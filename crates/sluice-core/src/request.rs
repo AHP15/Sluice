@@ -36,8 +36,13 @@ pub struct Predicate {
     pub case_insensitive: bool,
 }
 
+/// Adjacently tagged — `{"node": "and", "0": [...]}`, `{"node": "pred", "0":
+/// {...}}` — which is the shape `src/lib/contract.ts` declares. It was
+/// internally tagged, which serde cannot do for a newtype variant holding a
+/// sequence: every `and`/`or` tree failed to (de)serialize, so only a bare
+/// predicate could cross IPC (found by T-070's filter bar).
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "node", rename_all = "snake_case")]
+#[serde(tag = "node", content = "0", rename_all = "snake_case")]
 pub enum FilterTree {
     And(Vec<FilterTree>),
     Or(Vec<FilterTree>),
@@ -169,4 +174,24 @@ impl EditPlan {
 pub enum RawRequest {
     Script(String),
     CommandDocument(String),
+}
+
+#[cfg(test)]
+mod filter_wire_tests {
+    use super::*;
+
+    /// The exact JSON the webview sends (`src/lib/filter.ts`).
+    #[test]
+    fn an_and_tree_round_trips_in_the_webviews_shape() {
+        let json = r#"{"node":"and","0":[
+            {"node":"pred","0":{"column":"a","op":"eq","value":{"t":"text","v":"x"}}},
+            {"node":"or","0":[{"node":"pred","0":{"column":"b","op":"is_null","value":{"t":"null"}}}]}
+        ]}"#;
+        let tree: FilterTree = serde_json::from_str(json).expect("webview shape must parse");
+        let FilterTree::And(items) = &tree else { panic!("{tree:?}") };
+        assert_eq!(items.len(), 2);
+        let back = serde_json::to_string(&tree).expect("and/or must serialize");
+        let again: FilterTree = serde_json::from_str(&back).unwrap();
+        assert!(matches!(again, FilterTree::And(ref v) if v.len() == 2));
+    }
 }

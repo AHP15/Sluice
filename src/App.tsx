@@ -24,6 +24,7 @@ import type {
   EditGate,
   EditPlan,
   EditRequest,
+  FilterTree,
   Guardrails,
   LaunchOutcome,
   NavNode,
@@ -68,6 +69,7 @@ import { useUiStore } from "./store/ui";
 import { cn } from "./lib/utils";
 import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
 import { SavedQueries } from "./components/SavedQueries";
+import { FilterBar } from "./components/FilterBar";
 import { invalidateHistory } from "./components/HistoryPanel";
 
 interface RowsView {
@@ -351,8 +353,11 @@ function Workspace({ seed }: { seed: TabSeed }) {
   // A closed tab stops its stream.
   useEffect(() => () => streamRef.current?.cancel(), []);
 
+  // T-070 / D-005: the relation on screen, so the filter bar can re-browse it.
+  const browsedNode = useRef<NavNode | null>(null);
+
   const onSelectRelation = useCallback(
-    (node: NavNode) => {
+    (node: NavNode, filter: FilterTree | null = null) => {
       if (!session) return;
       if (holdForPending()) return;
       streamRef.current?.cancel();
@@ -362,12 +367,13 @@ function Workspace({ seed }: { seed: TabSeed }) {
       setError(null);
       setOutcomes(null);
       setSummary(null);
+      browsedNode.current = node;
       const label = node.id.path.join(".");
       // T-009: the grid issues ONLY this structured request. It never builds
       // SQL, and it does not know what engine is on the other end.
       const stream = RowStream.open(
         session.session_id,
-        { relation: node.id, filter: null, sort: [], limit: 500, cursor: null },
+        { relation: node.id, filter, sort: [], limit: 500, cursor: null },
         (e) => {
           if (streamRef.current !== stream) return; // superseded
           switch (e.kind) {
@@ -588,7 +594,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
                   sessionId={session.session_id}
                   capabilities={session.capabilities}
                   selected={selected}
-                  onSelect={onSelectRelation}
+                  onSelect={(node) => onSelectRelation(node)}
                 />
               </div>
             ) : (
@@ -639,6 +645,16 @@ function Workspace({ seed }: { seed: TabSeed }) {
             )}
 
             {outcomes && outcomes.length > 1 && <OutcomeStrip outcomes={outcomes} />}
+
+            {session && view?.relation && (
+              <FilterBar
+                // A new relation starts with an empty bar.
+                key={view.relation.path.join(".")}
+                columns={view.columns}
+                ops={session.capabilities.filter_ops}
+                onApply={(f) => browsedNode.current && onSelectRelation(browsedNode.current, f)}
+              />
+            )}
 
             <section className="min-h-0 flex-1">
               {session && view ? (

@@ -67,7 +67,7 @@ T-066 | done | L | D-017 | Layered error model with normalized kind, hints, and 
 T-067 | done | M | D-021 | Unit tests over pure driver-independent logic | 2026-11-06
 T-068 | done | M | D-021,D-006 | Per-engine type-fidelity corpus with hostile edge values | 2026-11-06
 T-069 | done | M | D-021,R-018 | Run the type-fidelity corpus in CI against a service container | 2026-11-06
-T-070 | todo | M | D-021 | React component tests over the grid and filter bar |
+T-070 | done | M | D-021 | React component tests over the grid and filter bar | 2026-11-06
 T-071 | in_progress | M | D-007,D-019,R-016 | Stable development signing identity and resilient keychain access |
 T-072 | in_progress | M | R-024 | Spike: validate the tiberius surface before SQL Server work begins |
 T-073 | done | M | D-022,R-029 | Spike: validate the cross-paradigm contract against a real mongod | 2026-08-02
