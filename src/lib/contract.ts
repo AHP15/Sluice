@@ -206,6 +206,15 @@ export interface ExecutionResult {
   outcomes: Outcome[];
   /** T-047: present for structured browse. */
   page?: PageInfo;
+  /** T-050: the execution's result budget; `exhausted_at` indexes `outcomes`. */
+  budget?: {
+    max_rows: number;
+    max_bytes: number;
+    used_rows: number;
+    used_bytes: number;
+    exhausted_by: "rows" | "bytes" | null;
+    exhausted_at: number | null;
+  };
   tx: {
     mode: "implicit_single" | "explicit_user" | "autocommit_per_statement";
     disposition: TxDisposition;

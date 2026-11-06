@@ -36,7 +36,7 @@ pub use capability::{missing_core_ops, CORE_FILTER_OPS,
 };
 pub use driver::Driver;
 pub use error::{DriverError, EnginePayload, ErrorHints, ErrorKind, QueryPosition};
-pub use outcome::{PageInfo, 
+pub use outcome::{row_cost, BudgetLimit, BudgetMeter, BudgetReport, ExecBudget, PageInfo, 
     Attribution, ExecutionResult, Outcome, OutcomeBody, TxContext, TxDisposition, TxMode,
 };
 pub use script::{ScriptDialect, SplitResult, StatementSpan};

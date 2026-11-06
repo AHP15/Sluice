@@ -47,7 +47,7 @@ T-046 | done | S | R-039 | Spike: verify what mongodb ClientSession delivers for
 T-047 | done | L | D-010 | Keyset pagination with declared fallback strategy | 2026-11-06
 T-048 | todo | M | D-010,R-010 | Per-relation keyset declaration accounting for composite key arity |
 T-049 | done | M | D-010,R-006 | Credit-based backpressure protocol for streamed row batches | 2026-11-06
-T-050 | todo | M | D-010,R-007,R-043 | Per-execution row and byte budget shared across the outcome sequence |
+T-050 | done | M | D-010,R-007,R-043 | Per-execution row and byte budget shared across the outcome sequence | 2026-11-06
 T-051 | done | M | D-010 | Real query cancellation and per-profile statement timeout | 2026-11-06
 T-052 | todo | M | D-010,R-042 | Decouple socket draining from webview consumption with a spill buffer |
 T-053 | done | L | D-016 | Native catalog introspection loaded lazily with explicit refresh | 2026-11-06

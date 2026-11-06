@@ -17,7 +17,7 @@ if [[ -z "${TEST_PG_URL:-}" ]]; then
 fi
 
 log=$(mktemp)
-cargo test -p sluice-postgres --test type_corpus --test live --test pool_reset --test redaction_corpus --test filters_live --test navigator_live --test cancel_live --test paging_live -- --nocapture 2>&1 | tee "$log"
+cargo test -p sluice-postgres --test type_corpus --test live --test pool_reset --test redaction_corpus --test filters_live --test navigator_live --test cancel_live --test paging_live --test budget_live -- --nocapture 2>&1 | tee "$log"
 
 summary=$(grep -E '^TYPE-CORPUS:' "$log" || true)
 if [[ -z "$summary" ]]; then

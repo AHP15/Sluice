@@ -117,6 +117,8 @@ pub struct PgDriver {
     nav_cache: Arc<std::sync::Mutex<std::collections::HashMap<Option<NodeId>, Vec<NavNode>>>>,
     /// T-051: set on a per-call copy (`with_cancel`), never on the shared driver.
     cancel: Option<CancelSlot>,
+    /// T-050: what one raw execution may retain for display.
+    budget: sluice_core::ExecBudget,
 }
 
 impl PgDriver {
@@ -187,6 +189,7 @@ impl PgDriver {
             collation: None,
             nav_cache: Arc::default(),
             cancel: None,
+            budget: sluice_core::ExecBudget::default(),
         };
 
         // Prove the credentials work now rather than on first browse, and pick
@@ -243,6 +246,7 @@ impl PgDriver {
             collation: self.collation.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
+            budget: self.budget,
         })
     }
 
@@ -261,6 +265,7 @@ impl PgDriver {
             collation: self.collation.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
+            budget: self.budget,
         })
     }
 
@@ -654,6 +659,13 @@ impl PgDriver {
         &self.redactor
     }
 
+    /// T-050: a copy with a different per-execution result budget.
+    pub fn with_budget(self: Arc<Self>, budget: sluice_core::ExecBudget) -> Arc<Self> {
+        let mut copy = self.clone_inner();
+        copy.budget = budget;
+        Arc::new(copy)
+    }
+
     /// T-051: a copy of this driver whose calls register with `slot`, so the
     /// query they run can be cancelled server-side via [`PgDriver::cancel`].
     pub fn with_cancel(self: Arc<Self>, slot: CancelSlot) -> Arc<Self> {
@@ -674,6 +686,7 @@ impl PgDriver {
             collation: self.collation.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
+            budget: self.budget,
         }
     }
 
@@ -815,13 +828,14 @@ impl Driver for PgDriver {
             // R-040: the user's text goes to the engine VERBATIM as one batch. No
             // client-side rewriting, so a splitter bug cannot manufacture a syntax
             // error the user did not write.
-            let result = client.simple_query(&script).await;
+            // T-050: streamed, metered against the per-execution budget —
+            // rows past it are dropped on arrival, never materialized.
+            let result = collect_budgeted(client, &script, self.budget).await;
     
             let split = sluice_core::script::split(&script, ScriptDialect::Postgres);
     
             match result {
-                Ok(messages) => {
-                    let bodies = collect_outcomes(messages);
+                Ok((bodies, report)) => {
                     let attributions = sluice_core::script::attribute(&split, bodies.len());
                     let outcomes: Vec<Outcome> = bodies
                         .into_iter()
@@ -841,6 +855,7 @@ impl Driver for PgDriver {
                         outcomes,
                         tx: TxContext { mode, disposition: TxDisposition::Committed },
                         page: None,
+                        budget: Some(report),
                     })
                 }
                 Err(e) => {
@@ -905,6 +920,7 @@ impl Driver for PgDriver {
                             },
                         },
                         page: None,
+                        budget: None,
                     })
                 }
             }
@@ -923,61 +939,57 @@ impl Driver for PgDriver {
     }
 }
 
-/// Turn the simple-query message stream into D-029 outcome bodies.
-fn collect_outcomes(messages: Vec<SimpleQueryMessage>) -> Vec<OutcomeBody> {
+/// T-050: run a script and turn its message stream into D-029 outcome bodies,
+/// keeping rows only while the execution's budget lasts.
+///
+/// Every statement still runs to completion — the budget limits what is
+/// *retained for display*, never what executes. Stopping a script early
+/// because a SELECT was large would silently skip the writes after it.
+async fn collect_budgeted(
+    client: &tokio_postgres::Client,
+    script: &str,
+    budget: sluice_core::ExecBudget,
+) -> Result<(Vec<OutcomeBody>, sluice_core::BudgetReport), tokio_postgres::Error> {
+    use futures_util::TryStreamExt as _;
+
+    let stream = client.simple_query_raw(script).await?;
+    let mut stream = std::pin::pin!(stream);
+    let mut meter = sluice_core::BudgetMeter::new(budget);
     let mut out: Vec<OutcomeBody> = Vec::new();
     let mut pending_cols: Option<Vec<sluice_core::ColumnDesc>> = None;
     let mut pending_rows: Vec<Vec<WireValue>> = Vec::new();
+    let mut pending_truncated = false;
 
-    for msg in messages {
+    while let Some(msg) = stream.try_next().await? {
         match msg {
             SimpleQueryMessage::RowDescription(cols) => {
-                flush(&mut out, &mut pending_cols, &mut pending_rows);
-                pending_cols = Some(
-                    cols.iter()
-                        .map(|c| sluice_core::ColumnDesc {
-                            name: c.name().to_string(),
-                            // The simple query protocol returns every value in
-                            // TEXT format and does NOT carry type OIDs, so the
-                            // honest descriptor is `unknown` rather than a
-                            // guess. D-017 makes `unknown` first-class exactly
-                            // so a driver never has to lie. Values are still
-                            // lossless — text is Postgres' own rendering.
-                            type_name: "unknown".into(),
-                            type_class: TypeClass::Unknown,
-                            nullable: true,
-                            mixed: false,
-                            derived: true,
-                            // No type OIDs on this protocol, so no claim of
-                            // exactness either way; script results are not
-                            // editable in place.
-                            exact: None,
-                        })
-                        .collect(),
-                );
-                pending_rows.clear();
+                flush_budgeted(&mut out, &mut pending_cols, &mut pending_rows, &mut pending_truncated);
+                pending_cols = Some(cols.iter().map(script_column).collect());
             }
             SimpleQueryMessage::Row(row) => {
-                let n = row.columns().len();
-                let mut cells = Vec::with_capacity(n);
-                for i in 0..n {
-                    cells.push(match row.get(i) {
+                // Once spent, later rows are not even decoded.
+                if meter.exhausted() {
+                    pending_truncated = true;
+                    continue;
+                }
+                let cells: Vec<WireValue> = (0..row.columns().len())
+                    .map(|i| match row.get(i) {
                         Some(s) => WireValue::Text(s.to_string()),
                         None => WireValue::Null,
-                    });
+                    })
+                    .collect();
+                if meter.admit(sluice_core::row_cost(&cells), out.len() as u32) {
+                    pending_rows.push(cells);
+                } else {
+                    pending_truncated = true;
                 }
-                pending_rows.push(cells);
             }
             SimpleQueryMessage::CommandComplete(n) => {
                 if pending_cols.is_some() {
-                    flush(&mut out, &mut pending_cols, &mut pending_rows);
+                    flush_budgeted(&mut out, &mut pending_cols, &mut pending_rows, &mut pending_truncated);
                 } else {
                     out.push(OutcomeBody::Affected {
                         count: n,
-                        // The simple query protocol's command tag is not exposed
-                        // by tokio-postgres, so `UPDATE 0` and `CREATE TABLE`
-                        // are indistinguishable here. `None` is the truthful
-                        // answer; T-053's catalog work can improve on it.
                         statement_kind: None,
                         concurrency_omitted: vec![],
                         document_errors: vec![],
@@ -987,25 +999,37 @@ fn collect_outcomes(messages: Vec<SimpleQueryMessage>) -> Vec<OutcomeBody> {
             _ => {}
         }
     }
-    flush(&mut out, &mut pending_cols, &mut pending_rows);
+    flush_budgeted(&mut out, &mut pending_cols, &mut pending_rows, &mut pending_truncated);
     if out.is_empty() {
         out.push(OutcomeBody::Status { message: "OK".into(), document: None });
     }
-    out
+    Ok((out, meter.report()))
 }
 
-fn flush(
+fn script_column(c: &tokio_postgres::SimpleColumn) -> sluice_core::ColumnDesc {
+    sluice_core::ColumnDesc {
+        name: c.name().to_string(),
+        // The simple query protocol returns every value in TEXT format and
+        // does NOT carry type OIDs, so the honest descriptor is `unknown`.
+        type_name: "unknown".into(),
+        type_class: TypeClass::Unknown,
+        nullable: true,
+        mixed: false,
+        derived: true,
+        exact: None,
+    }
+}
+
+fn flush_budgeted(
     out: &mut Vec<OutcomeBody>,
     cols: &mut Option<Vec<sluice_core::ColumnDesc>>,
     rows: &mut Vec<Vec<WireValue>>,
+    truncated: &mut bool,
 ) {
     if let Some(columns) = cols.take() {
-        out.push(OutcomeBody::Rows {
-            columns,
-            rows: std::mem::take(rows),
-            truncated: false,
-        });
+        out.push(OutcomeBody::Rows { columns, rows: std::mem::take(rows), truncated: *truncated });
     }
+    *truncated = false;
 }
 
 /// Opaque re-fetch token for an oversized value (T-018).
