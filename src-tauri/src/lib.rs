@@ -7,6 +7,7 @@ mod commands;
 mod consent_dialog;
 mod credentials;
 mod diagnostics;
+mod execution;
 mod guardrails;
 mod launcher;
 mod stream;
@@ -58,6 +59,7 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::grant_stream_credit,
         commands::cancel_stream,
         commands::run_script,
+        commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file,
         commands::debug_panicking_driver_call
@@ -84,6 +86,7 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::grant_stream_credit,
         commands::cancel_stream,
         commands::run_script,
+        commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file
     ]

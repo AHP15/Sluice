@@ -254,6 +254,7 @@ fn spec_from_env() -> Option<ConnectSpec> {
         dbname: cfg.get_dbname().unwrap_or("postgres").to_string(),
         tls,
         application_name: "sluice-type-corpus".into(),
+        statement_timeout: None,
     })
 }
 

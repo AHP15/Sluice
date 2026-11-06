@@ -22,6 +22,7 @@ fn spec() -> ConnectSpec {
         dbname: "sluice_dev".into(),
         tls: TlsMode::Disabled,
         application_name: "sluice-pool-tests".into(),
+        statement_timeout: None,
     }
 }
 

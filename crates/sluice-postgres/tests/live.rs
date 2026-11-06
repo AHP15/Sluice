@@ -35,6 +35,7 @@ fn spec() -> ConnectSpec {
         // default remains Verify everywhere else.
         tls: TlsMode::Disabled,
         application_name: "sluice-tests".into(),
+        statement_timeout: None,
     }
 }
 

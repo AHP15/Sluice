@@ -19,6 +19,7 @@ async fn driver() -> Option<std::sync::Arc<PgDriver>> {
         dbname: "sluice_dev".into(),
         tls: TlsMode::Disabled,
         application_name: "sluice-filters".into(),
+        statement_timeout: None,
     };
     match PgDriver::connect(spec).await {
         Ok(d) => Some(d),

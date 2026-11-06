@@ -98,8 +98,16 @@ export interface ScriptRun {
   summary: string;
 }
 
-export function runScript(sessionId: string, script: string): Promise<ScriptRun> {
-  return invoke<ScriptRun>("run_script", { sessionId, script });
+export function runScript(sessionId: string, script: string, queryId?: string): Promise<ScriptRun> {
+  return invoke<ScriptRun>("run_script", { sessionId, script, queryId: queryId ?? null });
+}
+
+/**
+ * T-051: cancel a running query by the id it was started with. The server
+ * stops it; if it does not stop in time, its connection is dropped.
+ */
+export function cancelQuery(queryId: string): Promise<boolean> {
+  return invoke<boolean>("cancel_query", { queryId });
 }
 
 /** T-018: pull one oversized value on demand. */

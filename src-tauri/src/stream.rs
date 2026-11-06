@@ -228,6 +228,7 @@ mod tests {
             dbname: "sluice_dev".into(),
             tls: TlsMode::Disabled,
             application_name: "sluice-stream-test".into(),
+            statement_timeout: None,
         };
         let Ok(d) = PgDriver::connect(spec).await else {
             eprintln!("SKIP: no Postgres reachable");

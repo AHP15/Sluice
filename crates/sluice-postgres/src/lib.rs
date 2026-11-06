@@ -27,6 +27,7 @@ use tokio_postgres::SimpleQueryMessage;
 
 use crate::encode::DEFAULT_VALUE_CEILING;
 use crate::lease::{Lease, PoolStats, PoolStatsSnapshot};
+pub use crate::lease::CancelSlot;
 use crate::tls::TlsMode;
 
 /// Everything needed to open a connection.
@@ -50,6 +51,11 @@ pub struct ConnectSpec {
     pub dbname: String,
     pub tls: TlsMode,
     pub application_name: String,
+    /// T-051 / D-010: the profile's statement timeout, enforced **by the
+    /// server** for every statement on every pooled connection. Sent as a
+    /// startup option, so `DISCARD ALL` (which resets to startup values)
+    /// cannot clear it. `None` leaves the server's own setting.
+    pub statement_timeout: Option<std::time::Duration>,
 }
 
 impl Default for ConnectSpec {
@@ -62,6 +68,7 @@ impl Default for ConnectSpec {
             dbname: "postgres".into(),
             tls: TlsMode::default(),
             application_name: "sluice".into(),
+            statement_timeout: None,
         }
     }
 }
@@ -106,6 +113,8 @@ pub struct PgDriver {
     /// first expand and kept until DDL the app ran, or an explicit refresh.
     /// Shared across `with_*` copies, like the pool.
     nav_cache: Arc<std::sync::Mutex<std::collections::HashMap<Option<NodeId>, Vec<NavNode>>>>,
+    /// T-051: set on a per-call copy (`with_cancel`), never on the shared driver.
+    cancel: Option<CancelSlot>,
 }
 
 impl PgDriver {
@@ -127,6 +136,9 @@ impl PgDriver {
             .user(&spec.user)
             .dbname(&spec.dbname)
             .application_name(&spec.application_name);
+        if let Some(t) = spec.statement_timeout {
+            cfg.options(&format!("-c statement_timeout={}", t.as_millis().max(1)));
+        }
         if let Some(pw) = &spec.password {
             // The one place the plaintext is legitimately needed: handing it to
             // the wire protocol. `tokio_postgres::Config` keeps it internally
@@ -172,6 +184,7 @@ impl PgDriver {
             redactor: sluice_core::Redactor::new(spec.password.clone()),
             collation: None,
             nav_cache: Arc::default(),
+            cancel: None,
         };
 
         // Prove the credentials work now rather than on first browse, and pick
@@ -227,6 +240,7 @@ impl PgDriver {
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
             nav_cache: self.nav_cache.clone(),
+            cancel: self.cancel.clone(),
         })
     }
 
@@ -244,6 +258,7 @@ impl PgDriver {
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
             nav_cache: self.nav_cache.clone(),
+            cancel: self.cancel.clone(),
         })
     }
 
@@ -535,14 +550,19 @@ impl PgDriver {
     /// server). Best effort: if it fails, the query still ends when the
     /// abandoned stream is drained, so this only bounds wasted server work.
     async fn send_cancel(&self, token: &tokio_postgres::CancelToken) {
-        let _ = if self.tls == TlsMode::Disabled {
+        let _ = self.send_cancel_checked(token).await;
+    }
+
+    async fn send_cancel_checked(&self, token: &tokio_postgres::CancelToken) -> bool {
+        let r = if self.tls == TlsMode::Disabled {
             token.cancel_query(tokio_postgres::NoTls).await
         } else {
             match tls::client_config(self.tls) {
                 Ok(cfg) => token.cancel_query(tokio_postgres_rustls::MakeRustlsConnect::new(cfg)).await,
-                Err(_) => return,
+                Err(_) => return false,
             }
         };
+        r.is_ok()
     }
 
     /// Run `f` on a leased connection, then release it through the declared
@@ -566,7 +586,23 @@ impl PgDriver {
             if dirty {
                 lease.mark_dirty();
             }
+            // T-051: register this connection's cancel token; a slot already
+            // cancelled refuses to start, closing the cancel-before-start race.
+            if let Some(slot) = &self.cancel {
+                if !slot.arm(lease.client().cancel_token()) {
+                    lease.release().await;
+                    return Err(DriverError::new(ErrorKind::Cancelled, "cancelled before it started"));
+                }
+            }
             let out = f(lease.client()).await;
+            if let Some(slot) = &self.cancel {
+                slot.disarm();
+                // A cancelled statement can leave an aborted transaction; the
+                // reset path (ROLLBACK, DISCARD ALL) must run on release.
+                if slot.is_cancelled() {
+                    lease.mark_dirty();
+                }
+            }
             lease.release().await;
             out
         }
@@ -589,6 +625,40 @@ impl PgDriver {
     /// errors the driver did not produce (a caught panic, say).
     pub fn redactor(&self) -> &sluice_core::Redactor {
         &self.redactor
+    }
+
+    /// T-051: a copy of this driver whose calls register with `slot`, so the
+    /// query they run can be cancelled server-side via [`PgDriver::cancel`].
+    pub fn with_cancel(self: Arc<Self>, slot: CancelSlot) -> Arc<Self> {
+        let mut copy = self.clone_inner();
+        copy.cancel = Some(slot);
+        Arc::new(copy)
+    }
+
+    fn clone_inner(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            ceiling: self.ceiling,
+            server: self.server.clone(),
+            tls: self.tls,
+            reset: self.reset,
+            stats: self.stats.clone(),
+            redactor: self.redactor.clone(),
+            collation: self.collation.clone(),
+            nav_cache: self.nav_cache.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+
+    /// T-051 / D-010: cancel the query registered in `slot` with the protocol
+    /// cancel request, which stops it **on the server**. Returns whether a
+    /// request was sent; `false` means nothing was running (and nothing will
+    /// start on that slot now) or the request could not be delivered.
+    pub async fn cancel(&self, slot: &CancelSlot) -> bool {
+        match slot.trip() {
+            Some(token) => self.send_cancel_checked(&token).await,
+            None => false,
+        }
     }
 
     /// T-053 / D-016: drop the navigator cache. External DDL is undetectable

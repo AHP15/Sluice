@@ -49,7 +49,12 @@ pub fn map_error(err: &tokio_postgres::Error, statement: Option<&str>) -> Driver
         });
     };
 
-    let kind = kind_for(db.code());
+    let mut kind = kind_for(db.code());
+    // T-051: 57014 is both a user cancel and a statement timeout; only the
+    // message tells them apart, and the UI words them differently.
+    if kind == ErrorKind::Cancelled && db.message().contains("statement timeout") {
+        kind = ErrorKind::Timeout;
+    }
 
     let hints = ErrorHints {
         position: statement.and_then(|sql| position_hint(db, sql)),

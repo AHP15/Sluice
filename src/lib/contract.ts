@@ -211,6 +211,8 @@ export interface ProfileMeta {
   user: string;
   dbname: string;
   tls: "verify" | "accept_invalid_certs" | "disabled";
+  /** T-051: statement timeout in seconds; absent = default, 0 = none. */
+  statement_timeout_secs?: number | null;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */

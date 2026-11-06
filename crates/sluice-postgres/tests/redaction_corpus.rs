@@ -25,6 +25,7 @@ fn spec(user: &str, password: &str, host: &str, tls: TlsMode) -> ConnectSpec {
         dbname: "sluice_dev".into(),
         tls,
         application_name: "sluice-redaction".into(),
+        statement_timeout: None,
     }
 }
 

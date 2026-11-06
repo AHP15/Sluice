@@ -43,6 +43,10 @@ pub struct ProfileMeta {
     pub dbname: String,
     #[serde(default)]
     pub tls: TlsMode,
+    /// T-051 / D-010: this profile's statement timeout in seconds. Unset means
+    /// the default (`execution::DEFAULT_STATEMENT_TIMEOUT`); `0` means none.
+    #[serde(default)]
+    pub statement_timeout_secs: Option<u32>,
 }
 
 /// What the UI learns after connecting.
@@ -66,6 +70,9 @@ struct SessionRecord {
     /// can move the password into the keychain. Dropped once saved.
     ephemeral_url: Option<ConnectionUrl>,
     target: ProfileMeta,
+    /// T-051: the session's statement timeout, for the client-side watchdog
+    /// that backs up the server's.
+    statement_timeout: Option<std::time::Duration>,
 }
 
 #[derive(Default)]
@@ -73,6 +80,7 @@ pub struct AppState {
     drivers: Mutex<HashMap<String, Arc<PgDriver>>>,
     sessions: Mutex<HashMap<String, SessionRecord>>,
     creds: CredentialStore,
+    queries: crate::execution::Queries,
 }
 
 impl AppState {
@@ -87,6 +95,10 @@ impl AppState {
                 None => sluice_core::Redactor::default().error(e),
             }),
         }
+    }
+
+    async fn timeout(&self, session_id: &str) -> Option<std::time::Duration> {
+        self.sessions.lock().await.get(session_id).and_then(|r| r.statement_timeout)
     }
 
     async fn driver(&self, session_id: &str) -> Result<Arc<PgDriver>, DriverError> {
@@ -143,7 +155,9 @@ pub async fn connect(
             dbname: profile.dbname.clone(),
             tls: profile.tls,
             application_name: "sluice".into(),
+            statement_timeout: crate::execution::statement_timeout(profile.statement_timeout_secs),
         };
+        let timeout = spec.statement_timeout;
 
         let redactor = sluice_core::Redactor::new(spec.password.clone());
         let driver = logged("connect", &profile.id, None, |_| None, PgDriver::connect(spec))
@@ -157,7 +171,12 @@ pub async fn connect(
         let guardrails = Guardrails::manual(&profile.host, &profile.dbname);
         state.sessions.lock().await.insert(
             session_id.clone(),
-            SessionRecord { guardrails: guardrails.clone(), ephemeral_url: None, target: profile.clone() },
+            SessionRecord {
+                guardrails: guardrails.clone(),
+                ephemeral_url: None,
+                target: profile.clone(),
+                statement_timeout: timeout,
+            },
         );
 
         Ok(SessionInfo {
@@ -204,7 +223,10 @@ pub async fn connect_launch(
             dbname: t.database.clone(),
             tls: t.tls,
             application_name: "sluice".into(),
+            // A launched connection has no profile yet: D-010's default.
+            statement_timeout: crate::execution::statement_timeout(None),
         };
+        let timeout = spec.statement_timeout;
 
         let redactor = sluice_core::Redactor::new(spec.password.clone());
         let driver = logged("connect", &launch_id, None, |_| None, PgDriver::connect(spec))
@@ -236,7 +258,9 @@ pub async fn connect_launch(
                     user: t.user.clone(),
                     dbname: t.database.clone(),
                     tls: t.tls,
+                    statement_timeout_secs: None,
                 },
+                statement_timeout: timeout,
             },
         );
 
@@ -273,9 +297,16 @@ pub async fn open_browse_stream(
         streams.insert(stream_id.clone(), gate.clone());
 
         let registry = streams.inner().clone();
+        // T-051: the stream's deadline is the session's statement timeout
+        // (plus the cancel grace), not a fixed constant.
+        let deadline_after = state
+            .timeout(&session_id)
+            .await
+            .map(|t| t + crate::execution::CANCEL_GRACE)
+            .unwrap_or(STREAM_DEADLINE);
         let id = stream_id.clone();
         tauri::async_runtime::spawn(async move {
-            let deadline = tokio::time::Instant::now() + STREAM_DEADLINE;
+            let deadline = tokio::time::Instant::now() + deadline_after;
             let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let stop: Arc<std::sync::Mutex<Option<Stop>>> = Arc::default();
             let emit = {
@@ -409,6 +440,14 @@ pub async fn save_session_as_profile(
     .await
 }
 
+/// T-051 / D-010: cancel a running query by the id the UI gave it. The server
+/// stops it; if it has not finished within the grace period, its connection
+/// is dropped. `false` means it had already finished.
+#[tauri::command]
+pub async fn cancel_query(state: tauri::State<'_, AppState>, query_id: String) -> Result<bool, DriverError> {
+    guard_driver_call(&sid(&query_id), async { Ok(state.queries.cancel(&query_id).await) }).await
+}
+
 /// T-053 / D-016: drop the session's navigator cache. External DDL cannot be
 /// detected without polling, so this is the contract, not a fallback.
 #[tauri::command]
@@ -490,10 +529,15 @@ pub async fn browse(
     state: tauri::State<'_, AppState>,
     session_id: String,
     request: BrowseRequest,
+    query_id: Option<String>,
 ) -> Result<ExecutionResult, DriverError> {
     let r = guard_driver_call(&sid(&session_id), async {
         let d = state.driver(&session_id).await?;
-        logged("browse", &session_id, None, rows_in, d.browse(request)).await
+        let limit = state.timeout(&session_id).await;
+        let call = crate::execution::run(&state.queries, query_id, d, limit, |d| async move {
+            d.browse(request).await
+        });
+        logged("browse", &session_id, None, rows_in, call).await
     })
     .await;
     state.redacted(&session_id, r).await
@@ -516,14 +560,19 @@ pub async fn run_script(
     state: tauri::State<'_, AppState>,
     session_id: String,
     script: String,
+    query_id: Option<String>,
 ) -> Result<ScriptRun, DriverError> {
     let r = guard_driver_call(&sid(&session_id), async {
         let d = state.driver(&session_id).await?;
+        let limit = state.timeout(&session_id).await;
         // The script text is passed for verbose diagnostics only; `logged`
         // drops it unless the user switched that on for this run (D-020).
         let text = script.clone();
-        let result =
-            logged("script", &session_id, Some(&text), rows_in, d.raw(RawRequest::Script(script))).await?;
+        // T-051: cancellable by `query_id`, bounded by the profile timeout.
+        let call = crate::execution::run(&state.queries, query_id, d, limit, |d| async move {
+            d.raw(RawRequest::Script(script)).await
+        });
+        let result = logged("script", &session_id, Some(&text), rows_in, call).await?;
         let summary = result.summary();
         Ok(ScriptRun { result, summary })
     })
@@ -690,6 +739,7 @@ mod boundary_tests {
             user: "app".into(),
             dbname: "main".into(),
             tls: TlsMode::Verify,
+            statement_timeout_secs: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {
@@ -710,6 +760,7 @@ mod boundary_tests {
                 user: "app".into(),
                 dbname: "shop".into(),
                 tls: TlsMode::Verify,
+                statement_timeout_secs: None,
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
         };

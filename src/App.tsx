@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Bug, Database, Play, Save, ShieldAlert, Sun, Moon, Plug, Plus, X } from "lucide-react";
+import { AlertTriangle, Bug, Database, Play, Save, ShieldAlert, Square, Sun, Moon, Plug, Plus, X } from "lucide-react";
 import { Navigator } from "./components/Navigator";
 import { QueryEditor } from "./components/QueryEditor";
 import { ResultGrid } from "./components/ResultGrid";
@@ -20,6 +20,7 @@ import type {
 import {
   LAUNCH_PENDING_EVENT,
   RowStream,
+  cancelQuery,
   connect,
   connectLaunch,
   coreVersion,
@@ -280,12 +281,17 @@ function Workspace({ seed }: { seed: TabSeed }) {
     [session],
   );
 
+  // T-051: the running script's id, so Stop can cancel it.
+  const runningQuery = useRef<string | null>(null);
+
   const onRun = useCallback(async () => {
     if (!session) return;
     setBusy(true);
     setError(null);
+    const queryId = crypto.randomUUID();
+    runningQuery.current = queryId;
     try {
-      const run = await runScript(session.session_id, draftQuery);
+      const run = await runScript(session.session_id, draftQuery, queryId);
       setOutcomes(run.result.outcomes);
       setSummary(run.summary);
       const first = run.result.outcomes.find((o) => o.kind === "rows");
@@ -300,9 +306,14 @@ function Workspace({ seed }: { seed: TabSeed }) {
     } catch (e) {
       setError(String((e as { message?: string })?.message ?? e));
     } finally {
+      runningQuery.current = null;
       setBusy(false);
     }
   }, [session, draftQuery]);
+
+  const onStop = useCallback(() => {
+    if (runningQuery.current) void cancelQuery(runningQuery.current);
+  }, []);
 
   return (
     <>
@@ -323,10 +334,17 @@ function Workspace({ seed }: { seed: TabSeed }) {
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
-            <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
-              <Play className="h-3.5 w-3.5" />
-              Run
-            </Button>
+            {busy && runningQuery.current ? (
+              <Button size="sm" variant="secondary" onClick={onStop}>
+                <Square className="h-3.5 w-3.5" />
+                Stop
+              </Button>
+            ) : (
+              <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
+                <Play className="h-3.5 w-3.5" />
+                Run
+              </Button>
+            )}
             <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>

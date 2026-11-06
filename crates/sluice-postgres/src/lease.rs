@@ -166,3 +166,46 @@ async fn native_reset(client: &tokio_postgres::Client) -> Result<(), tokio_postg
 async fn rollback(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     client.simple_query("ROLLBACK").await.map(|_| ())
 }
+
+/// T-051 / D-010: the handle that cancels one in-flight query.
+///
+/// A driver call made with a slot (`PgDriver::with_cancel`) records its leased
+/// connection's cancel token here when the lease is taken and clears it on
+/// release. `cancel` sends the protocol cancel request for whatever is running
+/// — or, if nothing has started yet, makes the next lease refuse to start.
+#[derive(Clone, Default)]
+pub struct CancelSlot {
+    inner: Arc<std::sync::Mutex<SlotState>>,
+}
+
+#[derive(Default)]
+struct SlotState {
+    token: Option<tokio_postgres::CancelToken>,
+    cancelled: bool,
+}
+
+impl CancelSlot {
+    pub(crate) fn arm(&self, token: tokio_postgres::CancelToken) -> bool {
+        let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if s.cancelled {
+            return false;
+        }
+        s.token = Some(token);
+        true
+    }
+
+    pub(crate) fn disarm(&self) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).token = None;
+    }
+
+    /// Mark cancelled and take the token of the query running now, if any.
+    pub fn trip(&self) -> Option<tokio_postgres::CancelToken> {
+        let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        s.cancelled = true;
+        s.token.take()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).cancelled
+    }
+}
