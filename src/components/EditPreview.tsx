@@ -57,9 +57,16 @@ function Statement({ s, n }: { s: PlannedStatement; n: number }) {
           </tbody>
         </table>
       )}
+      {/* T-060 / R-035: reduced protection, said here — on the edit it
+          affects, when it is about to run — rather than as a standing banner. */}
       {s.concurrency_omitted.length > 0 && (
         <div className="text-xs text-destructive">
           not checked for concurrent changes (protected by unique key only): {s.concurrency_omitted.join(", ")}
+        </div>
+      )}
+      {(s.concurrency_rendered?.length ?? 0) > 0 && (
+        <div className="text-xs text-muted-foreground">
+          checked by displayed text (these types have no equality): {s.concurrency_rendered!.join(", ")}
         </div>
       )}
     </li>
@@ -71,13 +78,22 @@ export function EditPreview({
   applying,
   onConfirm,
   onBack,
+  compareRendered = false,
+  onCompareRendered,
 }: {
   plan: EditPlan;
   applying: boolean;
   onConfirm: () => void;
   onBack: () => void;
+  /** T-060: whether non-comparable columns are being compared by text. */
+  compareRendered?: boolean;
+  onCompareRendered?: (on: boolean) => void;
 }) {
   const n = plan.statements.length;
+  // Offered only when it would change something for this plan.
+  const offer =
+    onCompareRendered &&
+    plan.statements.some((s) => s.concurrency_omitted.length > 0 || (s.concurrency_rendered?.length ?? 0) > 0);
   return (
     <div className="flex max-h-[50vh] flex-col border-t bg-background">
       <div className="flex items-center gap-2 border-b px-3 py-1.5 text-xs">
@@ -85,6 +101,20 @@ export function EditPreview({
           Review {n} statement{n === 1 ? "" : "s"} — exactly what will run, in one transaction
         </span>
         <span className="text-muted-foreground">no undo after it commits</span>
+        {offer && (
+          <label
+            className="flex items-center gap-1 text-muted-foreground"
+            title="For types with no equality (json, xml, geometric…), check that the value is still the text you were shown."
+          >
+            <input
+              type="checkbox"
+              disabled={applying}
+              checked={compareRendered}
+              onChange={(e) => onCompareRendered!(e.target.checked)}
+            />
+            compare unchecked columns by displayed text
+          </label>
+        )}
         <div className="ml-auto flex gap-2">
           <button
             type="button"

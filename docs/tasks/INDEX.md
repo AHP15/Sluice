@@ -57,7 +57,7 @@ T-056 | done | L | D-027 | Staged edits applied in one transaction behind a uniq
 T-057 | done | M | D-027,R-003 | Derive the edit preview from the same artifact that executes | 2026-11-06
 T-058 | done | M | D-027 | Null-safe optimistic concurrency with declared column comparability | 2026-11-06
 T-059 | done | M | D-027,R-034 | Bind concurrency originals with an explicit per-type cast | 2026-11-06
-T-060 | todo | M | D-027,R-035 | Determine concurrency comparability by probing the catalog |
+T-060 | done | M | D-027,R-035 | Determine concurrency comparability by probing the catalog | 2026-11-06
 T-061 | done | M | D-027 | Database-enforced safety mode and production confirmation | 2026-11-06
 T-062 | todo | M | D-027,D-018,R-026 | Classify Mongo document paths as editable or read-only |
 T-063 | todo | L | D-018 | Column derivation for schemaless collections |

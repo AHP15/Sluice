@@ -114,12 +114,15 @@ describe("ResultGrid editing", () => {
     expect(calls).toEqual(["apply", "discard", "unstage 0,1"]);
   });
 
-  test("a staged change to a non-comparable column says it is not checked", () => {
+  /** T-060: reduced protection is said in the preview, per edit — not as a
+   * standing banner over the grid that becomes furniture (R-035). */
+  test("a staged change to a non-comparable column adds no standing banner", () => {
     const cols = [COLS[0], { ...col("blob", "text"), concurrency_comparable: false }];
     const rows: WireValue[][] = [[{ t: "int", v: 1 }, { t: "text", v: "x" }]];
     const pending = stage(EMPTY, 0, 1, { t: "text", v: "y" }, rows[0][1]);
     render(<ResultGrid sessionId="s" columns={cols} rows={rows} truncated={false} editing={editing(pending, [])} />);
-    expect(screen.getByText(/not checked for concurrent changes.*blob/)).toBeTruthy();
+    expect(screen.getByText("1 pending change")).toBeTruthy();
+    expect(screen.queryByText(/not checked for concurrent changes/)).toBeNull();
   });
 
   test("a read-only gate leaves cells uneditable", () => {

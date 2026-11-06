@@ -14,7 +14,7 @@ use sluice_core::{
 };
 use tokio_postgres::types::Type;
 
-use crate::encode::{column_desc, length_expr, quote_ident, rendering_for, value_expr};
+use crate::encode::{column_desc, length_expr, quote_ident, rendering_for, value_expr, Comparability};
 
 /// Where each column's value (and optional length) sits in the projection.
 #[derive(Clone, Debug)]
@@ -117,6 +117,7 @@ pub fn qualified(relation: &NodeId) -> Result<String, DriverError> {
 ///
 /// `columns` comes from preparing `SELECT * FROM rel LIMIT 0`, so the types are
 /// the server's own — including for types with no Rust mapping (R-014).
+#[cfg(test)]
 pub fn compile(
     relation: &NodeId,
     columns: &[(String, Type)],
@@ -124,6 +125,20 @@ pub fn compile(
     ceiling: i64,
     with_ctid: bool,
     keys: &KeyInfo,
+) -> Result<CompiledBrowse, DriverError> {
+    compile_with(relation, columns, req, ceiling, with_ctid, keys, &Comparability::fallback())
+}
+
+/// `cmp` is the connection's catalog-probed comparability (T-060), which
+/// decides each column's `concurrency_comparable`.
+pub fn compile_with(
+    relation: &NodeId,
+    columns: &[(String, Type)],
+    req: &BrowseRequest,
+    ceiling: i64,
+    with_ctid: bool,
+    keys: &KeyInfo,
+    cmp: &Comparability,
 ) -> Result<CompiledBrowse, DriverError> {
     let rel = qualified(relation)?;
 
@@ -158,7 +173,7 @@ pub fn compile(
             ty: ty.clone(),
             value_idx,
             len_idx,
-            desc: column_desc(name, ty),
+            desc: column_desc(name, ty, cmp),
         });
     }
 

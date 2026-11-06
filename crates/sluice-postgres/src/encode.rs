@@ -157,7 +157,7 @@ pub fn length_expr(name: &str, ty: &Type) -> String {
     }
 }
 
-pub fn column_desc(name: &str, ty: &Type) -> ColumnDesc {
+pub fn column_desc(name: &str, ty: &Type, cmp: &Comparability) -> ColumnDesc {
     ColumnDesc {
         name: name.to_string(),
         // The engine's own name, verbatim — including for types with no Rust
@@ -172,10 +172,79 @@ pub fn column_desc(name: &str, ty: &Type) -> ColumnDesc {
         mixed: false,
         derived: false,
         exact: exact_domain_for(ty),
-        concurrency_comparable: concurrency_comparable(ty),
+        concurrency_comparable: cmp.comparable(ty),
     }
 }
 
+/// T-060 / R-035: types with a usable `=` — those with a default btree or hash
+/// operator class — loaded once per connection. Includes the polymorphic
+/// entries (`anyenum`, `anyarray`, `anyrange`, `record`) the resolver below
+/// needs for enums, arrays, ranges and composites.
+pub const EQUALITY_TYPES_SQL: &str = "select distinct c.opcintype::int8
+  from pg_opclass c join pg_am a on a.oid = c.opcmethod
+ where c.opcdefault and a.amname in ('btree', 'hash')";
+
+const ANYENUM: u32 = 3500;
+const ANYARRAY: u32 = 2277;
+const ANYRANGE: u32 = 3831;
+const ANYMULTIRANGE: u32 = 4537;
+const RECORD: u32 = 2249;
+
+/// Whether a column's type can enter the concurrency predicate, decided from
+/// the catalog this connection is talking to rather than a fixed list
+/// (T-060). Domains resolve to their base type, enums to `anyenum`, arrays
+/// and ranges to their element, composites to all of their fields.
+#[derive(Clone, Debug, Default)]
+pub struct Comparability {
+    /// `None` when the probe did not run: fall back to the allowlist below,
+    /// which only ever under-protects, never over-claims.
+    equality: Option<std::sync::Arc<std::collections::HashSet<u32>>>,
+}
+
+impl Comparability {
+    pub fn from_probe(oids: impl IntoIterator<Item = u32>) -> Self {
+        Self { equality: Some(std::sync::Arc::new(oids.into_iter().collect())) }
+    }
+
+    /// The static allowlist — what a connection without a probe result uses.
+    pub fn fallback() -> Self {
+        Self::default()
+    }
+
+    pub fn is_probed(&self) -> bool {
+        self.equality.is_some()
+    }
+
+    pub fn comparable(&self, ty: &Type) -> bool {
+        let Some(eq) = &self.equality else { return concurrency_comparable(ty) };
+        resolve(eq, ty, 0)
+    }
+}
+
+fn resolve(eq: &std::collections::HashSet<u32>, ty: &Type, depth: u8) -> bool {
+    use tokio_postgres::types::Kind;
+    // A pathological self-referencing composite must not recurse forever.
+    if depth > 8 {
+        return false;
+    }
+    match ty.kind() {
+        Kind::Simple => eq.contains(&ty.oid()),
+        Kind::Enum(_) => eq.contains(&ANYENUM),
+        Kind::Domain(base) => resolve(eq, base, depth + 1),
+        Kind::Array(elem) => eq.contains(&ANYARRAY) && resolve(eq, elem, depth + 1),
+        Kind::Range(sub) => eq.contains(&ANYRANGE) && resolve(eq, sub, depth + 1),
+        Kind::Multirange(sub) => eq.contains(&ANYMULTIRANGE) && resolve(eq, sub, depth + 1),
+        Kind::Composite(fields) => {
+            eq.contains(&RECORD) && fields.iter().all(|f| resolve(eq, f.type_(), depth + 1))
+        }
+        // Pseudo-types and anything newer than this match: not vouched for.
+        _ => false,
+    }
+}
+
+/// The fallback when the catalog probe did not run (T-060 replaces this as
+/// the normal path).
+///
 /// T-058 / D-027: types this driver vouches have a usable equality *and*
 /// round-trip exactly through the text form browse ships them in, so a value
 /// as read compares equal to the stored value when nothing changed.
@@ -422,16 +491,16 @@ mod tests {
     /// keep a numeric editor.
     #[test]
     fn exact_numerics_and_only_exact_numerics_are_marked_exact() {
-        assert_eq!(column_desc("id", &Type::INT8).exact, Some(ExactDomain::i64()));
+        assert_eq!(column_desc("id", &Type::INT8, &Comparability::fallback()).exact, Some(ExactDomain::i64()));
         for ty in [Type::NUMERIC, Type::MONEY] {
             assert_eq!(
-                column_desc("amount", &ty).exact,
+                column_desc("amount", &ty, &Comparability::fallback()).exact,
                 Some(ExactDomain::unconstrained_decimal()),
                 "{ty}"
             );
         }
         for ty in [Type::INT2, Type::INT4, Type::FLOAT8, Type::TEXT, Type::BOOL, Type::UUID] {
-            assert_eq!(column_desc("c", &ty).exact, None, "{ty} must not be marked exact");
+            assert_eq!(column_desc("c", &ty, &Comparability::fallback()).exact, None, "{ty} must not be marked exact");
         }
     }
 
@@ -472,7 +541,7 @@ mod tests {
         // An OID tokio-postgres has never heard of.
         let unknown = Type::new("geometry".into(), 999999, tokio_postgres::types::Kind::Simple, "public".into());
         assert!(matches!(rendering_for(&unknown), Rendering::Text(TextShape::Exotic)));
-        assert_eq!(column_desc("g", &unknown).type_name, "geometry");
+        assert_eq!(column_desc("g", &unknown, &Comparability::fallback()).type_name, "geometry");
     }
 
     #[test]
@@ -516,5 +585,37 @@ mod tests {
     fn base64_newlines_are_stripped() {
         let v = text_to_wire(TextShape::Binary, &Type::BYTEA, "AAAA\nBBBB\n".into());
         assert_eq!(v, WireValue::Bytes("AAAABBBB".into()));
+    }
+
+    /// T-060 / R-035: comparability follows the catalog through the type's
+    /// structure, instead of an allowlist that excluded domains, enums,
+    /// arrays and every extension type.
+    #[test]
+    fn comparability_resolves_through_domains_enums_arrays_and_composites() {
+        use tokio_postgres::types::{Field, Kind};
+        // As a stock server reports it: int4, text, jsonb, the polymorphics.
+        let probed = Comparability::from_probe([23, 25, 3802, ANYENUM, ANYARRAY, ANYRANGE, RECORD]);
+        let domain = Type::new("posint".into(), 90001, Kind::Domain(Type::INT4), "public".into());
+        let mood = Type::new("mood".into(), 90002, Kind::Enum(vec!["sad".into(), "ok".into()]), "public".into());
+        let int_arr = Type::new("_int4".into(), 1007, Kind::Array(Type::INT4), "pg_catalog".into());
+        let json_arr = Type::new("_json".into(), 199, Kind::Array(Type::JSON), "pg_catalog".into());
+        let good = Type::new("pair".into(), 90003, Kind::Composite(vec![Field::new("a".into(), Type::INT4)]), "public".into());
+        let bad = Type::new("bag".into(), 90004, Kind::Composite(vec![Field::new("j".into(), Type::JSON)]), "public".into());
+        let ext = Type::new("citext".into(), 90005, Kind::Simple, "public".into());
+
+        assert!(probed.comparable(&Type::JSONB));
+        assert!(probed.comparable(&domain));
+        assert!(probed.comparable(&mood));
+        assert!(probed.comparable(&int_arr));
+        assert!(probed.comparable(&good));
+        assert!(!probed.comparable(&Type::JSON), "json has no equality");
+        assert!(!probed.comparable(&json_arr), "an array is only as comparable as its element");
+        assert!(!probed.comparable(&bad), "a composite is only as comparable as its fields");
+        assert!(!probed.comparable(&ext), "an extension type the probe did not list");
+        assert!(Comparability::from_probe([23, 25, 3802, 90005]).comparable(&ext), "…and comparable once it is listed");
+
+        // Without a probe, the conservative allowlist applies.
+        assert!(!Comparability::fallback().comparable(&domain));
+        assert!(Comparability::fallback().comparable(&Type::INT4));
     }
 }

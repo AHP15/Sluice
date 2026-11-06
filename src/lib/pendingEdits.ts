@@ -205,13 +205,3 @@ export function applyToRows(rows: WireValue[][], p: Pending): WireValue[][] {
   });
 }
 
-/**
- * T-058 / D-027: staged columns the core cannot check for concurrent changes,
- * so their edits are protected by the unique key only. Names, deduplicated,
- * in column order.
- */
-export function unprotectedColumns(p: Pending, columns: ColumnDesc[]): string[] {
-  const idx = new Set<number>();
-  for (const cells of p.values()) for (const c of cells.keys()) if (!columns[c]?.concurrency_comparable) idx.add(c);
-  return [...idx].sort((a, b) => a - b).map((c) => columns[c].name);
-}

@@ -136,6 +136,9 @@ pub struct PgDriver {
     /// T-061 / D-027: whether the server refuses writes from this role,
     /// probed at connect.
     read_only: sluice_core::ReadOnlyGuarantee,
+    /// T-060 / R-035: which types have a usable equality on *this* server,
+    /// probed from the catalog at connect.
+    comparability: encode::Comparability,
     /// T-053 / D-016: one level of the navigator tree per parent, filled on
     /// first expand and kept until DDL the app ran, or an explicit refresh.
     /// Shared across `with_*` copies, like the pool.
@@ -222,6 +225,7 @@ impl PgDriver {
             redactor: sluice_core::Redactor::new(spec.password.clone()),
             collation: None,
             read_only: sluice_core::ReadOnlyGuarantee::default(),
+            comparability: encode::Comparability::fallback(),
             nav_cache: Arc::default(),
             cancel: None,
             budget: sluice_core::ExecBudget::default(),
@@ -272,7 +276,19 @@ impl PgDriver {
             .await
             .unwrap_or_default();
 
-        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, ..driver }))
+        // T-060: types with a usable `=` here. A failed probe falls back to
+        // the static allowlist, which under-protects but never over-claims.
+        let comparability = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| {
+                Ok(match client.query(encode::EQUALITY_TYPES_SQL, &[]).await {
+                    Ok(rows) => encode::Comparability::from_probe(rows.iter().map(|r| r.get::<_, i64>(0) as u32)),
+                    Err(_) => encode::Comparability::fallback(),
+                })
+            })
+            .await
+            .unwrap_or_default();
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, comparability, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
@@ -286,6 +302,7 @@ impl PgDriver {
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
             read_only: self.read_only.clone(),
+            comparability: self.comparability.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -306,6 +323,7 @@ impl PgDriver {
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
             read_only: self.read_only.clone(),
+            comparability: self.comparability.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -550,7 +568,7 @@ impl PgDriver {
                 shapes.push((e.relation.clone(), shape));
             }
             let (_, shape) = shapes.iter().find(|(r, _)| r == &e.relation).expect("inserted above");
-            compiled.push(edit::compile_update(i, e, &shape.columns, &shape.gate)?);
+            compiled.push(edit::compile_update_with(i, e, &shape.columns, &shape.gate, &self.comparability)?);
         }
         Ok(compiled)
     }
@@ -562,13 +580,14 @@ impl PgDriver {
         request: &BrowseRequest,
     ) -> Result<(browse::CompiledBrowse, EditGate), DriverError> {
         let shape = self.relation_shape(client, &request.relation).await?;
-        let compiled = browse::compile(
+        let compiled = browse::compile_with(
             &request.relation,
             &shape.columns,
             request,
             self.ceiling,
             shape.is_table,
             &shape.keys,
+            &self.comparability,
         )?;
         Ok((compiled, shape.gate))
     }
@@ -778,6 +797,7 @@ impl PgDriver {
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
             read_only: self.read_only.clone(),
+            comparability: self.comparability.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,

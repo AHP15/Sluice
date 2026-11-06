@@ -109,6 +109,11 @@ pub struct EditRequest {
     /// enter the predicate and MUST report the ones it dropped — see
     /// `Outcome::Affected::concurrency_omitted` (T-073 F-4).
     pub originals: Vec<Original>,
+    /// T-060 / R-035: the user opted in to comparing columns that have no
+    /// usable equality by their *displayed text* (`col::text IS NOT DISTINCT
+    /// FROM $n`), so protection degrades to "what you saw" instead of none.
+    #[serde(default)]
+    pub compare_rendered: bool,
 }
 
 /// One bound parameter of a planned statement, as it is sent (T-057).
@@ -135,6 +140,10 @@ pub struct PlannedStatement {
     pub inline: Option<String>,
     /// Written columns not checked for concurrent changes (T-058).
     pub concurrency_omitted: Vec<String>,
+    /// T-060: written columns checked by their displayed text rather than by
+    /// equality, because their type has none and the user opted in.
+    #[serde(default)]
+    pub concurrency_rendered: Vec<String>,
 }
 
 /// The statements a set of staged edits compiles to, previewed before apply.

@@ -174,6 +174,11 @@ export interface EditRequest {
   set: Original[];
   /** The written columns' values as read (T-058's concurrency predicate). */
   originals: Original[];
+  /**
+   * T-060: compare columns with no usable equality by their displayed text
+   * instead of leaving them unchecked. Opt-in, from the preview.
+   */
+  compare_rendered?: boolean;
 }
 
 /** T-057: one bound parameter of a planned statement, as sent. */
@@ -194,6 +199,8 @@ export interface PlannedStatement {
   params: BoundParam[];
   inline: string | null;
   concurrency_omitted: string[];
+  /** T-060: written columns checked by their displayed text (opt-in). */
+  concurrency_rendered?: string[];
 }
 
 /** T-057: what staged edits compile to. Apply must present `digest`. */

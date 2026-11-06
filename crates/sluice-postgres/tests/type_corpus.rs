@@ -424,6 +424,7 @@ async fn every_type_round_trips_through_the_wire_encoding_unchanged() {
             key: vec![Original { column: "id".into(), value: WireValue::Int(id.into()) }],
             set: vec![Original { column: "v".into(), value: original.clone() }],
             originals: vec![Original { column: "v".into(), value: original }],
+            compare_rendered: false,
         };
 
         // Unmodified, and the NULL row with a NULL original: both must commit.

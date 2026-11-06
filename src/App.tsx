@@ -710,6 +710,17 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 applying={applying}
                 onConfirm={onConfirm}
                 onBack={() => setReview(null)}
+                compareRendered={review.edits.some((e) => e.compare_rendered)}
+                onCompareRendered={async (on) => {
+                  // T-060: re-preview; apply then runs exactly this plan.
+                  const edits = review.edits.map((e) => ({ ...e, compare_rendered: on }));
+                  try {
+                    const plan = await previewEdits(session!.session_id, edits);
+                    setReview({ ...review, edits, plan });
+                  } catch (e2) {
+                    setError(String((e2 as { message?: string })?.message ?? e2));
+                  }
+                }}
               />
             )}
           </main>

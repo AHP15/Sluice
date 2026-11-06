@@ -97,7 +97,10 @@ describe("T-056: staged editing in the footer", () => {
   });
 });
 
-test("T-058: the footer names staged columns protected by unique key only", () => {
+// T-060 / R-035: this used to be a footer banner while edits were pending; it
+// now appears per edit in the preview (editPreviewRendered.test.tsx), so it
+// stays information rather than furniture.
+test("T-060: the footer carries no standing protection banner", () => {
   const cols = [col("id", "int8"), col("doc", "json", { type_class: "structural", concurrency_comparable: false })];
   const r: WireValue[][] = [[{ t: "numeric", v: "1" }, { t: "text", v: "{}" }]];
   const out = renderToStaticMarkup(
@@ -117,5 +120,6 @@ test("T-058: the footer names staged columns protected by unique key only", () =
       }}
     />,
   );
-  expect(out).toContain("protected by unique key only): doc");
+  expect(out).toContain("1 pending change");
+  expect(out).not.toContain("protected by unique key only");
 });

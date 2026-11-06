@@ -10,7 +10,7 @@ import { Download, Eye, Loader2, Lock, Undo2 } from "lucide-react";
 import type { ColumnDesc, EditGate, WireValue } from "../lib/contract";
 import { formatBytes, isAbsent, renderValue } from "../lib/contract";
 import { fetchValue, saveValueToFile } from "../lib/ipc";
-import { cellReadOnlyReason, pendingCount, staged, unprotectedColumns, type Pending } from "../lib/pendingEdits";
+import { cellReadOnlyReason, pendingCount, staged, type Pending } from "../lib/pendingEdits";
 import { cn } from "../lib/utils";
 import { CellEditor } from "./CellEditor";
 
@@ -116,7 +116,6 @@ export function ResultGrid({
     meta: { editing },
   });
   const changed = editing ? pendingCount(editing.pending) : 0;
-  const unprotected = editing && changed > 0 ? unprotectedColumns(editing.pending, columns) : [];
   const model = table.getRowModel().rows;
 
   const virtualizer = useVirtualizer({
@@ -222,11 +221,6 @@ export function ResultGrid({
               Discard
             </button>
             <span className="text-muted-foreground">applied in one transaction · no undo after</span>
-            {unprotected.length > 0 && (
-              <span className="text-destructive" title="These types cannot be compared, so a concurrent change to them would be overwritten.">
-                not checked for concurrent changes (protected by unique key only): {unprotected.join(", ")}
-              </span>
-            )}
           </span>
         )}
         <span>
