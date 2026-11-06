@@ -5,12 +5,14 @@
 //! D-006's tagged encoding is built on.
 
 pub mod browse;
+pub mod catalog_probe;
 pub mod edit;
 pub mod encode;
 pub mod error_map;
 pub mod lease;
 pub mod navigator;
 pub mod pinned;
+pub mod read_only;
 pub mod tls;
 pub mod version;
 
@@ -132,6 +134,17 @@ pub struct PgDriver {
     /// deterministic, read at connect. Deterministic means `=` and `LIKE`
     /// distinguish case — the semantics the filter bar reports.
     collation: Option<(String, bool)>,
+    /// T-061 / D-027: whether the server refuses writes from this role,
+    /// probed at connect.
+    read_only: sluice_core::ReadOnlyGuarantee,
+    /// T-060 / R-035: which types have a usable equality on *this* server,
+    /// probed from the catalog at connect.
+    comparability: encode::Comparability,
+    /// T-055 / R-028: which catalog areas probed successfully at connect.
+    catalog: sluice_core::CatalogSupport,
+    /// T-044: the server's `max_connections`, shared by every client — what a
+    /// raised budget is a citizen of. `None` if it could not be read.
+    max_connections: Option<i64>,
     /// T-053 / D-016: one level of the navigator tree per parent, filled on
     /// first expand and kept until DDL the app ran, or an explicit refresh.
     /// Shared across `with_*` copies, like the pool.
@@ -152,6 +165,11 @@ impl PgDriver {
     /// session is a lease held from this same pool.
     pub fn connection_budget(&self) -> usize {
         self.pool.status().max_size
+    }
+
+    /// T-044: the server's `max_connections`, if it could be read at connect.
+    pub fn max_connections(&self) -> Option<i64> {
+        self.max_connections
     }
 
     /// As [`connect`](Self::connect), with an explicit pool ceiling. Tests use
@@ -217,6 +235,10 @@ impl PgDriver {
             stats: Arc::new(PoolStats::default()),
             redactor: sluice_core::Redactor::new(spec.password.clone()),
             collation: None,
+            read_only: sluice_core::ReadOnlyGuarantee::default(),
+            comparability: encode::Comparability::fallback(),
+            catalog: sluice_core::CatalogSupport::default(),
+            max_connections: None,
             nav_cache: Arc::default(),
             cancel: None,
             budget: sluice_core::ExecBudget::default(),
@@ -261,7 +283,46 @@ impl PgDriver {
         // D-028: no `DISCARD ALL` means no native reset — reopen instead.
         let reset = if server.has_discard_all() { ResetSupport::Native } else { ResetSupport::ReopenOnly };
 
-        Ok(Arc::new(Self { server: Some(server), collation, reset, ..driver }))
+        // T-061: what the database enforces about writes. Never fails connect.
+        let read_only = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| Ok(read_only::probe(client).await))
+            .await
+            .unwrap_or_default();
+
+        // T-060: types with a usable `=` here. A failed probe falls back to
+        // the static allowlist, which under-protects but never over-claims.
+        let comparability = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| {
+                Ok(match client.query(encode::EQUALITY_TYPES_SQL, &[]).await {
+                    Ok(rows) => encode::Comparability::from_probe(rows.iter().map(|r| r.get::<_, i64>(0) as u32)),
+                    Err(_) => encode::Comparability::fallback(),
+                })
+            })
+            .await
+            .unwrap_or_default();
+
+        // T-055 / R-028: what the catalog demonstrably supports, so behaviour
+        // follows what this server does rather than what its banner claims.
+        let flavour_verified = !matches!(server.flavour, version::Flavour::Unknown(_));
+        let catalog = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| Ok(catalog_probe::probe(client, flavour_verified).await))
+            .await
+            .unwrap_or_default();
+
+        // T-044: for the citizenship warning on a raised budget.
+        let max_connections = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| {
+                Ok(client
+                    .query_one("select current_setting('max_connections')::int8", &[])
+                    .await
+                    .ok()
+                    .map(|r| r.get::<_, i64>(0)))
+            })
+            .await
+            .ok()
+            .flatten();
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, comparability, catalog, max_connections, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
@@ -274,10 +335,21 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            read_only: self.read_only.clone(),
+            comparability: self.comparability.clone(),
+            catalog: self.catalog.clone(),
+            max_connections: self.max_connections,
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
         })
+    }
+
+    /// Override the probed catalog support. For exercising T-055's degraded
+    /// navigation against a real server, which genuinely supports everything.
+    pub fn with_catalog(self: Arc<Self>, catalog: sluice_core::CatalogSupport) -> Arc<Self> {
+        self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        Arc::new(Self { catalog, ..self.clone_inner() })
     }
 
     /// Override the declared reset path. For exercising D-028's `reopen` and
@@ -293,6 +365,10 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            read_only: self.read_only.clone(),
+            comparability: self.comparability.clone(),
+            catalog: self.catalog.clone(),
+            max_connections: self.max_connections,
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -537,7 +613,7 @@ impl PgDriver {
                 shapes.push((e.relation.clone(), shape));
             }
             let (_, shape) = shapes.iter().find(|(r, _)| r == &e.relation).expect("inserted above");
-            compiled.push(edit::compile_update(i, e, &shape.columns, &shape.gate)?);
+            compiled.push(edit::compile_update_with(i, e, &shape.columns, &shape.gate, &self.comparability)?);
         }
         Ok(compiled)
     }
@@ -549,13 +625,14 @@ impl PgDriver {
         request: &BrowseRequest,
     ) -> Result<(browse::CompiledBrowse, EditGate), DriverError> {
         let shape = self.relation_shape(client, &request.relation).await?;
-        let compiled = browse::compile(
+        let compiled = browse::compile_with(
             &request.relation,
             &shape.columns,
             request,
             self.ceiling,
             shape.is_table,
             &shape.keys,
+            &self.comparability,
         )?;
         Ok((compiled, shape.gate))
     }
@@ -764,6 +841,10 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            read_only: self.read_only.clone(),
+            comparability: self.comparability.clone(),
+            catalog: self.catalog.clone(),
+            max_connections: self.max_connections,
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -853,6 +934,8 @@ impl Driver for PgDriver {
             fixed_schema: true,
             supports_script: true,
             string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
+            read_only: self.read_only.clone(),
+            catalog: self.catalog.clone(),
         }
     }
 
@@ -871,7 +954,7 @@ impl Driver for PgDriver {
             .unwrap_or_default();
         let nodes = self
             .with_lease(false, async |client: &tokio_postgres::Client| {
-                navigator::children(&client, parent, &hidden).await
+                navigator::children(&client, parent, &hidden, &self.catalog).await
             })
             .await?;
         // A notice (permission-denied, a vanished relation) is not catalog

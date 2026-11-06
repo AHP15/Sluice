@@ -104,7 +104,13 @@ pub fn query_event(
     let duration_ms = started.elapsed().as_millis() as u64;
     let rows = rows.map(|r| r as u64);
     let error_kind = error.map(error_kind_label);
-    match (verbose().then_some(text).flatten(), error_kind) {
+    // T-025 / R-030: query text typed in the editor can carry a credential
+    // (`ALTER ROLE … PASSWORD '…'`) that never took the credential code path.
+    // Redacted here, before it reaches any formatter — and so before it can
+    // reach the copy-diagnostics preview, which is built from this log.
+    let redacted = verbose().then_some(text).flatten().map(|t| sluice_core::redact_statement(t).text);
+    let text = redacted.as_deref();
+    match (text, error_kind) {
         (Some(text), Some(e)) => {
             tracing::warn!(kind, profile, duration_ms, rows, error_kind = e, query_text = text, "query")
         }
@@ -397,6 +403,18 @@ mod tests {
         }
         assert!(!out.contains("123-45-6789"), "query text leaked with verbose off: {out}");
         assert!(!out.contains("query_text"), "{out}");
+    }
+
+    #[test]
+    fn verbose_query_text_is_redacted_before_it_is_logged() {
+        let _g = VERBOSE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_verbose(true);
+        let out = capture(|| {
+            query_event("script", "p", Instant::now(), None, None, Some("ALTER ROLE app PASSWORD 'hunter2'"))
+        });
+        set_verbose(false);
+        assert!(!out.contains("hunter2"), "credential reached the log: {out}");
+        assert!(out.contains("[redacted]"), "{out}");
     }
 
     #[test]

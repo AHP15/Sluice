@@ -1,0 +1,3 @@
+[test]
+# T-070: a DOM for component tests (happy-dom), no browser and no Tauri.
+preload = ["./tests/unit/setup-dom.ts"]

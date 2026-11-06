@@ -26,7 +26,7 @@ use sluice_core::{
 use tokio_postgres::types::Type;
 
 use crate::browse::{cast_target, qualified, render_segs, typed_param, typed_param_segs, wire_to_text, Seg};
-use crate::encode::{concurrency_comparable, quote_ident};
+use crate::encode::{quote_ident, Comparability};
 
 /// The relation's unique keys: one per valid, non-partial, non-expression
 /// unique index, key columns only (not `INCLUDE` columns), in key order.
@@ -104,6 +104,8 @@ pub struct CompiledEdit {
     /// Written columns the statement does NOT check against their value as
     /// read (T-073 F-4, T-058): protected by the unique key only.
     pub concurrency_omitted: Vec<String>,
+    /// T-060: written columns compared by their displayed text (opt-in).
+    pub concurrency_rendered: Vec<String>,
     /// `SELECT 1 … WHERE <key>`, run after a zero-row update to tell "the row
     /// is gone" from "the row changed since it was read".
     pub probe_sql: String,
@@ -149,6 +151,7 @@ impl CompiledEdit {
                 .collect(),
             inline: literals.map(|l| render_segs(&self.segs, |i| l[i].clone())),
             concurrency_omitted: self.concurrency_omitted.clone(),
+            concurrency_rendered: self.concurrency_rendered.clone(),
         }
     }
 
@@ -195,11 +198,23 @@ fn writable(v: &WireValue) -> Result<(), &'static str> {
 ///
 /// `columns` are the relation's real columns and types (from the same probe
 /// browse uses), and `gate` was derived from the catalog for this call.
+#[cfg(test)]
 pub fn compile_update(
     index: usize,
     edit: &EditRequest,
     columns: &[(String, Type)],
     gate: &EditGate,
+) -> Result<CompiledEdit, DriverError> {
+    compile_update_with(index, edit, columns, gate, &Comparability::fallback())
+}
+
+/// `cmp` is the connection's catalog-probed comparability (T-060).
+pub fn compile_update_with(
+    index: usize,
+    edit: &EditRequest,
+    columns: &[(String, Type)],
+    gate: &EditGate,
+    cmp: &Comparability,
 ) -> Result<CompiledEdit, DriverError> {
     let key = match gate {
         EditGate::Editable { key } => key,
@@ -280,19 +295,26 @@ pub fn compile_update(
     }
 
     // T-058: the concurrency predicate, over written columns only, in the
-    // order they are written.
+    // order they are written. T-060: comparability comes from this
+    // connection's catalog; a type with no equality can, on opt-in, be
+    // compared by the text the user was shown.
     let mut omitted = Vec::new();
+    let mut rendered = Vec::new();
     for s in &edit.set {
         let original = edit.originals.iter().find(|o| o.column == s.column);
-        let checkable = original.is_some_and(|o| {
-            !matches!(o.value, WireValue::Missing)
-                && o.value.is_comparable()
-                && ty(&o.column).is_some_and(concurrency_comparable)
-        });
-        match original {
-            Some(o) if checkable => {
+        let usable = original.filter(|o| !matches!(o.value, WireValue::Missing) && o.value.is_comparable());
+        match usable {
+            Some(o) if ty(&o.column).is_some_and(|t| cmp.comparable(t)) => {
                 b.sql(format!(" AND {} IS NOT DISTINCT FROM ", quote_ident(&o.column)));
                 b.param(o, col_type(o)?);
+            }
+            // Only where the value as read *is* the server's text form —
+            // json, xml, geometric and other exotic types ship that way — so
+            // the comparison is against exactly what was displayed.
+            Some(o) if edit.compare_rendered && shown_as_server_text(&o.value) => {
+                b.sql(format!(" AND ({})::text IS NOT DISTINCT FROM ", quote_ident(&o.column)));
+                b.param_text(o);
+                rendered.push(s.column.clone());
             }
             _ => omitted.push(s.column.clone()),
         }
@@ -312,9 +334,16 @@ pub fn compile_update(
         params: b.params,
         param_types: b.types,
         concurrency_omitted: omitted,
+        concurrency_rendered: rendered,
         probe_sql: format!("SELECT 1 FROM {rel} WHERE {}", probe_pred.join(" AND ")),
         probe_params,
     })
+}
+
+/// The value as read is the server's own text rendering, so `::text` of the
+/// stored value equals it exactly when nothing changed.
+fn shown_as_server_text(v: &WireValue) -> bool {
+    matches!(v, WireValue::Text(_) | WireValue::Opaque { .. } | WireValue::Null)
 }
 
 /// Accumulates one statement's segments and its bound parameters together,
@@ -330,6 +359,13 @@ impl Builder {
     fn sql(&mut self, s: impl Into<String>) {
         self.segs.push(Seg::Sql(s.into()));
     }
+    /// A parameter compared as plain text (T-060's rendered form).
+    fn param_text(&mut self, o: &Original) {
+        self.params.push(wire_to_text(&o.value));
+        self.types.push("text".into());
+        self.segs.extend(typed_param_segs(self.params.len(), &Type::TEXT));
+    }
+
     fn param(&mut self, o: &Original, ty: &Type) {
         self.params.push(wire_to_text(&o.value));
         self.types.push(if *ty == Type::BYTEA { "bytea (base64)".into() } else { cast_target(ty) });
@@ -366,7 +402,7 @@ mod tests {
         EditGate::Editable { key: vec!["id".into()] }
     }
     fn edit(key: Vec<Original>, set: Vec<Original>) -> EditRequest {
-        EditRequest { relation: rel(), key, set, originals: vec![] }
+        EditRequest { relation: rel(), key, set, originals: vec![], compare_rendered: false }
     }
 
     // ---- T-057 / R-003: preview and execution are one artifact -------------
@@ -426,7 +462,7 @@ mod tests {
             }
         }
         let key = vec![o("id", WireValue::Int((r.next() % 100) as i64))];
-        (cols, EditRequest { relation: rel(), key, set, originals })
+        (cols, EditRequest { relation: rel(), key, set, originals, compare_rendered: false })
     }
 
     /// Undo `inline_literal` — what the server reads the literal as, under
@@ -723,5 +759,34 @@ mod tests {
         .unwrap();
         assert_eq!(c.probe_sql, "SELECT 1 FROM \"public\".\"items\" WHERE \"id\" = ($1)::text::int8");
         assert_eq!(c.probe_params, vec![Some("1".into())]);
+    }
+
+    /// T-060: with the opt-in, a column with no equality is compared by its
+    /// displayed text; without it, it is reported as unprotected. Either way
+    /// the preview says which.
+    #[test]
+    fn rendered_form_comparison_is_opt_in_and_reported() {
+        let cols = vec![("id".to_string(), Type::INT4), ("doc".to_string(), Type::JSON)];
+        let doc = |v: &str| Original { column: "doc".into(), value: WireValue::Text(v.into()) };
+        let mut e = EditRequest {
+            relation: rel(),
+            key: vec![o("id", WireValue::Int(1))],
+            set: vec![doc(r#"{"b":2}"#)],
+            originals: vec![doc(r#"{"a": 1}"#)],
+            compare_rendered: false,
+        };
+        let probed = Comparability::from_probe([23, 25]);
+
+        let off = compile_update_with(0, &e, &cols, &editable(), &probed).unwrap();
+        assert_eq!(off.concurrency_omitted, vec!["doc"]);
+        assert!(!off.sql.contains("::text IS NOT DISTINCT FROM"), "{}", off.sql);
+
+        e.compare_rendered = true;
+        let on = compile_update_with(0, &e, &cols, &editable(), &probed).unwrap();
+        assert!(on.concurrency_omitted.is_empty());
+        assert_eq!(on.concurrency_rendered, vec!["doc"]);
+        assert!(on.sql.contains(r#"("doc")::text IS NOT DISTINCT FROM ($3)::text::text"#), "{}", on.sql);
+        assert_eq!(on.params[2].as_deref(), Some(r#"{"a": 1}"#), "compared against the text as read");
+        assert_eq!(on.planned().concurrency_rendered, vec!["doc"]);
     }
 }

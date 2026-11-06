@@ -21,6 +21,16 @@ use sluice_postgres::pinned::{PinnedSession, SessionStatus, TxState, IDLE_TRANSA
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
+/// T-044 / R-038: connections in every profile's budget that pinned editor
+/// sessions may never take, so the navigator and grid always have a pool to
+/// draw on, whatever the editor tabs are doing.
+pub const BROWSE_FLOOR: usize = 2;
+
+/// How many pinned editor sessions a budget allows: all of it but the floor.
+pub fn pinned_limit(budget: usize) -> usize {
+    budget.saturating_sub(BROWSE_FLOOR)
+}
+
 /// How often the reaper looks for idle open transactions.
 pub const REAP_EVERY: Duration = Duration::from_secs(20);
 
@@ -41,6 +51,19 @@ pub struct Editors {
     /// tab is refused until it explicitly reconnects (a new editor) — a
     /// release is never followed by a silent reconnect.
     released: Mutex<HashMap<String, String>>,
+}
+
+/// T-044: one pinned editor session, as the usage indicator lists it.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PinnedUsage {
+    pub editor_id: String,
+    /// The connection tab the editor belongs to.
+    pub session_id: String,
+    pub in_transaction: bool,
+    /// Session state held as of the last run (T-043).
+    pub holds: Vec<String>,
+    /// Running a statement right now.
+    pub busy: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -79,14 +102,28 @@ impl Editors {
     /// session holding any state, or running a statement, is never released:
     /// if no session qualifies, the new tab is refused instead, because a
     /// released session would silently be a different one (R-037).
-    pub async fn make_room(&self, profile_key: &str, budget: usize) -> Result<Option<EditorEvent>, DriverError> {
+    ///
+    /// `limit` is the pinned capacity — [`pinned_limit`] of the profile's
+    /// `budget` (T-044), so browsing keeps [`BROWSE_FLOOR`] connections.
+    pub async fn make_room(&self, profile_key: &str, limit: usize, budget: usize) -> Result<Option<EditorEvent>, DriverError> {
+        if limit == 0 {
+            return Err(DriverError::new(
+                sluice_core::ErrorKind::Conflict,
+                format!(
+                    "This profile's connection budget is {budget}, and {BROWSE_FLOOR} connections are always kept for \
+                     browsing, so there is no room for an editor session. Raise the profile's connection budget to at \
+                     least {} to open one.",
+                    BROWSE_FLOOR + 1
+                ),
+            ));
+        }
         let mut live = self.live.lock().await;
         let mine: Vec<(String, Arc<Mutex<PinnedSession>>)> = live
             .iter()
             .filter(|(_, e)| e.profile_key == profile_key)
             .map(|(k, e)| (k.clone(), e.pinned.clone()))
             .collect();
-        if mine.len() < budget {
+        if mine.len() < limit {
             return Ok(None);
         }
         // LRU among the eligible.
@@ -123,9 +160,10 @@ impl Editors {
             return Err(DriverError::new(
                 sluice_core::ErrorKind::Conflict,
                 format!(
-                    "This profile's connection budget is {budget}, and every editor session using it holds session state \
-                     or is busy{busy}{what}, so none can be released without losing it. Commit or roll back, close an \
-                     editor tab, or raise the profile's connection budget, then try again."
+                    "Editor sessions may use {limit} of this profile's {budget} connections ({BROWSE_FLOOR} are kept for \
+                     browsing), and every one holds session state or is busy{busy}{what}, so none can be released \
+                     without losing it. Commit or roll back, close an editor tab, or raise the profile's connection \
+                     budget, then try again."
                 ),
             ));
         };
@@ -151,6 +189,31 @@ impl Editors {
                 holds: vec![],
             },
         }))
+    }
+
+    /// T-044 / R-038: which editors hold a pinned session in this profile's
+    /// budget, and which of those hold a transaction or other session state —
+    /// so a refused tab can see why, and which tab to close.
+    pub async fn usage(&self, profile_key: &str) -> Vec<PinnedUsage> {
+        let live = self.live.lock().await;
+        let mut out = Vec::new();
+        for (id, e) in live.iter().filter(|(_, e)| e.profile_key == profile_key) {
+            // A session running a statement is held by that statement; it is
+            // reported as busy rather than waited on.
+            let (status, busy) = match e.pinned.try_lock() {
+                Ok(s) => (Some(s.status()), false),
+                Err(_) => (None, true),
+            };
+            out.push(PinnedUsage {
+                editor_id: id.clone(),
+                session_id: e.session_id.clone(),
+                in_transaction: status.as_ref().is_some_and(|s| !matches!(s.tx, TxState::Idle)),
+                holds: status.map(|s| s.holds).unwrap_or_default(),
+                busy,
+            });
+        }
+        out.sort_by(|a, b| a.editor_id.cmp(&b.editor_id));
+        out
     }
 
     pub async fn session_of(&self, id: &str) -> Option<String> {
@@ -303,7 +366,7 @@ mod tests {
 
         // Under the budget: nothing is released.
         editors.insert("old".into(), ed(d.open_pinned().await.unwrap())).await;
-        assert!(editors.make_room("p", 3).await.unwrap().is_none());
+        assert!(editors.make_room("p", 3, 5).await.unwrap().is_none());
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         editors.insert("newer".into(), ed(d.open_pinned().await.unwrap())).await;
@@ -313,7 +376,7 @@ mod tests {
 
         // At the budget (3 of 3): the LRU idle one goes, not the newer idle
         // one, and never the one holding a transaction.
-        let ev = editors.make_room("p", 3).await.unwrap().expect("one released");
+        let ev = editors.make_room("p", 3, 5).await.unwrap().expect("one released");
         assert_eq!(ev.editor_id, "old");
         assert_eq!(ev.kind, "released");
         assert!(ev.status.lost.as_deref().unwrap().contains("Reconnect"));
@@ -322,11 +385,11 @@ mod tests {
         assert!(editors.get("tx").await.is_some());
 
         // Another profile's editors are not this budget's concern.
-        assert!(editors.make_room("other", 1).await.unwrap().is_none());
+        assert!(editors.make_room("other", 1, 5).await.unwrap().is_none());
 
         // Now everything left holds a transaction: refuse, release nothing.
         editors.get("newer").await.unwrap().lock().await.begin().await.unwrap();
-        let e = editors.make_room("p", 2).await.unwrap_err();
+        let e = editors.make_room("p", 2, 5).await.unwrap_err();
         assert_eq!(e.kind, sluice_core::ErrorKind::Conflict);
         assert!(e.message.contains("an open transaction"), "{}", e.message);
         assert!(editors.get("newer").await.is_some() && editors.get("tx").await.is_some());
@@ -351,14 +414,14 @@ mod tests {
         d.run_pinned(&mut b, "CREATE TEMP TABLE t043e (x int)").await.unwrap();
         editors.insert("temp".into(), ed(b)).await;
 
-        let e = editors.make_room("p", 2).await.unwrap_err();
+        let e = editors.make_room("p", 2, 5).await.unwrap_err();
         assert!(e.message.contains("SET work_mem") && e.message.contains("1 temp table"), "{}", e.message);
         assert!(editors.get("setcfg").await.is_some() && editors.get("temp").await.is_some());
 
         // A stateless one alongside them is the one released, and its banner
         // says nothing but the connection was lost.
         editors.insert("plain".into(), ed(d.open_pinned().await.unwrap())).await;
-        let ev = editors.make_room("p", 3).await.unwrap().expect("released");
+        let ev = editors.make_room("p", 3, 5).await.unwrap().expect("released");
         assert_eq!(ev.editor_id, "plain");
         assert!(ev.message.contains("held no session state"), "{}", ev.message);
         editors.close_all().await;
@@ -379,5 +442,37 @@ mod tests {
         editors.close_all().await;
         let r = d.raw(RawRequest::Script("SELECT count(*) FROM public.t041_close".into())).await.unwrap();
         assert_eq!(r.first_rows().unwrap().1[0][0], WireValue::Text("0".into()));
+    }
+
+    /// T-044 / R-038: pinned sessions never take the last two connections.
+    #[test]
+    fn the_browse_floor_comes_out_of_every_budget() {
+        assert_eq!(pinned_limit(5), 3);
+        assert_eq!(pinned_limit(3), 1);
+        assert_eq!(pinned_limit(2), 0);
+        assert_eq!(pinned_limit(1), 0);
+    }
+
+    #[tokio::test]
+    async fn a_budget_with_no_room_beyond_the_floor_refuses_editors_and_says_why() {
+        let err = Editors::default().make_room("p", pinned_limit(2), 2).await.unwrap_err();
+        assert!(err.message.contains("kept for browsing") && err.message.contains("at least 3"), "{}", err.message);
+    }
+
+    /// T-044: the indicator lists which editors hold a transaction.
+    #[tokio::test]
+    async fn usage_lists_pinned_sessions_and_their_transactions() {
+        let Some(d) = driver().await else { return };
+        let editors = Editors::default();
+        editors.insert("a".into(), ed(d.open_pinned().await.unwrap())).await;
+        let mut tx = d.open_pinned().await.unwrap();
+        tx.begin().await.unwrap();
+        editors.insert("b".into(), ed(tx)).await;
+
+        let u = editors.usage("p").await;
+        assert_eq!(u.iter().map(|x| (x.editor_id.as_str(), x.in_transaction)).collect::<Vec<_>>(), vec![("a", false), ("b", true)]);
+        assert!(editors.usage("other").await.is_empty());
+        editors.close("a").await;
+        editors.close("b").await;
     }
 }

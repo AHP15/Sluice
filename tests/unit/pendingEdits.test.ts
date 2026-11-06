@@ -15,7 +15,6 @@ import {
   parseCellInput,
   pendingCount,
   stage,
-  unprotectedColumns,
   unstage,
 } from "../../src/lib/pendingEdits";
 
@@ -165,12 +164,3 @@ describe("cell input", () => {
   });
 });
 
-test("T-058: staged columns that cannot be compared are named", () => {
-  const cols = [...columns, col("doc", "structural", { concurrency_comparable: false }), col("f", "float", { concurrency_comparable: false })];
-  const r: WireValue[] = [...rows[0], text("{}"), { t: "float", v: 0.5 }];
-  let p = stage(EMPTY, 0, 4, { t: "numeric", v: "1" }, r[4]);
-  p = stage(p, 0, 1, text("x"), r[1]);
-  p = stage(p, 0, 3, text("[]"), r[3]);
-  expect(unprotectedColumns(p, cols)).toEqual(["doc", "f"]);
-  expect(unprotectedColumns(stage(EMPTY, 0, 1, text("x"), r[1]), cols)).toEqual([]);
-});

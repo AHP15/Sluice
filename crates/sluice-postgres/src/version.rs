@@ -33,7 +33,8 @@ impl Flavour {
             Flavour::Redshift => "redshift".into(),
             Flavour::Yugabyte => "yugabytedb".into(),
             Flavour::Greenplum => "greenplum".into(),
-            Flavour::Unknown(_) => "unknown".into(),
+            // T-055 / R-028: treated as vanilla, and said to be unverified.
+            Flavour::Unknown(_) => "vanilla, unverified".into(),
         }
     }
 }
@@ -196,7 +197,8 @@ mod tests {
     fn an_unrecognised_banner_is_unknown_never_guessed_vanilla() {
         let info = parse("SomeNewDB 3.1 speaking pgwire\nsecond line");
         assert_eq!(info.flavour, Flavour::Unknown("SomeNewDB 3.1 speaking pgwire".into()));
-        assert_eq!(info.flavour.name(), "unknown");
+        // T-055: recorded as unknown, *displayed* as vanilla and unverified.
+        assert_eq!(info.flavour.name(), "vanilla, unverified");
         assert!(!info.has_collation_determinism());
     }
 

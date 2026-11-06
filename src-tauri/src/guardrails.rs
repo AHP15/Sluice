@@ -20,7 +20,7 @@
 
 use std::net::IpAddr;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How a session's connection details were obtained.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,19 +36,27 @@ pub enum Provenance {
     CommandLine,
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryPolicy {
     On,
     Off,
 }
 
-/// Whether the database itself enforces read-only access (D-027). Probing the
-/// role is T-061's; until then nothing is known, and the UI must say so.
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SafetyMode {
-    Unknown,
+/// T-061 / D-027: safety mode is a guarantee only when the **database**
+/// enforces it. `requested` is the profile's intent; `database` is what the
+/// driver's probe found the server will actually refuse. The UI shows the
+/// gap between them rather than the app pretending to close it.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct SafetyMode {
+    pub requested: bool,
+    pub database: sluice_core::ReadOnlyGuarantee,
+}
+
+impl Default for SafetyMode {
+    fn default() -> Self {
+        Self { requested: false, database: sluice_core::ReadOnlyGuarantee::default() }
+    }
 }
 
 /// D-027's production flag: typed confirmation for DDL and unqualified
@@ -79,7 +87,7 @@ impl Guardrails {
             saved: false,
             production: ProductionGuard { armed: !reasons.is_empty(), reasons },
             history: HistoryPolicy::Off,
-            safety_mode: SafetyMode::Unknown,
+            safety_mode: SafetyMode::default(),
         }
     }
 
@@ -93,13 +101,28 @@ impl Guardrails {
             saved: false,
             production: ProductionGuard { armed, reasons },
             history: if armed { HistoryPolicy::Off } else { HistoryPolicy::On },
-            safety_mode: SafetyMode::Unknown,
+            safety_mode: SafetyMode::default(),
         }
     }
 
     /// After "save as profile": normal profile handling, per D-014 — history on
     /// unless the profile is production-flagged. The production flag itself is
     /// kept: saving is not a reason to trust a host more.
+    /// T-035: a profile's explicit history choice beats the derived default
+    /// (off for a production-flagged profile, on otherwise).
+    pub fn with_history(mut self, choice: Option<HistoryPolicy>) -> Self {
+        if let Some(h) = choice {
+            self.history = h;
+        }
+        self
+    }
+
+    /// T-061: record the profile's intent and what the database enforces.
+    pub fn with_safety(mut self, requested: bool, database: sluice_core::ReadOnlyGuarantee) -> Self {
+        self.safety_mode = SafetyMode { requested, database };
+        self
+    }
+
     pub fn saved(mut self) -> Self {
         self.saved = true;
         self.history = if self.production.armed { HistoryPolicy::Off } else { HistoryPolicy::On };
@@ -127,7 +150,7 @@ pub fn production_reasons(host: &str, database: &str) -> Vec<String> {
     reasons
 }
 
-fn is_loopback(host: &str) -> bool {
+pub fn is_loopback(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     if h.eq_ignore_ascii_case("localhost") || h.to_ascii_lowercase().ends_with(".localhost") {
         return true;
@@ -155,7 +178,7 @@ mod tests {
     fn a_discovered_session_is_defaulted_conservatively() {
         let g = Guardrails::ephemeral(Provenance::Discovered, "localhost", "app_dev");
         assert_eq!(g.history, HistoryPolicy::Off);
-        assert_eq!(g.safety_mode, SafetyMode::Unknown);
+        assert_eq!(g.safety_mode, SafetyMode::default());
         assert!(!g.saved);
         assert!(!g.production.armed, "{:?}", g.production.reasons);
     }
@@ -193,5 +216,18 @@ mod tests {
         let prod = Guardrails::ephemeral(Provenance::Discovered, "db.prod", "shop").saved();
         assert!(prod.production.armed, "saving must not disarm the guard");
         assert_eq!(prod.history, HistoryPolicy::Off);
+    }
+
+    /// T-035: history defaults off for production and on otherwise, and an
+    /// explicit per-profile choice wins either way.
+    #[test]
+    fn history_defaults_follow_production_and_a_profile_choice_overrides() {
+        assert_eq!(Guardrails::manual("db.prod.internal", "shop").history, HistoryPolicy::Off);
+        assert_eq!(Guardrails::manual("localhost", "app_dev").history, HistoryPolicy::On);
+        let opted_out = Guardrails::manual("localhost", "app_dev").with_history(Some(HistoryPolicy::Off));
+        assert_eq!(opted_out.history, HistoryPolicy::Off);
+        let opted_in = Guardrails::manual("db.prod.internal", "shop").with_history(Some(HistoryPolicy::On));
+        assert_eq!(opted_in.history, HistoryPolicy::On);
+        assert_eq!(Guardrails::manual("db.prod.internal", "shop").with_history(None).history, HistoryPolicy::Off);
     }
 }

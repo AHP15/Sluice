@@ -115,3 +115,42 @@ async fn connect_records_the_parsed_version_and_flavour() {
     assert!(caps.string_collation.is_some(), "PG 12+ runs the gated collation probe");
     eprintln!("detected: {} {version}", caps.flavour.unwrap());
 }
+
+/// T-055 / R-028: a real server probes every catalog area as available and
+/// its flavour as verified; with an area forced unavailable, navigation
+/// renders what did probe plus a note, never an error.
+#[tokio::test]
+async fn navigation_degrades_to_what_the_catalog_probe_found() {
+    let Some(d) = connect().await else { return };
+    let caps = d.capabilities();
+    assert!(caps.catalog.flavour_verified, "{:?}", caps.catalog);
+    assert_eq!(caps.catalog.unavailable().count(), 0, "{:?}", caps.catalog);
+
+    run(&d, "DROP TABLE IF EXISTS public.t055; CREATE TABLE public.t055 (id int PRIMARY KEY, name text);").await;
+    let table = NodeId { kind: "table".into(), path: vec!["public".into(), "t055".into()] };
+
+    let mut degraded = caps.catalog.clone();
+    for f in &mut degraded.features {
+        if f.id == "indexes" {
+            f.available = false;
+        }
+    }
+    let d2 = d.clone().with_catalog(degraded.clone());
+    let kids = d2.navigator_children(Some(table.clone())).await.expect("partial, not an error");
+    let labels: Vec<&str> = kids.iter().map(|n| n.label.as_str()).collect();
+    assert!(labels.iter().any(|l| l.starts_with("id ")), "columns still shown: {labels:?}");
+    assert!(labels.iter().any(|l| l.contains("indexes are not available")), "{labels:?}");
+    assert!(!kids.iter().any(|n| n.id.kind == "index"), "{labels:?}");
+
+    for f in &mut degraded.features {
+        if f.id == "relations" {
+            f.available = false;
+        }
+    }
+    let d3 = d.clone().with_catalog(degraded);
+    let kids = d3.navigator_children(Some(schema())).await.expect("a note, not an error");
+    assert_eq!(kids.len(), 1);
+    assert!(kids[0].label.contains("tables and views are not available"), "{:?}", kids[0]);
+
+    run(&d, "DROP TABLE public.t055;").await;
+}

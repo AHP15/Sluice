@@ -36,8 +36,13 @@ pub struct Predicate {
     pub case_insensitive: bool,
 }
 
+/// Adjacently tagged — `{"node": "and", "0": [...]}`, `{"node": "pred", "0":
+/// {...}}` — which is the shape `src/lib/contract.ts` declares. It was
+/// internally tagged, which serde cannot do for a newtype variant holding a
+/// sequence: every `and`/`or` tree failed to (de)serialize, so only a bare
+/// predicate could cross IPC (found by T-070's filter bar).
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "node", rename_all = "snake_case")]
+#[serde(tag = "node", content = "0", rename_all = "snake_case")]
 pub enum FilterTree {
     And(Vec<FilterTree>),
     Or(Vec<FilterTree>),
@@ -104,6 +109,11 @@ pub struct EditRequest {
     /// enter the predicate and MUST report the ones it dropped — see
     /// `Outcome::Affected::concurrency_omitted` (T-073 F-4).
     pub originals: Vec<Original>,
+    /// T-060 / R-035: the user opted in to comparing columns that have no
+    /// usable equality by their *displayed text* (`col::text IS NOT DISTINCT
+    /// FROM $n`), so protection degrades to "what you saw" instead of none.
+    #[serde(default)]
+    pub compare_rendered: bool,
 }
 
 /// One bound parameter of a planned statement, as it is sent (T-057).
@@ -130,6 +140,10 @@ pub struct PlannedStatement {
     pub inline: Option<String>,
     /// Written columns not checked for concurrent changes (T-058).
     pub concurrency_omitted: Vec<String>,
+    /// T-060: written columns checked by their displayed text rather than by
+    /// equality, because their type has none and the user opted in.
+    #[serde(default)]
+    pub concurrency_rendered: Vec<String>,
 }
 
 /// The statements a set of staged edits compiles to, previewed before apply.
@@ -169,4 +183,24 @@ impl EditPlan {
 pub enum RawRequest {
     Script(String),
     CommandDocument(String),
+}
+
+#[cfg(test)]
+mod filter_wire_tests {
+    use super::*;
+
+    /// The exact JSON the webview sends (`src/lib/filter.ts`).
+    #[test]
+    fn an_and_tree_round_trips_in_the_webviews_shape() {
+        let json = r#"{"node":"and","0":[
+            {"node":"pred","0":{"column":"a","op":"eq","value":{"t":"text","v":"x"}}},
+            {"node":"or","0":[{"node":"pred","0":{"column":"b","op":"is_null","value":{"t":"null"}}}]}
+        ]}"#;
+        let tree: FilterTree = serde_json::from_str(json).expect("webview shape must parse");
+        let FilterTree::And(items) = &tree else { panic!("{tree:?}") };
+        assert_eq!(items.len(), 2);
+        let back = serde_json::to_string(&tree).expect("and/or must serialize");
+        let again: FilterTree = serde_json::from_str(&back).unwrap();
+        assert!(matches!(again, FilterTree::And(ref v) if v.len() == 2));
+    }
 }

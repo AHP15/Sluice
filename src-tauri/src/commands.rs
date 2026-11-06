@@ -27,6 +27,7 @@ use crate::guardrails::{Guardrails, Provenance};
 use crate::launcher::{LaunchOrigin, LaunchOutcome, Launcher};
 use crate::stream::{CreditGate, Stop, StreamEvent, Streams, BATCH_ROWS, MAX_IN_FLIGHT, STREAM_DEADLINE};
 use sluice_config::connection_url::ConnectionUrl;
+use sluice_state::profile::{CredentialProvider, Transport};
 
 /// Non-secret connection metadata. This is the ONLY connection shape the
 /// webview ever sees or sends.
@@ -51,6 +52,22 @@ pub struct ProfileMeta {
     /// together. Unset means `DEFAULT_CONNECTION_BUDGET`.
     #[serde(default)]
     pub connection_budget: Option<u32>,
+    /// T-038 / D-008: how the connection travels. Only `direct` connects.
+    #[serde(default)]
+    pub transport: Transport,
+    /// T-038 / D-008: where the password comes from — a provider, never the
+    /// password itself.
+    #[serde(default)]
+    pub auth: CredentialProvider,
+    /// T-035 / D-014: this profile's query-history choice. Unset means the
+    /// default — off for a production-flagged profile, on otherwise.
+    #[serde(default)]
+    pub history: Option<crate::guardrails::HistoryPolicy>,
+    /// T-061 / D-027: this profile is meant to be read-only. A statement of
+    /// intent only — whether the database enforces it is probed at connect
+    /// and reported beside it (`Guardrails.safety_mode`).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// What the UI learns after connecting.
@@ -65,6 +82,49 @@ pub struct SessionInfo {
     /// whatever opened it. The authoritative copy is the core's (see
     /// `SessionRecord`); this is the UI's view of it.
     pub guardrails: Guardrails,
+    /// T-044 / R-038: set when the profile's budget was raised past the
+    /// default — a deliberate choice, made knowing whose connections it uses.
+    pub budget_warning: Option<String>,
+}
+
+/// T-044 / R-038: a budget above the default is allowed, but said plainly:
+/// every connection it allows comes out of the server's `max_connections`,
+/// which every other client shares.
+pub fn budget_warning(budget: usize, max_connections: Option<i64>) -> Option<String> {
+    if budget <= sluice_postgres::DEFAULT_CONNECTION_BUDGET {
+        return None;
+    }
+    let server = match max_connections {
+        Some(m) => format!("the server's max_connections is {m}, shared by every client and application using it"),
+        None => "the server's max_connections is shared by every client and application using it".to_string(),
+    };
+    Some(format!(
+        "This profile may hold up to {budget} connections (the default is {}), and each tab on it shares them; {server}. \
+         Raise it only if this server has room to spare.",
+        sluice_postgres::DEFAULT_CONNECTION_BUDGET
+    ))
+}
+
+/// T-044: the usage indicator's view of one profile's budget.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConnectionUsage {
+    pub budget: usize,
+    /// Always kept for the navigator and grid.
+    pub browse_floor: usize,
+    /// How many pinned editor sessions the budget allows.
+    pub pinned_limit: usize,
+    pub pinned: Vec<PinnedUsageView>,
+    pub max_connections: Option<i64>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct PinnedUsageView {
+    pub editor_id: String,
+    /// The connection tab the editor belongs to, as the user named it.
+    pub tab: String,
+    pub in_transaction: bool,
+    pub holds: Vec<String>,
+    pub busy: bool,
 }
 
 /// What the core remembers about a live session beyond its driver.
@@ -107,6 +167,24 @@ impl AppState {
         }
     }
 
+    /// T-034: store a password split off an imported URL.
+    pub fn store_credential_for(&self, profile_id: &str, secret: &Secret<String>) -> Result<Backend, DriverError> {
+        self.creds
+            .store(profile_id, secret)
+            .map_err(|e| DriverError::new(ErrorKind::PermissionDenied, e.to_string()))
+    }
+
+    /// T-035: whose history a session's statements go to, and whether they go
+    /// at all. The policy is the core's copy of the guardrails, not the UI's.
+    async fn history_target(&self, session_id: &str) -> Option<(String, crate::guardrails::HistoryPolicy)> {
+        self.sessions.lock().await.get(session_id).map(|r| (r.target.id.clone(), r.guardrails.history))
+    }
+
+    /// A deleted profile must not leave its password behind (T-036).
+    pub fn forget_credential(&self, profile_id: &str) {
+        let _ = self.creds.delete(profile_id);
+    }
+
     async fn profile_key(&self, session_id: &str) -> Option<String> {
         self.sessions.lock().await.get(session_id).map(|r| r.profile_key.clone())
     }
@@ -123,6 +201,74 @@ impl AppState {
             .cloned()
             .ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such session"))
     }
+}
+
+/// T-038 / D-008: only `direct` is built. The others are in the schema so the
+/// file format need not change when they arrive; until then a profile that
+/// names one is refused with what to do instead, never connected directly
+/// behind the user's back.
+fn require_direct(t: &Transport) -> Result<(), DriverError> {
+    match t {
+        Transport::Direct {} => Ok(()),
+        Transport::SshTunnel { .. } => Err(DriverError::new(
+            ErrorKind::ConnectionFailed,
+            "built-in SSH tunnels are not available yet — run `ssh -L <local-port>:<db-host>:<db-port> <bastion>` \
+             and point a direct profile at localhost:<local-port>",
+        )),
+        Transport::Proxy { .. } => Err(DriverError::new(
+            ErrorKind::ConnectionFailed,
+            "proxy transports are not available yet — start the proxy yourself and point a direct profile at its local address",
+        )),
+    }
+}
+
+/// T-038 / D-008: resolve the profile's credential *provider* to a password.
+/// Returns the password (if any) and, for the keychain, why an existing item
+/// could not be read (T-071).
+///
+/// R-017: the environment is a credential parse boundary, so an `env` value
+/// is wrapped in `Secret` the moment it is read.
+fn resolve_auth(
+    creds: &CredentialStore,
+    profile_id: &str,
+    auth: &CredentialProvider,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(Option<Secret<String>>, Option<String>), DriverError> {
+    match auth {
+        CredentialProvider::Keychain {} => Ok(match creds.resolve(profile_id) {
+            Ok(p) => (Some(p), None),
+            Err(crate::credentials::CredentialError::Unreadable(why)) => (None, Some(why)),
+            Err(_) => (None, None),
+        }),
+        CredentialProvider::Env { var } => match env(var) {
+            Some(v) => Ok((Some(Secret::new(v)), None)),
+            None => Err(DriverError::new(
+                ErrorKind::AuthFailed,
+                format!("this profile reads its password from the environment variable `{var}`, which is not set"),
+            )),
+        },
+        other => Err(DriverError::new(
+            ErrorKind::AuthFailed,
+            format!("the `{}` credential provider is not available yet", other.label()),
+        )),
+    }
+}
+
+/// T-071 / R-016: an authentication failure is recoverable by re-entering the
+/// password, so say so in the error rather than leaving a dead end. When the
+/// keychain item was unreadable, the message names that as the likely cause.
+fn credential_reentry(mut e: DriverError, unreadable: Option<&str>) -> DriverError {
+    if e.kind == ErrorKind::AuthFailed {
+        e.hints.credential_reentry = Some(true);
+        if let Some(why) = unreadable {
+            e.message = format!(
+                "{} — the stored password could not be read from the keychain ({why}); \
+                 it may have been saved by a differently-signed build. Enter it again to re-store it.",
+                e.message
+            );
+        }
+    }
+    e
 }
 
 fn sid(s: &str) -> SessionId {
@@ -159,7 +305,14 @@ pub async fn connect(
 ) -> Result<SessionInfo, DriverError> {
     guard_driver_call(&sid(&profile.id), async {
         // D-007: the id becomes a credential HERE, in the core, at connect time.
-        let password = state.creds.resolve(&profile.id).ok();
+        //
+        // T-071 / R-016: a keychain item that will not open is not fatal. The
+        // connect is attempted without it (trust auth, `.pgpass` and service
+        // files may still succeed); if the server then refuses, the error asks
+        // the UI to collect the password again, which re-stores it under this
+        // build's identity.
+        require_direct(&profile.transport)?;
+        let (password, unreadable) = resolve_auth(&state.creds, &profile.id, &profile.auth, |v| std::env::var(v).ok())?;
 
         let spec = ConnectSpec {
             host: profile.host.clone(),
@@ -188,17 +341,20 @@ pub async fn connect(
                 let redactor = sluice_core::Redactor::new(spec.password.clone());
                 let d = logged("connect", &profile.id, None, |_| None, PgDriver::connect_with_pool_size(spec, budget))
                     .await
-                    .map_err(|e| redactor.error(e))?;
+                    .map_err(|e| credential_reentry(redactor.error(e), unreadable.as_deref()))?;
                 state.profiles.lock().await.insert(profile_key.clone(), Arc::downgrade(&d));
                 d
             }
         };
         let capabilities = driver.capabilities();
+        let (driver_budget, driver_max) = (driver.connection_budget(), driver.max_connections());
 
         let session_id = format!("{}::{}", profile.id, short_token());
         state.drivers.lock().await.insert(session_id.clone(), driver);
 
-        let guardrails = Guardrails::manual(&profile.host, &profile.dbname);
+        let guardrails = Guardrails::manual(&profile.host, &profile.dbname)
+            .with_history(profile.history)
+            .with_safety(profile.read_only, capabilities.read_only.clone());
         state.sessions.lock().await.insert(
             session_id.clone(),
             SessionRecord {
@@ -215,6 +371,7 @@ pub async fn connect(
             capabilities,
             tls_warning: profile.tls.warning().map(str::to_string),
             guardrails,
+            budget_warning: budget_warning(driver_budget, driver_max),
         })
     })
     .await
@@ -275,7 +432,8 @@ pub async fn connect_launch(
             LaunchOrigin::Evaluated { .. } => Provenance::Evaluated,
             LaunchOrigin::Url => Provenance::CommandLine,
         };
-        let guardrails = Guardrails::ephemeral(provenance, &t.host, &t.database);
+        let guardrails =
+            Guardrails::ephemeral(provenance, &t.host, &t.database).with_safety(false, capabilities.read_only.clone());
         state.sessions.lock().await.insert(
             session_id.clone(),
             SessionRecord {
@@ -291,6 +449,10 @@ pub async fn connect_launch(
                     tls: t.tls,
                     statement_timeout_secs: None,
                     connection_budget: None,
+                    transport: Transport::default(),
+                    auth: CredentialProvider::default(),
+                    history: None,
+                    read_only: false,
                 },
                 statement_timeout: timeout,
                 // R-002: a launch is its own ephemeral profile, and its budget.
@@ -303,6 +465,7 @@ pub async fn connect_launch(
             capabilities,
             tls_warning: t.tls.warning().map(str::to_string),
             guardrails,
+            budget_warning: None,
         })
     })
     .await
@@ -430,18 +593,22 @@ pub async fn cancel_stream(
 pub struct SavedProfile {
     pub profile: ProfileMeta,
     pub guardrails: Guardrails,
+    /// T-037 / R-019: the one-time "this file names your hosts" notice.
+    pub notice: Option<String>,
 }
 
 /// T-027: "save as profile" for a discovered or command-line session.
 ///
 /// The inline password, if any, moves into the keychain **here, in the core**
 /// (D-007) — the webview receives profile metadata only. The session then gets
-/// normal profile handling (D-014), keeping its production flag. Persisting the
-/// profile's metadata across restarts is T-036's; within this run the returned
-/// `ProfileMeta` connects through the ordinary `connect` command.
+/// normal profile handling (D-014), keeping its production flag, and (T-036)
+/// its metadata is written to the portable profile file so it survives a
+/// restart.
 #[tauri::command]
 pub async fn save_session_as_profile(
     state: tauri::State<'_, AppState>,
+    stores: tauri::State<'_, crate::state::Stores>,
+    file: tauri::State<'_, crate::workspace::WorkspaceFile>,
     session_id: String,
     label: String,
 ) -> Result<SavedProfile, DriverError> {
@@ -466,10 +633,61 @@ pub async fn save_session_as_profile(
                 return Err(DriverError::new(ErrorKind::PermissionDenied, e.to_string()));
             }
         }
+        let persisted = stores.dirs().and_then(|d| {
+            file.update(&d.config, |ws| {
+                ws.profiles.push(crate::workspace::ProfileEntry::from_meta(&profile));
+                Ok(())
+            })
+        });
+        if let Err(e) = persisted {
+            // Same rule: undo the keychain write and keep the session unsaved.
+            let _ = state.creds.delete(&profile.id);
+            record.ephemeral_url = Some(url);
+            return Err(e);
+        }
 
         record.guardrails = record.guardrails.clone().saved();
         record.target = profile.clone();
-        Ok(SavedProfile { profile, guardrails: record.guardrails.clone() })
+        let notice = stores.dirs().ok().and_then(|d| crate::workspace::topology_notice(&d.data, &profile.host));
+        Ok(SavedProfile { profile, guardrails: record.guardrails.clone(), notice })
+    })
+    .await
+}
+
+/// T-044 / R-038: who is using this tab's profile budget — which editor
+/// tabs hold pinned sessions, and which of those hold a transaction or other
+/// session state — so the user can see why a new editor was refused.
+#[tauri::command]
+pub async fn connection_usage(
+    state: tauri::State<'_, AppState>,
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
+    session_id: String,
+) -> Result<ConnectionUsage, DriverError> {
+    guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        let profile_key = state.profile_key(&session_id).await.unwrap_or_else(|| session_id.clone());
+        let budget = d.connection_budget();
+        let labels: HashMap<String, String> =
+            state.sessions.lock().await.iter().map(|(id, r)| (id.clone(), r.target.label.clone())).collect();
+        let pinned = editors
+            .usage(&profile_key)
+            .await
+            .into_iter()
+            .map(|u| PinnedUsageView {
+                tab: labels.get(&u.session_id).cloned().unwrap_or_else(|| u.session_id.clone()),
+                editor_id: u.editor_id,
+                in_transaction: u.in_transaction,
+                holds: u.holds,
+                busy: u.busy,
+            })
+            .collect();
+        Ok(ConnectionUsage {
+            budget,
+            browse_floor: crate::editor::BROWSE_FLOOR,
+            pinned_limit: crate::editor::pinned_limit(budget),
+            pinned,
+            max_connections: d.max_connections(),
+        })
     })
     .await
 }
@@ -655,7 +873,9 @@ pub async fn open_editor(
         // T-042 / D-028: within the profile's one budget — release an idle
         // editor (LRU) or refuse, never evict an open transaction.
         let profile_key = state.profile_key(&session_id).await.unwrap_or_else(|| session_id.clone());
-        if let Some(ev) = editors.make_room(&profile_key, d.connection_budget()).await? {
+        // T-044 / R-038: pinned sessions get the budget minus the browse floor.
+        let budget = d.connection_budget();
+        if let Some(ev) = editors.make_room(&profile_key, crate::editor::pinned_limit(budget), budget).await? {
             use tauri::Emitter;
             let _ = app.emit(crate::editor::EDITOR_EVENT, ev);
         }
@@ -686,11 +906,15 @@ pub struct EditorRun {
 #[tauri::command]
 pub async fn run_in_editor(
     state: tauri::State<'_, AppState>,
+    stores: tauri::State<'_, crate::state::Stores>,
     editors: tauri::State<'_, Arc<crate::editor::Editors>>,
     editor_id: String,
     script: String,
     query_id: Option<String>,
+    confirm: Option<String>,
 ) -> Result<EditorRun, DriverError> {
+    let started = std::time::Instant::now();
+    let for_history = script.clone();
     // T-042: a released editor is refused until it reconnects explicitly.
     if let Some(why) = editors.released(&editor_id).await {
         return Err(DriverError::new(ErrorKind::ConnectionFailed, why));
@@ -699,6 +923,7 @@ pub async fn run_in_editor(
         .session_of(&editor_id)
         .await
         .ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
+    production_gate(&state, &session_id, &script, confirm.as_deref()).await?;
     let r = guard_driver_call(&sid(&session_id), async {
         let pinned = editors.get(&editor_id).await.ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
         let d = state.driver(&session_id).await?;
@@ -716,7 +941,10 @@ pub async fn run_in_editor(
         Ok(EditorRun { run: ScriptRun { result, summary }, status })
     })
     .await;
-    state.redacted(&session_id, r).await
+    let r = state.redacted(&session_id, r).await;
+    let target = state.history_target(&session_id).await;
+    record_history(&stores, target, &for_history, started, r.as_ref().map(|run| &run.run.result));
+    r
 }
 
 /// T-041: the opt-in transaction controls.
@@ -777,10 +1005,16 @@ pub struct ScriptRun {
 #[tauri::command]
 pub async fn run_script(
     state: tauri::State<'_, AppState>,
+    stores: tauri::State<'_, crate::state::Stores>,
     session_id: String,
     script: String,
     query_id: Option<String>,
+    confirm: Option<String>,
 ) -> Result<ScriptRun, DriverError> {
+    production_gate(&state, &session_id, &script, confirm.as_deref()).await?;
+    let started = std::time::Instant::now();
+    let target = state.history_target(&session_id).await;
+    let for_history = script.clone();
     let r = guard_driver_call(&sid(&session_id), async {
         let d = state.driver(&session_id).await?;
         let limit = state.timeout(&session_id).await;
@@ -796,7 +1030,67 @@ pub async fn run_script(
         Ok(ScriptRun { result, summary })
     })
     .await;
-    state.redacted(&session_id, r).await
+    let r = state.redacted(&session_id, r).await;
+    record_history(&stores, target, &for_history, started, r.as_ref().map(|run| &run.result));
+    r
+}
+
+/// T-061 / D-027: on a production-armed session, DDL and unqualified
+/// DELETE/UPDATE run only after the user types the database name. Enforced
+/// here, in the core, from the session's own guardrails (T-027) — not from a
+/// UI flag the webview could skip. A refusal carries what needs confirming,
+/// and nothing has run.
+pub(crate) async fn production_gate(
+    state: &AppState,
+    session_id: &str,
+    script: &str,
+    confirm: Option<&str>,
+) -> Result<(), DriverError> {
+    let (armed, phrase) = match state.sessions.lock().await.get(session_id) {
+        Some(r) => (r.guardrails.production.armed, r.target.dbname.clone()),
+        None => return Ok(()),
+    };
+    check_confirmation(armed, &phrase, script, confirm)
+}
+
+fn check_confirmation(armed: bool, phrase: &str, script: &str, confirm: Option<&str>) -> Result<(), DriverError> {
+    if !armed {
+        return Ok(());
+    }
+    let statements = sluice_core::dangerous_statements(script);
+    if statements.is_empty() || confirm.map(str::trim) == Some(phrase) {
+        return Ok(());
+    }
+    let mut e = DriverError::new(
+        ErrorKind::Conflict,
+        format!("this is a production connection — type `{phrase}` to confirm"),
+    );
+    e.hints.confirmation = Some(sluice_core::ConfirmationRequest { phrase: phrase.to_string(), statements });
+    Err(e)
+}
+
+/// T-035 / T-025: append one execution to query history, if the session's
+/// policy allows it. The statement is redacted (R-030) **before** it reaches
+/// the store, which never sees the raw text. Best-effort: failing to record
+/// history must never fail the query that ran.
+fn record_history(
+    stores: &crate::state::Stores,
+    target: Option<(String, crate::guardrails::HistoryPolicy)>,
+    script: &str,
+    started: std::time::Instant,
+    result: Result<&ExecutionResult, &DriverError>,
+) {
+    let Some((profile_id, crate::guardrails::HistoryPolicy::On)) = target else { return };
+    if script.trim().is_empty() {
+        return;
+    }
+    let (outcome, rows) = match result {
+        Ok(r) => ("ok", rows_in(r).map(|n| n as i64)),
+        Err(e) if e.kind == ErrorKind::Cancelled => ("cancelled", None),
+        Err(_) => ("error", None),
+    };
+    let stored = sluice_core::redact_statement(script);
+    stores.record_history(&profile_id, &stored, outcome, started.elapsed().as_millis() as i64, rows);
 }
 
 /// T-018: pull one oversized value on demand.
@@ -874,7 +1168,7 @@ pub async fn debug_panicking_driver_call() -> Result<String, DriverError> {
     .await
 }
 
-fn short_token() -> String {
+pub(crate) fn short_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -900,12 +1194,96 @@ mod boundary_tests {
         }
     }
 
+    /// T-061: confirmation is required only when armed and only for the
+    /// statements that need it; the exact phrase runs it.
+    /// T-044: raising the budget is allowed and said plainly; the default is not.
+    #[test]
+    fn a_raised_budget_carries_the_max_connections_warning() {
+        assert_eq!(budget_warning(sluice_postgres::DEFAULT_CONNECTION_BUDGET, Some(100)), None);
+        let w = budget_warning(20, Some(100)).unwrap();
+        assert!(w.contains("20 connections") && w.contains("max_connections is 100"), "{w}");
+        assert!(budget_warning(20, None).unwrap().contains("max_connections"));
+    }
+
+    #[test]
+    fn production_sessions_require_the_typed_database_name() {
+        assert!(check_confirmation(false, "shop", "DROP TABLE t", None).is_ok(), "unarmed: no gate");
+        assert!(check_confirmation(true, "shop", "SELECT 1", None).is_ok(), "harmless: no gate");
+
+        let e = check_confirmation(true, "shop", "SELECT 1; DELETE FROM orders", None).unwrap_err();
+        let c = e.hints.confirmation.expect("says what to confirm");
+        assert_eq!(c.phrase, "shop");
+        assert_eq!(c.statements.len(), 1);
+        assert!(c.statements[0].statement.starts_with("DELETE FROM orders"));
+
+        assert!(check_confirmation(true, "shop", "DELETE FROM orders", Some("Shop")).is_err(), "exact, case and all");
+        assert!(check_confirmation(true, "shop", "DELETE FROM orders", Some("yes")).is_err());
+        assert!(check_confirmation(true, "shop", "DELETE FROM orders", Some(" shop ")).is_ok());
+    }
+
+    #[test]
+    fn only_direct_transports_connect() {
+        assert!(require_direct(&Transport::default()).is_ok());
+        let e = require_direct(&Transport::SshTunnel { host: "bastion".into(), port: None, user: None }).unwrap_err();
+        assert!(e.message.contains("ssh -L"), "{}", e.message);
+        assert!(require_direct(&Transport::Proxy { address: "127.0.0.1:5433".into() }).is_err());
+    }
+
+    #[test]
+    fn credential_providers_resolve_or_say_why_not() {
+        let dir = std::env::temp_dir().join(format!("sluice-auth-{}", short_token()));
+        let creds = CredentialStore::with_fallback_dir(dir);
+        let env = |v: &str| (v == "SET").then(|| "from-env".to_string());
+
+        let (pw, _) = resolve_auth(&creds, "p", &CredentialProvider::Env { var: "SET".into() }, env).unwrap();
+        assert_eq!(pw.unwrap().expose(), "from-env");
+
+        let e = resolve_auth(&creds, "p", &CredentialProvider::Env { var: "UNSET".into() }, env).unwrap_err();
+        assert!(e.message.contains("UNSET"), "{}", e.message);
+        assert!(!e.message.contains("from-env"));
+
+        // No stored password is not an error: trust auth and .pgpass may apply.
+        let (pw, why) = resolve_auth(&creds, "p", &CredentialProvider::Keychain {}, env).unwrap();
+        assert!(pw.is_none() && why.is_none());
+
+        for p in [CredentialProvider::Static {}, CredentialProvider::IamToken {}] {
+            assert!(resolve_auth(&creds, "p", &p, env).is_err(), "{p:?}");
+        }
+    }
+
+    /// T-071 / R-016: an auth failure asks for re-entry instead of dead-ending,
+    /// and names the unreadable keychain item when that was the cause.
+    #[test]
+    fn auth_failures_ask_for_credential_reentry() {
+        let e = credential_reentry(DriverError::new(ErrorKind::AuthFailed, "password authentication failed"), None);
+        assert_eq!(e.hints.credential_reentry, Some(true));
+
+        let e = credential_reentry(
+            DriverError::new(ErrorKind::AuthFailed, "password authentication failed"),
+            Some("keychain platform error"),
+        );
+        assert!(e.message.contains("could not be read from the keychain"), "{}", e.message);
+
+        let other = credential_reentry(DriverError::new(ErrorKind::ConnectionFailed, "refused"), Some("x"));
+        assert_eq!(other.hints.credential_reentry, None);
+        assert_eq!(other.message, "refused");
+    }
+
     /// T-006: the acceptance says *every* IPC command boundary is wrapped.
     /// Reviewing for that decays; checking it does not.
     #[test]
     fn every_tauri_command_is_panic_guarded() {
         const MARKER: &str = "#[tauri::command]";
-        let src = command_source();
+        // Every module that defines IPC commands, not just this one.
+        let mut src = command_source().to_string();
+        for (name, other) in [("state.rs", include_str!("state.rs")), ("workspace.rs", include_str!("workspace.rs"))] {
+            // Cut at the test *module*, not the first `#[cfg(test)]` — a
+            // test-only helper above the commands must not hide them.
+            let other = &other[..other.find("#[cfg(test)]\nmod tests").unwrap_or(other.len())];
+            assert!(other.contains(MARKER), "{name} commands are not being scanned");
+            src.push('\n');
+            src.push_str(other);
+        }
         let segments: Vec<&str> = src.split(MARKER).skip(1).collect();
         assert!(
             !segments.is_empty(),
@@ -960,6 +1338,10 @@ mod boundary_tests {
             tls: TlsMode::Verify,
             statement_timeout_secs: None,
             connection_budget: None,
+            transport: Transport::default(),
+            auth: CredentialProvider::Env { var: "APP_DB_PASS".into() },
+            history: Some(crate::guardrails::HistoryPolicy::Off),
+            read_only: true,
         };
         let json = serde_json::to_string(&p).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {
@@ -982,8 +1364,13 @@ mod boundary_tests {
                 tls: TlsMode::Verify,
                 statement_timeout_secs: None,
                 connection_budget: None,
+                transport: Transport::default(),
+                auth: CredentialProvider::default(),
+                history: None,
+                read_only: false,
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
+            notice: None,
         };
         let json = serde_json::to_string(&saved).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {

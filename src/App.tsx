@@ -19,10 +19,14 @@ import {
 } from "./lib/pendingEdits";
 import { Button } from "./components/ui/button";
 import type {
+  CatalogSupport,
   ColumnDesc,
+  ConfirmationRequest,
+  DriverError,
   EditGate,
   EditPlan,
   EditRequest,
+  FilterTree,
   Guardrails,
   LaunchOutcome,
   NavNode,
@@ -48,6 +52,12 @@ import {
   type SessionStatus,
   connectLaunch,
   coreVersion,
+  deleteProfile,
+  importConnectionUrl,
+  loadWorkspace,
+  queryClient,
+  saveProfile,
+  WORKSPACE_KEY,
   diagnosticsPreview,
   disconnect,
   runScript,
@@ -58,6 +68,13 @@ import {
   verboseDiagnostics,
 } from "./lib/ipc";
 import { useUiStore } from "./store/ui";
+import { cn } from "./lib/utils";
+import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
+import { SavedQueries } from "./components/SavedQueries";
+import { FilterBar } from "./components/FilterBar";
+import { ConfirmPanel } from "./components/ConfirmPanel";
+import { ConnectionUsageIndicator } from "./components/ConnectionUsage";
+import { invalidateHistory } from "./components/HistoryPanel";
 
 interface RowsView {
   columns: ColumnDesc[];
@@ -340,8 +357,11 @@ function Workspace({ seed }: { seed: TabSeed }) {
   // A closed tab stops its stream.
   useEffect(() => () => streamRef.current?.cancel(), []);
 
+  // T-070 / D-005: the relation on screen, so the filter bar can re-browse it.
+  const browsedNode = useRef<NavNode | null>(null);
+
   const onSelectRelation = useCallback(
-    (node: NavNode) => {
+    (node: NavNode, filter: FilterTree | null = null) => {
       if (!session) return;
       if (holdForPending()) return;
       streamRef.current?.cancel();
@@ -351,12 +371,13 @@ function Workspace({ seed }: { seed: TabSeed }) {
       setError(null);
       setOutcomes(null);
       setSummary(null);
+      browsedNode.current = node;
       const label = node.id.path.join(".");
       // T-009: the grid issues ONLY this structured request. It never builds
       // SQL, and it does not know what engine is on the other end.
       const stream = RowStream.open(
         session.session_id,
-        { relation: node.id, filter: null, sort: [], limit: 500, cursor: null },
+        { relation: node.id, filter, sort: [], limit: 500, cursor: null },
         (e) => {
           if (streamRef.current !== stream) return; // superseded
           switch (e.kind) {
@@ -393,11 +414,15 @@ function Workspace({ seed }: { seed: TabSeed }) {
   // T-051: the running script's id, so Stop can cancel it.
   const runningQuery = useRef<string | null>(null);
 
-  const onRun = useCallback(async () => {
+  // T-061: statements a production session held back, awaiting typed confirmation.
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
+
+  const onRun = useCallback(async (confirm?: string) => {
     if (!session) return;
     if (holdForPending()) return;
     setBusy(true);
     setError(null);
+    setConfirmation(null);
     const queryId = crypto.randomUUID();
     runningQuery.current = queryId;
     try {
@@ -411,7 +436,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
           return;
         }
         try {
-          const r = await runInEditor(id, draftQuery, queryId);
+          const r = await runInEditor(id, draftQuery, queryId, confirm);
           setEditor((e) => (e ? { ...e, status: r.status } : e));
           run = r.run;
         } catch (e) {
@@ -422,7 +447,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
           throw e;
         }
       } else {
-        run = await runScript(session.session_id, draftQuery, queryId);
+        run = await runScript(session.session_id, draftQuery, queryId, confirm);
       }
       setOutcomes(run.result.outcomes);
       setSummary(run.summary);
@@ -436,10 +461,14 @@ function Workspace({ seed }: { seed: TabSeed }) {
         });
       }
     } catch (e) {
-      setError(String((e as { message?: string })?.message ?? e));
+      const held = (e as DriverError)?.hints?.confirmation;
+      if (held) setConfirmation(held);
+      else setError(String((e as { message?: string })?.message ?? e));
     } finally {
       runningQuery.current = null;
       setBusy(false);
+      // T-035: the core recorded it (or not, per the profile's policy).
+      invalidateHistory();
     }
   }, [session, draftQuery, pending, pinsSocket, editor]);
 
@@ -534,11 +563,12 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 Stop
               </Button>
             ) : (
-              <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
+              <Button size="sm" variant="secondary" onClick={() => void onRun()} disabled={!session || busy}>
                 <Play className="h-3.5 w-3.5" />
                 Run
               </Button>
             )}
+            {session && <ConnectionUsageIndicator sessionId={session.session_id} />}
             <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
@@ -554,6 +584,14 @@ function Workspace({ seed }: { seed: TabSeed }) {
           </div>
         )}
 
+        {/* T-044 / R-038: a raised budget is a deliberate choice, said plainly. */}
+        {session?.budget_warning && (
+          <div className="flex items-center gap-2 border-b bg-secondary px-3 py-1 text-xs">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span>{session.budget_warning}</span>
+          </div>
+        )}
+
         {session && (
           <GuardrailBar
             guardrails={session.guardrails}
@@ -561,7 +599,8 @@ function Workspace({ seed }: { seed: TabSeed }) {
             onSave={async (label) => {
               const saved = await saveSessionAsProfile(session.session_id, label);
               setSession({ ...session, guardrails: saved.guardrails });
-              return saved.profile.label;
+              void queryClient.invalidateQueries({ queryKey: WORKSPACE_KEY });
+              return { label: saved.profile.label, notice: saved.notice ?? null };
             }}
           />
         )}
@@ -570,11 +609,12 @@ function Workspace({ seed }: { seed: TabSeed }) {
           <aside className="flex w-64 shrink-0 flex-col border-r">
             {session ? (
               <div className="min-h-0 flex-1 overflow-auto p-1">
+                <CatalogNote catalog={session.capabilities.catalog} />
                 <Navigator
                   sessionId={session.session_id}
                   capabilities={session.capabilities}
                   selected={selected}
-                  onSelect={onSelectRelation}
+                  onSelect={(node) => onSelectRelation(node)}
                 />
               </div>
             ) : (
@@ -603,8 +643,20 @@ function Workspace({ seed }: { seed: TabSeed }) {
             {!editor && editorNotice && (
               <div className="border-b px-3 py-1 text-xs text-destructive">{editorNotice}</div>
             )}
+            <SavedQueries
+              sql={draftQuery}
+              profileId={session ? session.session_id.split("::")[0] : null}
+              onLoad={setDraftQuery}
+            />
+            {confirmation && (
+              <ConfirmPanel
+                request={confirmation}
+                onConfirm={(phrase) => void onRun(phrase)}
+                onCancel={() => setConfirmation(null)}
+              />
+            )}
             <section className="h-40 shrink-0 border-b">
-              <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={onRun} />
+              <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={() => void onRun()} />
             </section>
 
             {(summary || error) && (
@@ -620,6 +672,16 @@ function Workspace({ seed }: { seed: TabSeed }) {
             )}
 
             {outcomes && outcomes.length > 1 && <OutcomeStrip outcomes={outcomes} />}
+
+            {session && view?.relation && (
+              <FilterBar
+                // A new relation starts with an empty bar.
+                key={view.relation.path.join(".")}
+                columns={view.columns}
+                ops={session.capabilities.filter_ops}
+                onApply={(f) => browsedNode.current && onSelectRelation(browsedNode.current, f)}
+              />
+            )}
 
             <section className="min-h-0 flex-1">
               {session && view ? (
@@ -660,6 +722,17 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 applying={applying}
                 onConfirm={onConfirm}
                 onBack={() => setReview(null)}
+                compareRendered={review.edits.some((e) => e.compare_rendered)}
+                onCompareRendered={async (on) => {
+                  // T-060: re-preview; apply then runs exactly this plan.
+                  const edits = review.edits.map((e) => ({ ...e, compare_rendered: on }));
+                  try {
+                    const plan = await previewEdits(session!.session_id, edits);
+                    setReview({ ...review, edits, plan });
+                  } catch (e2) {
+                    setError(String((e2 as { message?: string })?.message ?? e2));
+                  }
+                }}
               />
             )}
           </main>
@@ -765,9 +838,9 @@ function GuardrailBar({
 }: {
   guardrails: Guardrails;
   origin: Extract<LaunchOutcome, { kind: "connect" }> | null;
-  onSave: (label: string) => Promise<string>;
+  onSave: (label: string) => Promise<{ label: string; notice: string | null }>;
 }) {
-  const [savedAs, setSavedAs] = useState<string | null>(null);
+  const [savedAs, setSavedAs] = useState<{ label: string; notice: string | null } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const t = origin?.target;
@@ -791,9 +864,7 @@ function GuardrailBar({
         </span>
       )}
       <span className="rounded bg-secondary px-1.5 py-0.5">history {g.history}</span>
-      <span className="rounded bg-secondary px-1.5 py-0.5" title="Whether the database itself enforces read-only access is not known yet.">
-        safety mode: {g.safety_mode}
-      </span>
+      <SafetyBadge mode={g.safety_mode} />
       {g.production.armed && (
         <span
           className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
@@ -825,9 +896,66 @@ function GuardrailBar({
           Save as profile
         </Button>
       )}
-      {savedAs && <span className="ml-auto text-muted-foreground">Saved as “{savedAs}”</span>}
+      {savedAs && (
+        <span className="ml-auto text-muted-foreground">
+          Saved as “{savedAs.label}”{savedAs.notice ? ` — ${savedAs.notice}` : ""}
+        </span>
+      )}
       {err && <span className="text-destructive">{err}</span>}
     </div>
+  );
+}
+
+/**
+ * T-055 / R-028: say at connect, not mid-navigation, when introspection on
+ * this server will be partial or its flavour is unverified.
+ */
+function CatalogNote({ catalog }: { catalog: CatalogSupport | undefined }) {
+  if (!catalog) return null;
+  const missing = catalog.features.filter((f) => !f.available).map((f) => f.label);
+  if (catalog.flavour_verified && missing.length === 0) return null;
+  return (
+    <p className="mb-1 rounded bg-secondary px-2 py-1 text-[11px] text-muted-foreground" role="note">
+      {!catalog.flavour_verified && "Unrecognized server: treated as vanilla Postgres, unverified. "}
+      {missing.length > 0 ? `Not available on this server: ${missing.join(", ")}.` : "Every catalog probe succeeded."}
+    </p>
+  );
+}
+
+/**
+ * T-061 / D-027: read-only is shown as what the *database* enforces, beside
+ * what the profile asked for. Asked-for but not enforced is the case that
+ * must be loud — the app does not close that gap, the database role does.
+ */
+function SafetyBadge({ mode }: { mode: Guardrails["safety_mode"] }) {
+  const db = mode.database;
+  if (db.state === "enforced") {
+    return (
+      <span className="rounded bg-secondary px-1.5 py-0.5" title={db.basis}>
+        read-only · enforced by the database
+      </span>
+    );
+  }
+  if (mode.requested) {
+    const why = db.state === "not_enforced" ? db.reasons.join("\n") : db.reason;
+    return (
+      <span
+        className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
+        title={why}
+      >
+        <ShieldAlert className="h-3 w-3" />
+        read-only requested but NOT enforced by the database
+        {db.state === "not_enforced" ? `: ${db.reasons[0]}` : " (could not verify)"}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="rounded bg-secondary px-1.5 py-0.5"
+      title={db.state === "not_enforced" ? db.reasons.join("\n") : db.reason}
+    >
+      {db.state === "not_enforced" ? "writable" : "write access unknown"}
+    </span>
   );
 }
 
@@ -913,7 +1041,7 @@ function OutcomeStrip({ outcomes }: { outcomes: Outcome[] }) {
  */
 function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }) {
   const [form, setForm] = useState<ProfileMeta>({
-    id: "local",
+    id: newProfileId(),
     label: "Local",
     host: "localhost",
     port: 55432,
@@ -921,9 +1049,20 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
     dbname: "sluice_dev",
     tls: "disabled",
   });
+  // T-036: the portable profile file, re-read from disk by the core.
+  const workspace = useQuery({ queryKey: WORKSPACE_KEY, queryFn: loadWorkspace });
+  const [saveNote, setSaveNote] = useState<string | null>(null);
+  // T-034: a pasted URL is a credential until the core strips it, so it is
+  // held only until submitted and rendered as a password field.
+  const [importUrl, setImportUrl] = useState("");
   const [secret, setSecret] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // T-071 / R-016: the core says the stored password could not be used (an
+  // unreadable keychain item after a signing change, or a server refusal).
+  // Not a dead end: ask for it again; storing it re-creates the keychain item
+  // under this build's identity.
+  const [reentry, setReentry] = useState(false);
 
   const field = (k: keyof ProfileMeta, label: string, type = "text") => (
     <label className="block px-2 py-1 text-xs">
@@ -949,15 +1088,91 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
         try {
           if (secret) await storeCredential(form.id, secret);
           setSecret("");
+          setReentry(false);
           onConnected(await connect(form));
         } catch (e2) {
-          setErr(String((e2 as { message?: string })?.message ?? e2));
+          const de = e2 as DriverError;
+          setReentry(de?.hints?.credential_reentry === true);
+          setErr(String(de?.message ?? e2));
         } finally {
           setBusy(false);
         }
       }}
     >
-      <p className="px-2 py-1 text-xs font-medium uppercase text-muted-foreground">Connect</p>
+      <SavedProfiles
+        workspace={workspace.data}
+        selectedId={form.id}
+        onPick={(p) => {
+          setForm(p);
+          setSecret("");
+          setReentry(false);
+          setErr(null);
+          setSaveNote(null);
+        }}
+        onDelete={async (id) => {
+          try {
+            queryClient.setQueryData(WORKSPACE_KEY, await deleteProfile(id));
+            if (id === form.id) setForm({ ...form, id: newProfileId() });
+          } catch (e2) {
+            setErr(String((e2 as { message?: string })?.message ?? e2));
+          }
+        }}
+      />
+      {workspace.error && (
+        <p className="px-2 py-1 text-xs text-destructive">
+          {String((workspace.error as { message?: string })?.message ?? workspace.error)}
+        </p>
+      )}
+      <div className="flex items-center gap-1 px-2 py-1">
+        <input
+          type="password"
+          aria-label="Import connection URL"
+          autoComplete="off"
+          className="min-w-0 flex-1 rounded border border-input bg-transparent px-1.5 py-1 text-xs"
+          placeholder="Paste postgres:// URL to import"
+          value={importUrl}
+          onChange={(e) => setImportUrl(e.target.value)}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          className="h-7"
+          disabled={!importUrl.trim()}
+          onClick={async () => {
+            setErr(null);
+            setSaveNote(null);
+            const url = importUrl;
+            setImportUrl("");
+            try {
+              const view = await importConnectionUrl(url, "");
+              queryClient.setQueryData(WORKSPACE_KEY, view);
+              const added = view.profiles[view.profiles.length - 1];
+              if (added) setForm(added);
+              setSaveNote(view.notice ?? "Imported. Any password in the URL is now in the keychain.");
+            } catch (e2) {
+              setErr(String((e2 as { message?: string })?.message ?? e2));
+            }
+          }}
+        >
+          Import
+        </Button>
+      </div>
+      <div className="flex items-center justify-between px-2 py-1">
+        <p className="text-xs font-medium uppercase text-muted-foreground">Connect</p>
+        <button
+          type="button"
+          className="text-xs text-muted-foreground hover:text-foreground"
+          onClick={() => {
+            setForm({ ...form, id: newProfileId(), label: "New profile" });
+            setSecret("");
+            setSaveNote(null);
+          }}
+        >
+          New
+        </button>
+      </div>
+      {field("label", "Name")}
       {field("host", "Host")}
       {field("port", "Port", "number")}
       {field("user", "User")}
@@ -975,13 +1190,31 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
             setForm({ ...form, connection_budget: /^\d+$/.test(t) ? Number(t) : null });
           }}
         />
+        {/* T-044 / R-038: raising it is allowed, and explicit. */}
+        {(form.connection_budget ?? 5) > 5 && (
+          <span className="mt-0.5 block text-[10px] text-destructive">
+            Above the default of 5. Every connection comes out of the server's max_connections, which all its clients share.
+          </span>
+        )}
+        {(form.connection_budget ?? 5) <= 2 && (
+          <span className="mt-0.5 block text-[10px] text-muted-foreground">
+            2 connections are always kept for browsing, so this budget leaves no room for editor sessions.
+          </span>
+        )}
       </label>
       <label className="block px-2 py-1 text-xs">
-        <span className="text-muted-foreground">Password</span>
+        <span className="text-muted-foreground">
+          {reentry ? "Re-enter password — it will be stored again in the keychain" : "Password"}
+        </span>
         <input
           type="password"
-          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          className={cn(
+            "mt-0.5 w-full rounded border bg-transparent px-1.5 py-1 text-sm",
+            reentry ? "border-destructive" : "border-input",
+          )}
           value={secret}
+          autoFocus={reentry}
+          required={reentry}
           onChange={(e) => setSecret(e.target.value)}
           placeholder="stored in the OS keychain"
         />
@@ -998,12 +1231,65 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
           <option value="disabled">Disabled</option>
         </select>
       </label>
+      <label className="flex items-center gap-1.5 px-2 py-1 text-xs">
+        <input
+          type="checkbox"
+          checked={form.read_only ?? false}
+          onChange={(e) => setForm({ ...form, read_only: e.target.checked })}
+        />
+        <span>
+          Read-only profile
+          <span className="block text-[10px] text-muted-foreground">
+            Use a read-only database role; Sluice checks whether the server enforces it.
+          </span>
+        </span>
+      </label>
+      <label className="block px-2 py-1 text-xs">
+        <span className="text-muted-foreground">Query history</span>
+        <select
+          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          value={form.history ?? ""}
+          onChange={(e) =>
+            setForm({ ...form, history: e.target.value === "" ? null : (e.target.value as "on" | "off") })
+          }
+        >
+          <option value="">Default — off for production, on otherwise</option>
+          <option value="on">Keep history for this profile</option>
+          <option value="off">Never keep history for this profile</option>
+        </select>
+      </label>
       {err && <p className="px-2 py-1 text-xs text-destructive">{err}</p>}
       <div className="px-2 py-1">
         <Button type="submit" size="sm" disabled={busy} className="w-full">
           <Plug className="h-3.5 w-3.5" />
           {busy ? "Connecting…" : "Connect"}
         </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          disabled={busy}
+          className="mt-1 w-full"
+          onClick={async () => {
+            setErr(null);
+            setSaveNote(null);
+            try {
+              // D-007: the password goes to the keychain; the file gets metadata.
+              if (secret) await storeCredential(form.id, secret);
+              setSecret("");
+              const view = await saveProfile(form);
+              queryClient.setQueryData(WORKSPACE_KEY, view);
+              // T-037 / R-019: the one-time "this file names your hosts" notice.
+              setSaveNote(view.notice ?? "Saved to the profile file.");
+            } catch (e2) {
+              setErr(String((e2 as { message?: string })?.message ?? e2));
+            }
+          }}
+        >
+          <Save className="h-3.5 w-3.5" />
+          Save profile
+        </Button>
+        {saveNote && <p className="pt-1 text-xs text-muted-foreground">{saveNote}</p>}
       </div>
     </form>
   );

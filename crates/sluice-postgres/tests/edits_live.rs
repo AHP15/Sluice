@@ -65,6 +65,7 @@ fn set_name(table: &str, id: i64, name: WireValue) -> EditRequest {
         key: vec![o("id", WireValue::Int(id))],
         set: vec![o("name", name)],
         originals: vec![],
+        compare_rendered: false,
     }
 }
 
@@ -95,6 +96,7 @@ async fn the_gate_follows_the_catalog() {
             key: vec![o("name", WireValue::Text("a".into()))],
             set: vec![o("name", WireValue::Text("b".into()))],
             originals: vec![],
+            compare_rendered: false,
         }], None)
         .await
         .unwrap_err();
@@ -187,6 +189,7 @@ async fn concurrency_is_null_safe_and_names_what_it_cannot_check() {
         key: vec![o("id", WireValue::Int(id))],
         set,
         originals,
+        compare_rendered: false,
     };
 
     // A NULL cell as read: `name = NULL` would match nothing and report a
@@ -246,7 +249,78 @@ async fn columns_declare_concurrency_comparability() {
         .unwrap();
     let cols = r.first_rows().unwrap().0;
     let decl: Vec<(&str, bool)> = cols.iter().map(|c| (c.name.as_str(), c.concurrency_comparable)).collect();
-    assert_eq!(decl, vec![("id", true), ("name", true), ("doc", false), ("x", false), ("f", false)]);
+    // T-060: float8 has a usable `=` and arrives over the binary protocol, so
+    // its original round-trips exactly; json and xml have no equality.
+    assert_eq!(decl, vec![("id", true), ("name", true), ("doc", false), ("x", false), ("f", true)]);
+}
+
+/// T-060 / R-035: comparability is probed from this server's catalog, so the
+/// types the static allowlist used to drop stay protected.
+#[tokio::test]
+async fn the_catalog_probe_keeps_r035s_types_protected() {
+    let Some(d) = driver().await else { return };
+    sql(&d, "
+        CREATE EXTENSION IF NOT EXISTS citext;
+        DROP TABLE IF EXISTS public.t060;
+        DROP TYPE IF EXISTS public.t060_mood;
+        DROP DOMAIN IF EXISTS public.t060_posint;
+        CREATE TYPE public.t060_mood AS ENUM ('sad', 'ok');
+        CREATE DOMAIN public.t060_posint AS int4 CHECK (VALUE > 0);
+        CREATE TABLE public.t060 (
+            id int8 PRIMARY KEY, j jsonb, n numeric, u uuid, c citext, m public.t060_mood,
+            p public.t060_posint, a int4[], js json, pt point
+        );
+        INSERT INTO public.t060 VALUES
+            (1, '{\"a\": 1}', 1.50, gen_random_uuid(), 'Hi', 'ok', 3, '{1,2}', '{\"a\":  1}', '(1,2)');
+    ").await;
+    // The probe is once per connection (R-035): a type created after connect
+    // — citext, the enum, the domain — reads as not comparable until the next
+    // one. That under-protects and never over-claims; reconnect to see them.
+    drop(d);
+    let Some(d) = driver().await else { return };
+    let r = d
+        .browse(BrowseRequest { relation: rel("table", "t060"), filter: None, sort: vec![], limit: 1, cursor: None, offset: None })
+        .await
+        .unwrap();
+    let (cols, rows) = r.first_rows().unwrap();
+    let decl: Vec<(&str, bool)> = cols.iter().map(|c| (c.name.as_str(), c.concurrency_comparable)).collect();
+    assert_eq!(
+        decl,
+        vec![
+            ("id", true), ("j", true), ("n", true), ("u", true), ("c", true), ("m", true),
+            ("p", true), ("a", true), ("js", false), ("pt", false),
+        ]
+    );
+
+    // An unchanged edit over every comparable column commits — no spurious
+    // conflict from any of them.
+    let row = rows[0].clone();
+    let all: Vec<Original> = cols.iter().zip(&row).skip(1).take(7).map(|(c, v)| o(&c.name, v.clone())).collect();
+    let edit = |set: Vec<Original>, originals: Vec<Original>, compare_rendered: bool| EditRequest {
+        relation: rel("table", "t060"),
+        key: vec![o("id", WireValue::Int(1))],
+        set,
+        originals,
+        compare_rendered,
+    };
+    d.apply_edits(vec![edit(all.clone(), all, false)], None).await.expect("unchanged comparable edit commits");
+
+    // json by its displayed text: unchanged commits, changed underneath conflicts.
+    let js = cols.iter().position(|c| c.name == "js").unwrap();
+    let seen = o("js", row[js].clone());
+    let set = o("js", WireValue::Text("{\"b\": 2}".into()));
+    let plan = d.preview_edits(vec![edit(vec![set.clone()], vec![seen.clone()], true)]).await.unwrap();
+    assert_eq!(plan.statements[0].concurrency_rendered, vec!["js"]);
+    assert!(plan.statements[0].concurrency_omitted.is_empty());
+    d.apply_edits(vec![edit(vec![set.clone()], vec![seen.clone()], true)], None)
+        .await
+        .expect("rendered compare against the text as read commits");
+    // The stored value is now {"b": 2}; the stale original must conflict.
+    let r = d.apply_edits(vec![edit(vec![set], vec![seen], true)], None).await.expect("reports, does not throw");
+    match &r.outcomes[0].body {
+        OutcomeBody::Error { error } => assert_eq!(error.kind, ErrorKind::Conflict, "{error:?}"),
+        other => panic!("a stale rendered original must conflict, got {other:?}"),
+    }
 }
 
 /// T-057 / R-003: what the preview shows is what runs. For generated edit
@@ -307,7 +381,7 @@ async fn the_inline_preview_does_what_apply_does() {
             };
             originals.push(o(c, if next() % 5 == 0 { stale } else { orig }));
         }
-        let edits = vec![EditRequest { relation: rel("table", "t057"), key: vec![o("id", WireValue::Int(1))], set, originals }];
+        let edits = vec![EditRequest { relation: rel("table", "t057"), key: vec![o("id", WireValue::Int(1))], set, originals, compare_rendered: false }];
 
         sql(&d, reset).await;
         let plan = d.preview_edits(edits.clone()).await.unwrap();

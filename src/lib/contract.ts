@@ -120,6 +120,16 @@ export interface Capabilities {
   supports_script: boolean;
   /** T-015: the server's default string collation (what `case_sensitive` reflects). */
   string_collation: string | null;
+  /** T-061: what the server enforces about writes from this session. */
+  read_only?: ReadOnlyGuarantee;
+  /** T-055 / R-028: which catalog areas probed successfully at connect. */
+  catalog?: CatalogSupport;
+}
+
+export interface CatalogSupport {
+  /** False when the banner matched no known flavour ("vanilla, unverified"). */
+  flavour_verified: boolean;
+  features: { id: string; label: string; available: boolean }[];
 }
 
 export type Predicate = {
@@ -172,6 +182,11 @@ export interface EditRequest {
   set: Original[];
   /** The written columns' values as read (T-058's concurrency predicate). */
   originals: Original[];
+  /**
+   * T-060: compare columns with no usable equality by their displayed text
+   * instead of leaving them unchecked. Opt-in, from the preview.
+   */
+  compare_rendered?: boolean;
 }
 
 /** T-057: one bound parameter of a planned statement, as sent. */
@@ -192,6 +207,8 @@ export interface PlannedStatement {
   params: BoundParam[];
   inline: string | null;
   concurrency_omitted: string[];
+  /** T-060: written columns checked by their displayed text (opt-in). */
+  concurrency_rendered?: string[];
 }
 
 /** T-057: what staged edits compile to. Apply must present `digest`. */
@@ -220,6 +237,10 @@ export interface DriverError {
     table?: string | null;
     schema?: string | null;
     retryable?: boolean | null;
+    /** T-071: the stored credential could not be used; ask for it again. */
+    credential_reentry?: boolean | null;
+    /** T-061: nothing ran; this production session needs typed confirmation. */
+    confirmation?: ConfirmationRequest | null;
   };
   payload?: {
     code?: string | null;
@@ -281,6 +302,17 @@ export interface ExecutionResult {
   };
 }
 
+export type Transport =
+  | { kind: "direct" }
+  | { kind: "ssh-tunnel"; host: string; port?: number | null; user?: string | null }
+  | { kind: "proxy"; address: string };
+
+export type CredentialProvider =
+  | { provider: "static" }
+  | { provider: "keychain" }
+  | { provider: "env"; var: string }
+  | { provider: "iam-token" };
+
 export interface ProfileMeta {
   id: string;
   label: string;
@@ -296,6 +328,17 @@ export interface ProfileMeta {
    * sessions together. Absent = the core's default (5).
    */
   connection_budget?: number | null;
+  /** T-038 / D-008: how the connection travels. Only `direct` connects today. */
+  transport?: Transport;
+  /** T-038 / D-008: where the password comes from — never the password. */
+  auth?: CredentialProvider;
+  /**
+   * T-035: this profile's query-history choice. Absent = the default: off for
+   * a production-flagged profile, on otherwise.
+   */
+  history?: "on" | "off" | null;
+  /** T-061: meant to be read-only; whether the database enforces it is probed. */
+  read_only?: boolean;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */
@@ -325,12 +368,61 @@ export interface Guardrails {
   saved: boolean;
   production: { armed: boolean; reasons: string[] };
   history: "on" | "off";
-  safety_mode: "unknown";
+  /** T-061: the profile's read-only intent beside what the database enforces. */
+  safety_mode: { requested: boolean; database: ReadOnlyGuarantee };
+}
+
+/** T-061 / D-027: whether the server itself refuses writes from this session. */
+export type ReadOnlyGuarantee =
+  | { state: "unknown"; reason: string }
+  | { state: "enforced"; basis: string }
+  | { state: "not_enforced"; reasons: string[] };
+
+/** T-061: a statement held back until the user types `phrase`. */
+export interface ConfirmationRequest {
+  phrase: string;
+  statements: { statement: string; reason: string }[];
+}
+
+/**
+ * T-035: one query-history entry. `statement` was redacted in the core before
+ * it was stored (T-025); a `redacted` or `truncated` entry is not replayable
+ * as written.
+ */
+export interface HistoryEntry {
+  id: number;
+  profile_id: string;
+  executed_at: number;
+  statement: string;
+  redacted: boolean;
+  truncated: boolean;
+  outcome: "ok" | "error" | "cancelled";
+  duration_ms: number | null;
+  rows: number | null;
+}
+
+/** T-036: one `[[query]]` in the portable profile file. */
+export interface SavedQuery {
+  id: string;
+  label: string;
+  profile?: string | null;
+  sql: string;
+}
+
+/** T-036: the profile file as the webview sees it — metadata only (D-007). */
+export interface WorkspaceView {
+  profiles: ProfileMeta[];
+  queries: SavedQuery[];
+  /** Where the file lives, so the user can open or commit it themselves. */
+  path: string | null;
+  /** T-037: a one-time notice about what the file reveals, when warranted. */
+  notice?: string | null;
 }
 
 export interface SavedProfile {
   profile: ProfileMeta;
   guardrails: Guardrails;
+  notice?: string | null;
 }
 
 export interface SessionInfo {
@@ -338,6 +430,17 @@ export interface SessionInfo {
   capabilities: Capabilities;
   tls_warning: string | null;
   guardrails: Guardrails;
+  /** T-044: set when the profile's budget was raised past the default. */
+  budget_warning?: string | null;
+}
+
+/** T-044 / R-038: who is using a profile's connection budget. */
+export interface ConnectionUsage {
+  budget: number;
+  browse_floor: number;
+  pinned_limit: number;
+  pinned: { editor_id: string; tab: string; in_transaction: boolean; holds: string[]; busy: boolean }[];
+  max_connections: number | null;
 }
 
 /**

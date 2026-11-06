@@ -20,6 +20,7 @@
 //!   `WireValue::Numeric` load-bearing.
 
 pub mod capability;
+pub mod danger;
 pub mod driver;
 pub mod error;
 pub mod outcome;
@@ -28,14 +29,15 @@ pub mod request;
 pub mod script;
 pub mod redact;
 pub mod secret;
+pub mod statement_redact;
 pub mod value;
 
 pub use capability::{missing_core_ops, CORE_FILTER_OPS, 
     CancelSupport, Capabilities, FilterOpDecl, NodeKind, RawPayloadKind, ResetSupport,
-    SessionAffinity, TransactionSupport,
+    CatalogFeature, CatalogSupport, ReadOnlyGuarantee, SessionAffinity, TransactionSupport,
 };
 pub use driver::Driver;
-pub use error::{DriverError, EnginePayload, ErrorHints, ErrorKind, QueryPosition};
+pub use error::{ConfirmationRequest, DriverError, EnginePayload, ErrorHints, ErrorKind, QueryPosition};
 pub use outcome::{row_cost, BudgetLimit, BudgetMeter, BudgetReport, ExecBudget, PageInfo, 
     Attribution, ExecutionResult, Outcome, OutcomeBody, TxContext, TxDisposition, TxMode,
 };
@@ -49,6 +51,8 @@ pub use request::{
     SortKey,
 };
 pub use redact::{redact_shapes, Redactor};
+pub use danger::{dangerous_statements, Dangerous};
+pub use statement_redact::{redact_statement, StoredStatement};
 pub use secret::{deserialize_optional_secret, Secret, REDACTED};
 pub use value::{ColumnDesc, ExactDomain, TypeClass, WireValue};
 
@@ -139,6 +143,8 @@ mod contract_tests {
             fixed_schema: true,
             supports_script: true,
             string_collation: Some("en_US.utf8".into()),
+            read_only: ReadOnlyGuarantee::Enforced { basis: "standby".into() },
+            catalog: CatalogSupport::default(),
         };
 
         let json = serde_json::to_string(&caps).expect("serialize");

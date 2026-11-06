@@ -6,14 +6,18 @@ import type {
   EditGate,
   EditPlan,
   EditRequest,
+  ConnectionUsage,
   ExecutionResult,
+  HistoryEntry,
   LaunchOutcome,
   NavNode,
   NodeId,
   ProfileMeta,
   SavedProfile,
+  SavedQuery,
   SessionInfo,
   WireValue,
+  WorkspaceView,
 } from "./contract";
 
 /**
@@ -38,6 +42,62 @@ export const queryClient = new QueryClient({
 
 export function coreVersion(): Promise<string> {
   return invoke<string>("core_version");
+}
+
+/** T-036: the portable profile file. Re-read from disk on every call. */
+export function loadWorkspace(): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("load_workspace");
+}
+
+export function saveProfile(profile: ProfileMeta): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("save_profile", { profile });
+}
+
+/** Removes the profile and its stored password. */
+export function deleteProfile(profileId: string): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("delete_profile", { profileId });
+}
+
+/**
+ * T-034: import a pasted connection URL. It goes inward only; the core splits
+ * the password off into the keychain and persists the rest.
+ */
+export function importConnectionUrl(url: string, label: string): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("import_connection_url", { url, label });
+}
+
+export function saveQuery(query: SavedQuery): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("save_query", { query });
+}
+
+export function deleteQuery(queryId: string): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("delete_query", { queryId });
+}
+
+export const WORKSPACE_KEY = ["workspace"] as const;
+
+/** T-044: the profile budget's usage — pinned editor sessions and their state. */
+export function connectionUsage(sessionId: string): Promise<ConnectionUsage> {
+  return invoke<ConnectionUsage>("connection_usage", { sessionId });
+}
+
+/** T-035: query history, newest first. */
+export function listHistory(profileId: string | null, search: string): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("list_history", { profileId, search: search || null, limit: 200 });
+}
+
+/** T-035: the one-click purge; resolves to the number of entries removed. */
+export function clearHistory(): Promise<number> {
+  return invoke<number>("clear_history");
+}
+
+/** T-033: disposable UI state from the cache dir; `null` when there is none. */
+export function loadUiState(): Promise<unknown> {
+  return invoke<unknown>("load_ui_state");
+}
+
+export function saveUiState(state: unknown): Promise<void> {
+  return invoke<void>("save_ui_state", { state });
 }
 
 export function storeCredential(
@@ -101,8 +161,9 @@ export interface ScriptRun {
   summary: string;
 }
 
-export function runScript(sessionId: string, script: string, queryId?: string): Promise<ScriptRun> {
-  return invoke<ScriptRun>("run_script", { sessionId, script, queryId: queryId ?? null });
+/** `confirm`: the typed phrase for a production session's confirmation (T-061). */
+export function runScript(sessionId: string, script: string, queryId?: string, confirm?: string): Promise<ScriptRun> {
+  return invoke<ScriptRun>("run_script", { sessionId, script, queryId: queryId ?? null, confirm: confirm ?? null });
 }
 
 /**
@@ -164,8 +225,8 @@ export function openEditor(sessionId: string): Promise<EditorOpened> {
   return invoke<EditorOpened>("open_editor", { sessionId });
 }
 
-export function runInEditor(editorId: string, script: string, queryId?: string): Promise<EditorRun> {
-  return invoke<EditorRun>("run_in_editor", { editorId, script, queryId: queryId ?? null });
+export function runInEditor(editorId: string, script: string, queryId?: string, confirm?: string): Promise<EditorRun> {
+  return invoke<EditorRun>("run_in_editor", { editorId, script, queryId: queryId ?? null, confirm: confirm ?? null });
 }
 
 /** T-041: the opt-in transaction controls. */

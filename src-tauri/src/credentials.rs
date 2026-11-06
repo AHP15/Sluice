@@ -24,6 +24,13 @@ const SERVICE: &str = "dev.sluice.app";
 pub enum CredentialError {
     NotFound,
     Backend(String),
+    /// T-071 / R-016: the keychain holds *something* for this profile but would
+    /// not hand it over — on macOS, typically an item stored by a build with a
+    /// different signing identity, or an access prompt that was denied. Not
+    /// fatal: the caller connects without it and, if the server then refuses,
+    /// asks the user to re-enter the password, which re-stores it under the
+    /// current identity.
+    Unreadable(String),
 }
 
 impl std::fmt::Display for CredentialError {
@@ -32,6 +39,11 @@ impl std::fmt::Display for CredentialError {
             CredentialError::NotFound => write!(f, "no stored credential for that profile"),
             // Never interpolate the secret itself, only the backend's own text.
             CredentialError::Backend(e) => write!(f, "credential store unavailable: {e}"),
+            CredentialError::Unreadable(e) => write!(
+                f,
+                "the stored password could not be read from the keychain ({e}); \
+                 it may have been saved by a differently-signed build — enter it again to re-store it"
+            ),
         }
     }
 }
@@ -78,6 +90,13 @@ impl CredentialStore {
                 if entry.set_password(secret.expose()).is_ok() {
                     return Ok(Backend::PlatformKeychain);
                 }
+                // T-071 / R-016: an item left by a differently-signed build can
+                // refuse an in-place update. Replacing it re-creates the item
+                // under the *current* identity, which is what re-entry is for.
+                let _ = entry.delete_credential();
+                if entry.set_password(secret.expose()).is_ok() {
+                    return Ok(Backend::PlatformKeychain);
+                }
             }
         }
         self.file_store(profile_id, secret)?;
@@ -90,17 +109,23 @@ impl CredentialStore {
     /// T-022/R-017: the keychain and the decrypted-file path are both credential
     /// *parse boundaries* — the value crosses from opaque storage into process
     /// memory here — so it is wrapped before it is returned, never after.
+    ///
+    /// T-071 / R-016: a keychain read that fails for any reason other than "no
+    /// such item" is reported as [`CredentialError::Unreadable`] (unless the
+    /// file fallback has the secret), never folded into `NotFound` — the caller
+    /// needs to know the difference to ask for re-entry instead of failing.
     pub fn resolve(&self, profile_id: &str) -> Result<Secret<String>, CredentialError> {
+        let mut keychain_failure = None;
         if !self.force_fallback {
             if let Ok(entry) = keyring::Entry::new(SERVICE, profile_id) {
                 match entry.get_password() {
                     Ok(p) => return Ok(Secret::new(p)),
                     Err(keyring::Error::NoEntry) => {}
-                    Err(_) => {}
+                    Err(e) => keychain_failure = Some(keychain_error_label(&e)),
                 }
             }
         }
-        self.file_resolve(profile_id)
+        merge_fallback(self.file_resolve(profile_id), keychain_failure)
     }
 
     pub fn delete(&self, profile_id: &str) -> Result<(), CredentialError> {
@@ -199,6 +224,30 @@ impl CredentialStore {
     }
 }
 
+/// A shape-only label for a keychain error: the variant, never the backend's
+/// text, which is free-form and not ours to vouch for.
+fn keychain_error_label(e: &keyring::Error) -> String {
+    match e {
+        keyring::Error::NoStorageAccess(_) => "keychain access denied or unavailable",
+        keyring::Error::PlatformFailure(_) => "keychain platform error",
+        keyring::Error::BadEncoding(_) => "stored value is not valid text",
+        _ => "keychain error",
+    }
+    .to_string()
+}
+
+/// The file fallback's answer wins when it has one; otherwise a keychain read
+/// failure is surfaced as `Unreadable` rather than hidden behind `NotFound`.
+fn merge_fallback(
+    file: Result<Secret<String>, CredentialError>,
+    keychain_failure: Option<String>,
+) -> Result<Secret<String>, CredentialError> {
+    match (file, keychain_failure) {
+        (Err(CredentialError::NotFound), Some(why)) => Err(CredentialError::Unreadable(why)),
+        (other, _) => other,
+    }
+}
+
 fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<(), CredentialError> {
     let mut f = fs::File::create(path).map_err(|e| CredentialError::Backend(e.to_string()))?;
     f.write_all(bytes).map_err(|e| CredentialError::Backend(e.to_string()))?;
@@ -226,8 +275,12 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
+        // A counter, not just the clock: parallel tests can read the same
+        // timestamp, share a directory, and overwrite each other's key.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let d = std::env::temp_dir().join(format!("sluice-cred-test-{}", std::process::id()))
-            .join(format!("{:?}", std::time::SystemTime::now()));
+            .join(format!("{n}-{:?}", std::time::SystemTime::now()));
         let _ = fs::create_dir_all(&d);
         d
     }
@@ -304,6 +357,22 @@ mod tests {
 
     /// Error text is rendered in the UI and written to logs, so it must never
     /// carry the secret it failed to handle.
+    #[test]
+    fn a_keychain_read_failure_is_unreadable_not_not_found() {
+        let r = merge_fallback(Err(CredentialError::NotFound), Some("keychain platform error".into()));
+        assert!(matches!(r, Err(CredentialError::Unreadable(_))));
+        let text = r.err().unwrap().to_string();
+        assert!(text.contains("enter it again"), "{text}");
+    }
+
+    #[test]
+    fn the_file_fallback_still_answers_when_the_keychain_fails() {
+        let r = merge_fallback(Ok(Secret::new("pw".into())), Some("keychain error".into()));
+        assert_eq!(r.unwrap().expose(), "pw");
+        // And no keychain failure means plain NotFound is preserved.
+        assert!(matches!(merge_fallback(Err(CredentialError::NotFound), None), Err(CredentialError::NotFound)));
+    }
+
     #[test]
     fn credential_errors_never_embed_the_secret() {
         let e = CredentialError::Backend("libsecret: no such collection".into());
