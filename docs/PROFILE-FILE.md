@@ -16,6 +16,27 @@ put it there.
 
 The connect panel shows the exact path under the profile list.
 
+## What this file reveals (R-019)
+
+This file contains **no passwords or other credentials**. Those live in the
+OS keychain (D-007). It does contain:
+
+- hostnames and ports
+- usernames
+- database names
+- the inventory of which environments exist (for example, that a
+  production database is reachable at a given host)
+
+Together, that is reconnaissance data. It lists your endpoints and valid
+usernames, which is most of what an attacker needs before trying
+credentials. "No credentials" doesn't mean "safe to publish". Committing the
+file to a private repo or putting it in your own sync folder is what it's
+designed for. **Don't put it in a public or widely shared repository.**
+
+The file's own header says the same thing. The first time you save a
+profile that points somewhere other than this machine, Sluice shows a
+one-time reminder.
+
 ## Format
 
 ```toml

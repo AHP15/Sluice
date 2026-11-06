@@ -359,11 +359,14 @@ export interface WorkspaceView {
   queries: SavedQuery[];
   /** Where the file lives, so the user can open or commit it themselves. */
   path: string | null;
+  /** T-037: a one-time notice about what the file reveals, when warranted. */
+  notice?: string | null;
 }
 
 export interface SavedProfile {
   profile: ProfileMeta;
   guardrails: Guardrails;
+  notice?: string | null;
 }
 
 export interface SessionInfo {

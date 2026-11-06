@@ -127,7 +127,7 @@ pub fn production_reasons(host: &str, database: &str) -> Vec<String> {
     reasons
 }
 
-fn is_loopback(host: &str) -> bool {
+pub fn is_loopback(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     if h.eq_ignore_ascii_case("localhost") || h.to_ascii_lowercase().ends_with(".localhost") {
         return true;

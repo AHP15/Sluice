@@ -520,6 +520,8 @@ pub async fn cancel_stream(
 pub struct SavedProfile {
     pub profile: ProfileMeta,
     pub guardrails: Guardrails,
+    /// T-037 / R-019: the one-time "this file names your hosts" notice.
+    pub notice: Option<String>,
 }
 
 /// T-027: "save as profile" for a discovered or command-line session.
@@ -573,7 +575,8 @@ pub async fn save_session_as_profile(
 
         record.guardrails = record.guardrails.clone().saved();
         record.target = profile.clone();
-        Ok(SavedProfile { profile, guardrails: record.guardrails.clone() })
+        let notice = stores.dirs().ok().and_then(|d| crate::workspace::topology_notice(&d.data, &profile.host));
+        Ok(SavedProfile { profile, guardrails: record.guardrails.clone(), notice })
     })
     .await
 }
@@ -1149,6 +1152,7 @@ mod boundary_tests {
                 auth: CredentialProvider::default(),
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
+            notice: None,
         };
         let json = serde_json::to_string(&saved).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {

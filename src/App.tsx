@@ -571,7 +571,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
               const saved = await saveSessionAsProfile(session.session_id, label);
               setSession({ ...session, guardrails: saved.guardrails });
               void queryClient.invalidateQueries({ queryKey: WORKSPACE_KEY });
-              return saved.profile.label;
+              return { label: saved.profile.label, notice: saved.notice ?? null };
             }}
           />
         )}
@@ -780,9 +780,9 @@ function GuardrailBar({
 }: {
   guardrails: Guardrails;
   origin: Extract<LaunchOutcome, { kind: "connect" }> | null;
-  onSave: (label: string) => Promise<string>;
+  onSave: (label: string) => Promise<{ label: string; notice: string | null }>;
 }) {
-  const [savedAs, setSavedAs] = useState<string | null>(null);
+  const [savedAs, setSavedAs] = useState<{ label: string; notice: string | null } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const t = origin?.target;
@@ -840,7 +840,11 @@ function GuardrailBar({
           Save as profile
         </Button>
       )}
-      {savedAs && <span className="ml-auto text-muted-foreground">Saved as “{savedAs}”</span>}
+      {savedAs && (
+        <span className="ml-auto text-muted-foreground">
+          Saved as “{savedAs.label}”{savedAs.notice ? ` — ${savedAs.notice}` : ""}
+        </span>
+      )}
       {err && <span className="text-destructive">{err}</span>}
     </div>
   );
@@ -1089,8 +1093,10 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
               // D-007: the password goes to the keychain; the file gets metadata.
               if (secret) await storeCredential(form.id, secret);
               setSecret("");
-              queryClient.setQueryData(WORKSPACE_KEY, await saveProfile(form));
-              setSaveNote("Saved to the profile file.");
+              const view = await saveProfile(form);
+              queryClient.setQueryData(WORKSPACE_KEY, view);
+              // T-037 / R-019: the one-time "this file names your hosts" notice.
+              setSaveNote(view.notice ?? "Saved to the profile file.");
             } catch (e2) {
               setErr(String((e2 as { message?: string })?.message ?? e2));
             }

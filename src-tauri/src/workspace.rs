@@ -36,12 +36,30 @@ pub const FILE_NAME: &str = "profiles.toml";
 pub const CURRENT_VERSION: u32 = 1;
 const MIGRATIONS: &[Migration] = &[];
 
-/// Written above the document on every save. T-037 / R-019 owns the precise
-/// wording of what the file does and does not contain.
+/// Written above the document on every save.
+///
+/// T-037 / R-019: the precise claim. "Safe to commit" was established for
+/// credentials and then applied to the whole file; what the file still
+/// reveals — an inventory of endpoints, valid usernames, and which
+/// environments exist — is reconnaissance data, so the header says so.
 pub const HEADER: &str = "\
 Sluice connection profiles and saved queries.
 Format: https://github.com/OWNER/sluice/blob/main/docs/PROFILE-FILE.md
+
+This file contains NO passwords or other credentials (those are in the OS
+keychain). It DOES contain hostnames, ports, usernames, database names, and
+which environments exist (e.g. that a production database is reachable at a
+given host). Treat it as infrastructure inventory: fine for a private repo or
+your own sync folder, not for a public or widely shared one.
+
 Hand edits are fine; Sluice re-reads this file before every change it makes.";
+
+/// T-037 / R-019: shown the first time a profile pointing beyond this machine
+/// is saved — once, not on every save, so it is read rather than dismissed.
+pub const TOPOLOGY_NOTICE: &str = "Saved. Note: the profile file holds no passwords, but it does record this \
+host, port, user and database. Keep it out of public or widely shared repositories.";
+
+const NOTICE_MARKER: &str = "topology-notice-shown";
 
 pub const SPEC: DocumentSpec<'static> =
     DocumentSpec { what: "the profile file", current: CURRENT_VERSION, migrations: MIGRATIONS, header: HEADER };
@@ -202,6 +220,25 @@ pub struct WorkspaceView {
     pub profiles: Vec<ProfileMeta>,
     pub queries: Vec<SavedQuery>,
     pub path: Option<String>,
+    /// T-037: a one-time notice for the user, when a save warrants one.
+    pub notice: Option<String>,
+}
+
+/// T-037 / R-019: whether this save should carry the topology notice. True
+/// at most once per installation — the marker lives in the data dir, beside
+/// the other durable machine-local state.
+pub fn topology_notice(data_dir: &Path, host: &str) -> Option<String> {
+    if crate::guardrails::is_loopback(host) {
+        return None;
+    }
+    let marker = data_dir.join(NOTICE_MARKER);
+    if marker.exists() {
+        return None;
+    }
+    // Best effort: failing to record it means warning again, never not at all.
+    let _ = std::fs::create_dir_all(data_dir);
+    let _ = std::fs::write(&marker, b"R-019 topology notice shown\n");
+    Some(TOPOLOGY_NOTICE.to_string())
 }
 
 fn sid() -> SessionId {
@@ -213,6 +250,7 @@ fn view(stores: &Stores, ws: Workspace) -> WorkspaceView {
         profiles: ws.profiles.iter().map(ProfileEntry::to_meta).collect(),
         queries: ws.queries,
         path: stores.dirs.as_ref().map(|d| WorkspaceFile::path(&d.config).display().to_string()),
+        notice: None,
     }
 }
 
@@ -233,11 +271,14 @@ pub async fn save_profile(
 ) -> Result<WorkspaceView, DriverError> {
     guard_driver_call(&sid(), async {
         validate_id(&profile.id)?;
-        let ws = file.update(&stores.dirs()?.config, |ws| {
+        let dirs = stores.dirs()?;
+        let ws = file.update(&dirs.config, |ws| {
             upsert(&mut ws.profiles, ProfileEntry::from_meta(&profile), |p| &p.id);
             Ok(ws.clone())
         })?;
-        Ok(view(&stores, ws))
+        let mut v = view(&stores, ws);
+        v.notice = topology_notice(&dirs.data, &profile.host);
+        Ok(v)
     })
     .await
 }
@@ -366,7 +407,9 @@ mod tests {
         assert!(text.contains("database = \"app_dev\""), "{text}");
         assert!(text.contains("tls = \"disabled\""), "{text}");
         assert!(!text.contains("[[query]]"), "empty sections are omitted: {text}");
-        assert!(!text.to_lowercase().contains("password"), "{text}");
+        // The header names passwords to say they are absent; the body must not.
+        let body = &text[text.find("version = ").unwrap()..];
+        assert!(!body.to_lowercase().contains("password"), "{body}");
     }
 
     #[test]
@@ -418,6 +461,25 @@ mod tests {
         let err = f.update(dir.path(), |_| Ok(())).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "version = 2\n");
+    }
+
+    /// T-037 / R-019: the header states exactly what the file reveals.
+    #[test]
+    fn the_header_is_precise_about_what_the_file_contains() {
+        let text = config::render(&Workspace::default(), &SPEC).unwrap();
+        for must in ["NO passwords", "hostnames", "ports", "usernames", "database names", "which environments exist"] {
+            assert!(text.contains(must), "header must mention `{must}`: {text}");
+        }
+        assert!(!text.to_lowercase().contains("safe to commit"), "{text}");
+    }
+
+    #[test]
+    fn the_topology_notice_shows_once_and_never_for_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(topology_notice(dir.path(), "localhost"), None);
+        assert_eq!(topology_notice(dir.path(), "127.0.0.1"), None);
+        assert!(topology_notice(dir.path(), "db.staging.internal").is_some());
+        assert_eq!(topology_notice(dir.path(), "db.prod.internal"), None, "once, not every save");
     }
 
     /// D-011: no accounts, no server, no sync, no telemetry — anywhere. This

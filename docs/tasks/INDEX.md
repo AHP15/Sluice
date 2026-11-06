@@ -34,7 +34,7 @@ T-033 | done | L | D-014 | Three-store app state with versioning and atomic writ
 T-034 | todo | S | D-014,D-007 | Strip passwords out of imported connection URLs |
 T-035 | todo | M | D-014 | Query history caps, purge, and per-profile opt-out |
 T-036 | done | M | D-011 | Portable profile and saved-query file format | 2026-11-06
-T-037 | todo | S | D-011,R-019 | Correct the safe-to-commit claim on the profile file |
+T-037 | done | S | D-011,R-019 | Correct the safe-to-commit claim on the profile file | 2026-11-06
 T-038 | done | S | D-008 | Model transport variants and credential providers in the profile schema | 2026-11-06
 T-039 | done | M | D-028 | Per-profile pool with capability-declared connection reset | 2026-11-06
 T-040 | done | M | D-028,R-036 | Reset only connections that were actually dirtied | 2026-11-06

@@ -39,7 +39,9 @@ pub const APP_DIR: &str = "sluice";
 /// (the `directories` crate), or rooted anywhere for tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppDirs {
-    /// Profiles and saved queries — portable, diffable, safe to sync.
+    /// Profiles and saved queries — portable and diffable. No credentials, but
+    /// it does name hosts, ports, users and databases (R-019): portable is not
+    /// the same as safe to publish.
     pub config: PathBuf,
     /// Query history — durable, but machine-local by design (D-011's
     /// portability covers profiles and saved queries, not history).
