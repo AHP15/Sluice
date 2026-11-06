@@ -1,5 +1,5 @@
 T-001 | done | M | D-001 | Scaffold Tauri v2 workspace with a Rust core and React webview | 2026-08-02
-T-002 | done | M | D-023 | Establish the React UI stack against the WebKitGTK CSS floor | 2026-08-02
+T-002 | done | M | D-023 | Establish the React UI stack against the WebKitGTK CSS floor | 2026-11-06
 T-003 | done | S | D-025 | Rename the project off drizzle-studio and add a permissive license | 2026-11-06
 T-004 | done | M | D-019 | Build-only CI matrix publishing unsigned cross-platform artifacts | 2026-11-06
 T-005 | done | M | D-003 | Define the Driver trait and capability descriptor | 2026-08-02
@@ -66,7 +66,7 @@ T-065 | todo | M | D-018,D-029,R-025 | Declare sortability per relation and per 
 T-066 | done | L | D-017 | Layered error model with normalized kind, hints, and verbatim payload | 2026-08-03
 T-067 | todo | M | D-021 | Unit tests over pure driver-independent logic |
 T-068 | done | M | D-021,D-006 | Per-engine type-fidelity corpus with hostile edge values | 2026-11-06
-T-069 | in_progress | M | D-021,R-018 | Run the type-fidelity corpus in CI against a service container |
+T-069 | done | M | D-021,R-018 | Run the type-fidelity corpus in CI against a service container | 2026-11-06
 T-070 | todo | M | D-021 | React component tests over the grid and filter bar |
 T-071 | todo | M | D-007,D-019,R-016 | Stable development signing identity and resilient keychain access |
 T-072 | in_progress | M | R-024 | Spike: validate the tiberius surface before SQL Server work begins |
