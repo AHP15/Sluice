@@ -145,7 +145,7 @@ pub fn parse(raw: &str) -> Result<ConnectionUrl, UrlError> {
         u => Some(decode(u)?),
     };
 
-    let password = match parsed.password() {
+    let mut password = match parsed.password() {
         None | Some("") => None,
         Some(p) => Some(Secret::new(decode(p)?)),
     };
@@ -161,6 +161,16 @@ pub fn parse(raw: &str) -> Result<ConnectionUrl, UrlError> {
 
     let mut params = BTreeMap::new();
     for (k, v) in parsed.query_pairs() {
+        // T-034: libpq also accepts `?password=…`. It is a password like any
+        // other, so it goes into the `Secret` — never into `params`, which are
+        // plain strings that `redacted()` prints and callers may persist. The
+        // userinfo password wins if both are given, matching libpq.
+        if k.eq_ignore_ascii_case("password") {
+            if password.is_none() && !v.is_empty() {
+                password = Some(Secret::new(v.into_owned()));
+            }
+            continue;
+        }
         params.insert(k.into_owned(), v.into_owned());
     }
 
@@ -188,6 +198,22 @@ pub fn looks_like_connection_url(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-034: a query-string password is a password, not a parameter.
+    #[test]
+    fn a_query_string_password_is_secret_and_never_a_param() {
+        let u = parse("postgres://alice@db.example.com/shop?password=s%3Dcret&sslmode=require").unwrap();
+        assert_eq!(u.password.as_ref().unwrap().expose(), "s=cret");
+        assert!(!u.params.contains_key("password"));
+        assert_eq!(u.params.get("sslmode").map(String::as_str), Some("require"));
+        let shown = u.redacted();
+        assert!(!shown.contains("cret"), "{shown}");
+
+        // Upper-case key too; and userinfo wins when both are present.
+        let u = parse("postgres://alice:inline@h/db?PASSWORD=query").unwrap();
+        assert_eq!(u.password.as_ref().unwrap().expose(), "inline");
+        assert!(u.params.is_empty(), "{:?}", u.params.keys());
+    }
 
     #[test]
     fn parses_a_full_postgres_url() {

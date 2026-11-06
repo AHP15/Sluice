@@ -56,6 +56,14 @@ export function deleteProfile(profileId: string): Promise<WorkspaceView> {
   return invoke<WorkspaceView>("delete_profile", { profileId });
 }
 
+/**
+ * T-034: import a pasted connection URL. It goes inward only; the core splits
+ * the password off into the keychain and persists the rest.
+ */
+export function importConnectionUrl(url: string, label: string): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("import_connection_url", { url, label });
+}
+
 export function saveQuery(query: SavedQuery): Promise<WorkspaceView> {
   return invoke<WorkspaceView>("save_query", { query });
 }

@@ -50,6 +50,7 @@ import {
   connectLaunch,
   coreVersion,
   deleteProfile,
+  importConnectionUrl,
   loadWorkspace,
   queryClient,
   saveProfile,
@@ -943,6 +944,9 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
   // T-036: the portable profile file, re-read from disk by the core.
   const workspace = useQuery({ queryKey: WORKSPACE_KEY, queryFn: loadWorkspace });
   const [saveNote, setSaveNote] = useState<string | null>(null);
+  // T-034: a pasted URL is a credential until the core strips it, so it is
+  // held only until submitted and rendered as a password field.
+  const [importUrl, setImportUrl] = useState("");
   const [secret, setSecret] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1011,6 +1015,41 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
           {String((workspace.error as { message?: string })?.message ?? workspace.error)}
         </p>
       )}
+      <div className="flex items-center gap-1 px-2 py-1">
+        <input
+          type="password"
+          aria-label="Import connection URL"
+          autoComplete="off"
+          className="min-w-0 flex-1 rounded border border-input bg-transparent px-1.5 py-1 text-xs"
+          placeholder="Paste postgres:// URL to import"
+          value={importUrl}
+          onChange={(e) => setImportUrl(e.target.value)}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          className="h-7"
+          disabled={!importUrl.trim()}
+          onClick={async () => {
+            setErr(null);
+            setSaveNote(null);
+            const url = importUrl;
+            setImportUrl("");
+            try {
+              const view = await importConnectionUrl(url, "");
+              queryClient.setQueryData(WORKSPACE_KEY, view);
+              const added = view.profiles[view.profiles.length - 1];
+              if (added) setForm(added);
+              setSaveNote(view.notice ?? "Imported. Any password in the URL is now in the keychain.");
+            } catch (e2) {
+              setErr(String((e2 as { message?: string })?.message ?? e2));
+            }
+          }}
+        >
+          Import
+        </Button>
+      </div>
       <div className="flex items-center justify-between px-2 py-1">
         <p className="text-xs font-medium uppercase text-muted-foreground">Connect</p>
         <button

@@ -115,6 +115,13 @@ impl AppState {
         }
     }
 
+    /// T-034: store a password split off an imported URL.
+    pub fn store_credential_for(&self, profile_id: &str, secret: &Secret<String>) -> Result<Backend, DriverError> {
+        self.creds
+            .store(profile_id, secret)
+            .map_err(|e| DriverError::new(ErrorKind::PermissionDenied, e.to_string()))
+    }
+
     /// A deleted profile must not leave its password behind (T-036).
     pub fn forget_credential(&self, profile_id: &str) {
         let _ = self.creds.delete(profile_id);
@@ -981,7 +988,7 @@ pub async fn debug_panicking_driver_call() -> Result<String, DriverError> {
     .await
 }
 
-fn short_token() -> String {
+pub(crate) fn short_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)

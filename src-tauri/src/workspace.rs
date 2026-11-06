@@ -303,6 +303,84 @@ pub async fn delete_profile(
     .await
 }
 
+/// T-034 / D-014: what an imported URL becomes. The password — inline or
+/// `?password=` — is split off for the keychain; everything persisted is the
+/// URL's other components. There is deliberately no URL field in the profile
+/// file, so there is no string in which a password could survive.
+pub struct ImportedUrl {
+    pub entry: ProfileEntry,
+    pub password: Option<sluice_core::Secret<String>>,
+}
+
+pub fn decompose_url(url: &sluice_core::Secret<String>, id: &str, label: &str) -> Result<ImportedUrl, DriverError> {
+    let parsed = sluice_config::connection_url::parse(url.expose())
+        .map_err(|e| DriverError::new(ErrorKind::Conflict, e.to_string()))?;
+    if !matches!(parsed.scheme.as_str(), "postgres" | "postgresql") {
+        return Err(DriverError::new(
+            ErrorKind::Conflict,
+            format!("`{}` URLs cannot be imported yet — this build connects to Postgres only", parsed.scheme),
+        ));
+    }
+    let host = parsed.host.clone().unwrap_or_else(|| "localhost".into());
+    let database = parsed.database.clone().unwrap_or_else(|| "postgres".into());
+    let entry = ProfileEntry {
+        id: id.to_string(),
+        label: if label.trim().is_empty() { format!("{database}@{host}") } else { label.trim().to_string() },
+        engine: default_engine(),
+        host,
+        port: parsed.port.unwrap_or(5432),
+        user: parsed.user.clone().unwrap_or_else(|| "postgres".into()),
+        database,
+        tls: crate::launcher::tls_from_params(&parsed),
+        statement_timeout_secs: None,
+        connection_budget: None,
+        transport: Transport::default(),
+        auth: CredentialProvider::default(),
+    };
+    Ok(ImportedUrl { entry, password: parsed.password })
+}
+
+/// T-034: import a pasted connection URL as a profile.
+///
+/// The URL travels inward only and is deserialized straight into
+/// `Secret<String>` (T-022) — it is a credential until the password is split
+/// off here, in the core. The password goes to the keychain; the profile file
+/// gets the rest. If either write fails, neither is left behind.
+#[tauri::command]
+pub async fn import_connection_url(
+    stores: tauri::State<'_, Stores>,
+    file: tauri::State<'_, WorkspaceFile>,
+    app: tauri::State<'_, crate::commands::AppState>,
+    url: sluice_core::Secret<String>,
+    label: String,
+) -> Result<WorkspaceView, DriverError> {
+    guard_driver_call(&sid(), async {
+        let id = format!("profile-{}", crate::commands::short_token());
+        let imported = decompose_url(&url, &id, &label)?;
+        drop(url);
+        let dirs = stores.dirs()?;
+        if let Some(pw) = &imported.password {
+            app.store_credential_for(&id, pw)?;
+        }
+        let host = imported.entry.host.clone();
+        let saved = file.update(&dirs.config, |ws| {
+            ws.profiles.push(imported.entry);
+            Ok(ws.clone())
+        });
+        let ws = match saved {
+            Ok(ws) => ws,
+            Err(e) => {
+                app.forget_credential(&id);
+                return Err(e);
+            }
+        };
+        let mut v = view(&stores, ws);
+        v.notice = topology_notice(&dirs.data, &host);
+        Ok(v)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn save_query(
     stores: tauri::State<'_, Stores>,
@@ -461,6 +539,35 @@ mod tests {
         let err = f.update(dir.path(), |_| Ok(())).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "version = 2\n");
+    }
+
+    /// T-034: the password leaves the URL for the keychain, and nothing that
+    /// reaches the profile file can carry it.
+    #[test]
+    fn an_imported_url_is_persisted_without_its_password() {
+        for raw in [
+            "postgres://alice:hunter2@db.example.com:5433/shop?sslmode=disable",
+            "postgresql://alice@db.example.com:5433/shop?password=hunter2&sslmode=disable",
+            "postgres://alice:hunt%65r2@db.example.com:5433/shop?sslmode=disable",
+        ] {
+            let imported = decompose_url(&sluice_core::Secret::new(raw.into()), "profile-x", "").unwrap();
+            assert_eq!(imported.password.as_ref().map(|p| p.expose().as_str()), Some("hunter2"), "{raw}");
+            let e = &imported.entry;
+            assert_eq!((e.host.as_str(), e.port, e.user.as_str(), e.database.as_str()), ("db.example.com", 5433, "alice", "shop"));
+            assert_eq!(e.tls, TlsMode::Disabled);
+            assert_eq!(e.label, "shop@db.example.com");
+
+            let text = config::render(&Workspace { profiles: vec![imported.entry], queries: vec![] }, &SPEC).unwrap();
+            assert!(!text.contains("hunter2") && !text.contains("hunt%65r2"), "{text}");
+        }
+    }
+
+    #[test]
+    fn importing_a_non_postgres_or_broken_url_says_why_without_echoing_it() {
+        let e = decompose_url(&sluice_core::Secret::new("mongodb://u:hunter2@h/db".into()), "p", "").err().unwrap();
+        assert!(e.message.contains("Postgres only") && !e.message.contains("hunter2"), "{}", e.message);
+        let e = decompose_url(&sluice_core::Secret::new("not a url hunter2".into()), "p", "").err().unwrap();
+        assert!(!e.message.contains("hunter2"), "{}", e.message);
     }
 
     /// T-037 / R-019: the header states exactly what the file reveals.

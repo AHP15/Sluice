@@ -31,7 +31,7 @@ T-030 | done | M | D-026,R-031 | Broaden the consent fingerprint beyond the conf
 T-031 | done | M | D-026,R-032 | Precise subprocess environment policy with loud failure | 2026-11-06
 T-032 | done | M | D-026,R-033 | Platform-accurate consent text and Linux subprocess sandboxing | 2026-11-06
 T-033 | done | L | D-014 | Three-store app state with versioning and atomic writes | 2026-11-06
-T-034 | todo | S | D-014,D-007 | Strip passwords out of imported connection URLs |
+T-034 | done | S | D-014,D-007 | Strip passwords out of imported connection URLs | 2026-11-06
 T-035 | todo | M | D-014 | Query history caps, purge, and per-profile opt-out |
 T-036 | done | M | D-011 | Portable profile and saved-query file format | 2026-11-06
 T-037 | done | S | D-011,R-019 | Correct the safe-to-commit claim on the profile file | 2026-11-06
