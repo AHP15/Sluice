@@ -155,6 +155,7 @@ async fn browse_runs_through_the_lease() {
             sort: vec![],
             limit: 10,
             cursor: None,
+            offset: None,
         })
         .await
         .expect("browse");
@@ -170,6 +171,7 @@ fn browse_req(table: &str) -> BrowseRequest {
         sort: vec![],
         limit: 10,
         cursor: None,
+        offset: None,
     }
 }
 

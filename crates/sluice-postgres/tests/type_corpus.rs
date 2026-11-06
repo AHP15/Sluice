@@ -280,6 +280,7 @@ async fn browse(d: &PgDriver, table: &str, filter: Option<FilterTree>) -> Result
             sort: vec![SortKey { column: "id".into(), descending: false }],
             limit: 10,
             cursor: None,
+            offset: None,
         })
         .await
         .map_err(|e| e.to_string())?;

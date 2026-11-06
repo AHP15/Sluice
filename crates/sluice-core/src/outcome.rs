@@ -164,6 +164,23 @@ impl TxContext {
 pub struct ExecutionResult {
     pub outcomes: Vec<Outcome>,
     pub tx: TxContext,
+    /// T-047 / D-010: for a structured browse, how it paged and where the next
+    /// page starts. `None` for raw scripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageInfo>,
+}
+
+/// How a browse paginated, declared by the driver (T-047 / D-010).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum PageInfo {
+    /// Keyset on `key` (the requested sort, then the primary key as a
+    /// tiebreaker). Pass `next_cursor` as the next request's `cursor`.
+    Keyset { key: Vec<String>, next_cursor: Option<Vec<WireValue>> },
+    /// LIMIT/OFFSET, and why keyset was not possible. Pass `next_offset` as
+    /// the next request's `offset`. Pages can shift if rows change between
+    /// requests — the reason keyset is preferred.
+    Offset { reason: String, next_offset: Option<u64> },
 }
 
 impl ExecutionResult {
@@ -175,6 +192,7 @@ impl ExecutionResult {
                 body: OutcomeBody::Rows { columns, rows, truncated },
             }],
             tx: TxContext::autocommit(),
+            page: None,
         }
     }
 
@@ -338,6 +356,7 @@ mod tests {
                 mode: TxMode::ImplicitSingle,
                 disposition: TxDisposition::RolledBack { rolled_back: vec![0, 1] },
             },
+            page: None,
         };
         let committed = ExecutionResult {
             outcomes,
@@ -345,6 +364,7 @@ mod tests {
                 mode: TxMode::AutocommitPerStatement,
                 disposition: TxDisposition::Committed,
             },
+            page: None,
         };
 
         assert_eq!(rolled.summary(), "statement 3 failed; statements 1-2 rolled back");
@@ -370,6 +390,7 @@ mod tests {
                 },
             ],
             tx: TxContext::autocommit(),
+            page: None,
         };
         assert!(r.summary().contains("cancelled"));
         assert!(!r.summary().contains("failed"), "summary: {}", r.summary());

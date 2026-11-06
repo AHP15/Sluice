@@ -140,7 +140,14 @@ export interface BrowseRequest {
   sort: SortKey[];
   limit: number;
   cursor: WireValue[] | null;
+  /** T-047: next_offset from an offset-paged result. */
+  offset?: number | null;
 }
+
+/** T-047: how a browse paged, declared by the driver. */
+export type PageInfo =
+  | { strategy: "keyset"; key: string[]; next_cursor: WireValue[] | null }
+  | { strategy: "offset"; reason: string; next_offset: number | null };
 
 export interface QueryPosition {
   utf16_offset: number;
@@ -197,6 +204,8 @@ export type TxDisposition =
 
 export interface ExecutionResult {
   outcomes: Outcome[];
+  /** T-047: present for structured browse. */
+  page?: PageInfo;
   tx: {
     mode: "implicit_single" | "explicit_user" | "autocommit_per_statement";
     disposition: TxDisposition;

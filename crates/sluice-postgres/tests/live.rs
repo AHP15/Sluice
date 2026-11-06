@@ -78,6 +78,7 @@ fn browse_req(name: &str) -> BrowseRequest {
         sort: vec![],
         limit: 100,
         cursor: None,
+        offset: None,
     }
 }
 

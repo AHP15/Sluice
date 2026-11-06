@@ -137,7 +137,7 @@ export function saveValueToFile(
 export type StreamEvent =
   | { kind: "columns"; columns: ColumnDesc[] }
   | { kind: "rows"; seq: number; rows: WireValue[][] }
-  | { kind: "done"; rows: number; truncated: boolean }
+  | { kind: "done"; rows: number; truncated: boolean; page: import("./contract").PageInfo | null }
   | { kind: "cancelled" }
   | { kind: "timed_out" }
   | { kind: "error"; error: { message: string } };

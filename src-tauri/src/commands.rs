@@ -351,7 +351,7 @@ pub async fn open_browse_stream(
                 (Ok(_), Some(Stop::Cancelled)) => StreamEvent::Cancelled,
                 // Stopped without a gate stop: the channel closed (tab gone).
                 (Ok(end), None) if end.stopped => StreamEvent::Cancelled,
-                (Ok(end), None) => StreamEvent::Done { rows: end.rows, truncated: end.truncated },
+                (Ok(end), None) => StreamEvent::Done { rows: end.rows, truncated: end.truncated, page: end.page },
             };
             let _ = on_event.send(last);
             registry.remove(&id);

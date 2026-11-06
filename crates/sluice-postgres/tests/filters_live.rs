@@ -47,6 +47,7 @@ async fn ids(d: &PgDriver, filter: FilterTree) -> Vec<i64> {
             sort: vec![SortKey { column: "id".into(), descending: false }],
             limit: 100,
             cursor: None,
+            offset: None,
         })
         .await
         .expect("browse");

@@ -44,7 +44,7 @@ T-043 | todo | M | D-028,R-037 | Restrict LRU eviction to provably stateless tab
 T-044 | todo | M | D-028,R-038 | Reserve a browse floor inside the connection budget |
 T-045 | todo | S | D-028,R-039 | Three-valued session affinity capability |
 T-046 | done | S | R-039 | Spike: verify what mongodb ClientSession delivers for an editor tab | 2026-08-02
-T-047 | todo | L | D-010 | Keyset pagination with declared fallback strategy |
+T-047 | done | L | D-010 | Keyset pagination with declared fallback strategy | 2026-11-06
 T-048 | todo | M | D-010,R-010 | Per-relation keyset declaration accounting for composite key arity |
 T-049 | done | M | D-010,R-006 | Credit-based backpressure protocol for streamed row batches | 2026-11-06
 T-050 | todo | M | D-010,R-007,R-043 | Per-execution row and byte budget shared across the outcome sequence |

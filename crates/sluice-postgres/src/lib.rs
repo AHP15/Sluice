@@ -82,13 +82,15 @@ pub enum BrowseBatch {
 }
 
 /// How a streamed browse ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BrowseStreamEnd {
     pub rows: usize,
     /// The request's `limit` was reached (more rows may exist).
     pub truncated: bool,
     /// The consumer stopped it (cancel, timeout, or a closed channel).
     pub stopped: bool,
+    /// T-047: the strategy used and the next page's position (unstopped only).
+    pub page: Option<sluice_core::PageInfo>,
 }
 
 pub struct PgDriver {
@@ -449,7 +451,28 @@ impl PgDriver {
         // `ctid` exists on physical tables only; T-018 uses it to build
         // re-fetch handles for oversized values.
         let with_ctid = request.relation.kind == "table";
-        browse::compile(&request.relation, &columns, request, self.ceiling, with_ctid)
+        // T-047: what the catalog says about paging this relation. The
+        // primary key in key order and the NOT NULL columns; a view has none.
+        let keys = if with_ctid {
+            const PK: &str = "
+                SELECT a.attname
+                FROM pg_index x
+                JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = ANY(x.indkey)
+                WHERE x.indrelid = to_regclass($1) AND x.indisprimary
+                ORDER BY array_position(x.indkey::int2[], a.attnum)";
+            const NOT_NULL: &str = "
+                SELECT attname FROM pg_attribute
+                WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped AND attnotnull";
+            let pk = client.query(PK, &[&rel]).await.map_err(|e| error_map::map_error(&e, Some(PK)))?;
+            let nn = client.query(NOT_NULL, &[&rel]).await.map_err(|e| error_map::map_error(&e, Some(NOT_NULL)))?;
+            browse::KeyInfo {
+                primary_key: pk.iter().map(|r| r.get(0)).collect(),
+                not_null: nn.iter().map(|r| r.get(0)).collect(),
+            }
+        } else {
+            browse::KeyInfo::default()
+        };
+        browse::compile(&request.relation, &columns, request, self.ceiling, with_ctid, &keys)
     }
 
     fn decode_row(
@@ -501,7 +524,7 @@ impl PgDriver {
         self.with_lease(false, async |client: &tokio_postgres::Client| {
             let compiled = self.compile_browse(client, &request).await?;
             if !emit(BrowseBatch::Columns(compiled.column_descs())).await {
-                return Ok(BrowseStreamEnd { rows: 0, truncated: false, stopped: true });
+                return Ok(BrowseStreamEnd { rows: 0, truncated: false, stopped: true, page: None });
             }
 
             let cancel = client.cancel_token();
@@ -512,18 +535,21 @@ impl PgDriver {
             let mut stream = std::pin::pin!(stream);
 
             let mut sent = 0usize;
+            let mut last: Option<Vec<WireValue>> = None;
             let mut batch: Vec<Vec<WireValue>> = Vec::with_capacity(batch_rows);
             while let Some(row) = stream
                 .try_next()
                 .await
                 .map_err(|e| error_map::map_error(&e, Some(&compiled.sql)))?
             {
-                batch.push(self.decode_row(&compiled, &row, &request.relation)?);
+                let decoded = self.decode_row(&compiled, &row, &request.relation)?;
+                last = Some(decoded.clone());
+                batch.push(decoded);
                 if batch.len() == batch_rows {
                     let n = batch.len();
                     if !emit(BrowseBatch::Rows(std::mem::take(&mut batch))).await {
                         self.send_cancel(&cancel).await;
-                        return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true });
+                        return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true, page: None });
                     }
                     // Counted only once accepted: a batch refused at cancel was
                     // never delivered.
@@ -533,7 +559,7 @@ impl PgDriver {
             if !batch.is_empty() {
                 let n = batch.len();
                 if !emit(BrowseBatch::Rows(batch)).await {
-                    return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true });
+                    return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true, page: None });
                 }
                 sent += n;
             }
@@ -541,6 +567,7 @@ impl PgDriver {
                 rows: sent,
                 truncated: sent as u32 >= request.limit,
                 stopped: false,
+                page: Some(compiled.paging.page_info(&compiled.columns, last.as_deref(), sent, request.limit)),
             })
         })
         .await
@@ -746,8 +773,17 @@ impl Driver for PgDriver {
             }
 
             let truncated = out_rows.len() as u32 >= request.limit;
+            // T-047: declare the strategy used and where the next page starts.
+            let page = compiled.paging.page_info(
+                &compiled.columns,
+                out_rows.last().map(Vec::as_slice),
+                out_rows.len(),
+                request.limit,
+            );
             // D-029: structured browse always yields exactly one `rows` outcome.
-            Ok(ExecutionResult::single_rows(compiled.column_descs(), out_rows, truncated))
+            let mut result = ExecutionResult::single_rows(compiled.column_descs(), out_rows, truncated);
+            result.page = Some(page);
+            Ok(result)
         })
         .await
     }
@@ -804,6 +840,7 @@ impl Driver for PgDriver {
                     Ok(ExecutionResult {
                         outcomes,
                         tx: TxContext { mode, disposition: TxDisposition::Committed },
+                        page: None,
                     })
                 }
                 Err(e) => {
@@ -867,6 +904,7 @@ impl Driver for PgDriver {
                                 TxDisposition::Committed
                             },
                         },
+                        page: None,
                     })
                 }
             }
