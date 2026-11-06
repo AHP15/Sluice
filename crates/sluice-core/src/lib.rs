@@ -175,6 +175,32 @@ mod contract_tests {
         .is_comparable());
     }
 
+    /// T-067: every wire value reports a class, and the per-value classes
+    /// cover every declared class except the column-only `Unknown` fallback.
+    #[test]
+    fn every_wire_value_maps_to_a_type_class() {
+        let cases = [
+            (WireValue::Null, TypeClass::Unknown),
+            (WireValue::Missing, TypeClass::Unknown),
+            (WireValue::Bool(true), TypeClass::Boolean),
+            (WireValue::Int(1), TypeClass::Integer),
+            (WireValue::Float(1.0), TypeClass::Float),
+            (WireValue::Numeric("1".into()), TypeClass::ExactNumeric),
+            (WireValue::Text("a".into()), TypeClass::Text),
+            (WireValue::Bytes("".into()), TypeClass::Binary),
+            (WireValue::Timestamp("2026-01-01".into()), TypeClass::Timestamp),
+            (WireValue::Uuid("0".into()), TypeClass::Uuid),
+            (WireValue::Document(vec![]), TypeClass::Structural),
+            (WireValue::Array(vec![]), TypeClass::Structural),
+            (WireValue::Opaque { type_name: "inet".into(), rendered: "x".into() }, TypeClass::Opaque),
+            (WireValue::Oversized { type_name: "bytea".into(), byte_len: 1, handle: None }, TypeClass::Oversized),
+            (WireValue::Unsupported { type_name: "x".into(), rendered: "x".into() }, TypeClass::Unknown),
+        ];
+        for (v, want) in &cases {
+            assert_eq!(v.type_class(), *want, "{v:?}");
+        }
+    }
+
     /// T-068: Mongo `Decimal128` extremes — 34 significant digits and an
     /// exponent range far beyond f64 — survive the wire encoding as text. The
     /// engine half of this belongs to a Mongo corpus once that driver exists;

@@ -306,6 +306,69 @@ mod tests {
     use super::*;
 
     /// D-006's raw/tagged split, asserted exactly as the decision words it.
+    /// T-067: every engine type maps into a declared type class — the layer
+    /// that lets the UI pick editors and operators without knowing Postgres.
+    #[test]
+    fn engine_types_map_into_the_declared_type_classes() {
+        let table: &[(Type, TypeClass)] = &[
+            (Type::BOOL, TypeClass::Boolean),
+            (Type::INT2, TypeClass::Integer),
+            (Type::INT4, TypeClass::Integer),
+            (Type::INT8, TypeClass::ExactNumeric),
+            (Type::NUMERIC, TypeClass::ExactNumeric),
+            (Type::MONEY, TypeClass::ExactNumeric),
+            (Type::FLOAT4, TypeClass::Float),
+            (Type::FLOAT8, TypeClass::Float),
+            (Type::TEXT, TypeClass::Text),
+            (Type::VARCHAR, TypeClass::Text),
+            (Type::BPCHAR, TypeClass::Text),
+            (Type::NAME, TypeClass::Text),
+            (Type::UUID, TypeClass::Uuid),
+            (Type::DATE, TypeClass::Timestamp),
+            (Type::TIMESTAMP, TypeClass::Timestamp),
+            (Type::TIMESTAMPTZ, TypeClass::Timestamp),
+            (Type::TIME, TypeClass::Timestamp),
+            (Type::INTERVAL, TypeClass::Timestamp),
+            (Type::BYTEA, TypeClass::Binary),
+            (Type::JSON, TypeClass::Structural),
+            (Type::JSONB, TypeClass::Structural),
+            // R-014: anything without a Rust mapping is Opaque, never an error.
+            (Type::INET, TypeClass::Opaque),
+            (Type::TS_VECTOR, TypeClass::Opaque),
+            (Type::INT4_ARRAY, TypeClass::Opaque),
+            (Type::POINT, TypeClass::Opaque),
+        ];
+        for (ty, want) in table {
+            assert_eq!(type_class_for(ty), *want, "{ty}");
+        }
+    }
+
+    /// T-067: the class a column is *declared* with is the class of the values
+    /// the encoder produces for it — otherwise the UI offers one type's editor
+    /// and operators for another type's values.
+    #[test]
+    fn a_columns_declared_class_matches_its_encoded_values() {
+        for ty in [
+            Type::INT8, Type::NUMERIC, Type::TEXT, Type::VARCHAR, Type::UUID,
+            Type::TIMESTAMPTZ, Type::DATE, Type::BYTEA, Type::INET,
+        ] {
+            let Rendering::Text(shape) = rendering_for(&ty) else { panic!("{ty} is text-rendered") };
+            let v = text_to_wire(shape, &ty, "x".into());
+            assert_eq!(v.type_class(), type_class_for(&ty), "{ty} encodes as {v:?}");
+        }
+        // The one deliberate exception, pinned so it cannot drift silently:
+        // json/jsonb columns are declared Structural, but values cross as
+        // verbatim Text — parsing into a Document would lose key order and
+        // duplicate keys (T-068). Consequence, recorded on T-067: no filter
+        // operator is declared for Structural, so json columns get none.
+        for ty in [Type::JSON, Type::JSONB] {
+            let Rendering::Text(shape) = rendering_for(&ty) else { panic!() };
+            assert_eq!(type_class_for(&ty), TypeClass::Structural);
+            assert_eq!(text_to_wire(shape, &ty, "{}".into()).type_class(), TypeClass::Text);
+        }
+        assert_eq!(float_to_wire(1.5, &Type::FLOAT8).type_class(), type_class_for(&Type::FLOAT8));
+    }
+
     /// T-068: JSON has no NaN or infinity — serde writes `null`, which the
     /// grid would show as SQL NULL. Non-finite floats become tagged strings in
     /// Postgres' own spelling; finite ones stay raw.

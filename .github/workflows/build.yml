@@ -50,6 +50,12 @@ jobs:
       - name: Core contract and redaction tests
         run: cargo test -p sluice-core
 
+      # T-067 / D-021: filter compilation, type-class mapping and the rest of
+      # the driver's pure logic must run with NO database. This job has no
+      # service container, so a unit test that quietly needed one fails here.
+      - name: Driver unit tests without a database
+        run: cargo test -p sluice-postgres --lib
+
   # T-028 / R-001 (critical). D-026 splits config discovery into an inert tier
   # (parsed, never executed — automatic and unprompted) and an executable tier
   # (consent-gated). The entire safety argument for making the first tier

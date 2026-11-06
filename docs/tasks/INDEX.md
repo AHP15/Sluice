@@ -64,7 +64,7 @@ T-063 | todo | L | D-018 | Column derivation for schemaless collections |
 T-064 | todo | M | D-018,R-015 | Sample both ends of a collection and show inference coverage |
 T-065 | todo | M | D-018,D-029,R-025 | Declare sortability per relation and per path |
 T-066 | done | L | D-017 | Layered error model with normalized kind, hints, and verbatim payload | 2026-08-03
-T-067 | todo | M | D-021 | Unit tests over pure driver-independent logic |
+T-067 | done | M | D-021 | Unit tests over pure driver-independent logic | 2026-11-06
 T-068 | done | M | D-021,D-006 | Per-engine type-fidelity corpus with hostile edge values | 2026-11-06
 T-069 | done | M | D-021,R-018 | Run the type-fidelity corpus in CI against a service container | 2026-11-06
 T-070 | todo | M | D-021 | React component tests over the grid and filter bar |
