@@ -95,6 +95,8 @@ export interface FilterOpDecl {
   label: string;
   type_classes: TypeClass[];
   case_sensitive: boolean | null;
+  /** T-015: the operator honours `Predicate.case_insensitive`. */
+  case_insensitive_toggle: boolean;
 }
 
 export interface Capabilities {
@@ -110,9 +112,17 @@ export interface Capabilities {
   filter_ops: FilterOpDecl[];
   fixed_schema: boolean;
   supports_script: boolean;
+  /** T-015: the server's default string collation (what `case_sensitive` reflects). */
+  string_collation: string | null;
 }
 
-export type Predicate = { column: string; op: string; value: WireValue };
+export type Predicate = {
+  column: string;
+  op: string;
+  value: WireValue;
+  /** T-015: compare ignoring case; only on ops declaring `case_insensitive_toggle`. */
+  case_insensitive?: boolean;
+};
 
 export type FilterTree =
   | { node: "and"; 0: FilterTree[] }

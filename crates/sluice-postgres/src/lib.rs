@@ -95,6 +95,10 @@ pub struct PgDriver {
     /// T-024 / R-023: this connection's password, kept **only** to redact it
     /// from every error the driver returns, in every encoding.
     redactor: sluice_core::Redactor,
+    /// T-015: the database's default collation and whether it is
+    /// deterministic, read at connect. Deterministic means `=` and `LIKE`
+    /// distinguish case — the semantics the filter bar reports.
+    collation: Option<(String, bool)>,
 }
 
 impl PgDriver {
@@ -159,21 +163,30 @@ impl PgDriver {
             reset: ResetSupport::Native,
             stats: Arc::new(PoolStats::default()),
             redactor: sluice_core::Redactor::new(spec.password.clone()),
+            collation: None,
         };
 
         // Prove the credentials work now rather than on first browse, and pick
         // up the version banner while we are here (T-054 refines this).
-        let version = driver
+        let (version, collation) = driver
             .with_lease(false, async |client: &tokio_postgres::Client| {
+                // T-015: the default collation's name and determinism. A
+                // nondeterministic (e.g. ICU case-insensitive) default would
+                // make `=` ignore case; the descriptor must say which it is.
                 let row = client
-                    .query_one("select version()", &[])
+                    .query_one(
+                        "select version(), \
+                                (select datcollate from pg_database where datname = current_database()), \
+                                coalesce((select collisdeterministic from pg_collation where collname = 'default'), true)",
+                        &[],
+                    )
                     .await
                     .map_err(|e| error_map::map_error(&e, None))?;
-                Ok(row.get::<_, String>(0))
+                Ok((row.get::<_, String>(0), (row.get::<_, String>(1), row.get::<_, bool>(2))))
             })
             .await?;
 
-        Ok(Arc::new(Self { server_version: Some(version), ..driver }))
+        Ok(Arc::new(Self { server_version: Some(version), collation: Some(collation), ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
@@ -185,6 +198,7 @@ impl PgDriver {
             reset: self.reset,
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
+            collation: self.collation.clone(),
         })
     }
 
@@ -200,6 +214,7 @@ impl PgDriver {
             reset,
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
+            collation: self.collation.clone(),
         })
     }
 
@@ -575,9 +590,10 @@ impl Driver for PgDriver {
             }),
             raw_payload: RawPayloadKind::Script,
             node_kinds: navigator::node_kinds(),
-            filter_ops: filter_ops(),
+            filter_ops: filter_ops(self.collation.as_ref().is_none_or(|(_, det)| *det)),
             fixed_schema: true,
             supports_script: true,
+            string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
         }
     }
 
@@ -858,7 +874,10 @@ pub fn decode_handle(handle: &str) -> Option<(Vec<String>, String, String)> {
 /// R-009: `case_sensitive` is declared, not assumed. Postgres `contains`
 /// compiles to `ILIKE`, which is case-INSENSITIVE — the same behaviour the
 /// Mongo driver was made to match, so the declared value is the same on both.
-fn filter_ops() -> Vec<FilterOpDecl> {
+/// `strings_case_sensitive`: what the database's default collation does —
+/// deterministic collations distinguish case for `=` and `LIKE`. That is
+/// reported, not overridden (R-009); the per-predicate toggle opts out.
+fn filter_ops(strings_case_sensitive: bool) -> Vec<FilterOpDecl> {
     let all = vec![
         TypeClass::Boolean,
         TypeClass::Integer,
@@ -869,16 +888,19 @@ fn filter_ops() -> Vec<FilterOpDecl> {
         TypeClass::Uuid,
     ];
     vec![
-        FilterOpDecl { id: "eq".into(), label: "equals".into(), type_classes: all.clone(), case_sensitive: Some(true) },
-        FilterOpDecl { id: "ne".into(), label: "not equals".into(), type_classes: all.clone(), case_sensitive: Some(true) },
-        FilterOpDecl { id: "gt".into(), label: "greater than".into(), type_classes: all.clone(), case_sensitive: None },
-        FilterOpDecl { id: "gte".into(), label: "at least".into(), type_classes: all.clone(), case_sensitive: None },
-        FilterOpDecl { id: "lt".into(), label: "less than".into(), type_classes: all.clone(), case_sensitive: None },
-        FilterOpDecl { id: "lte".into(), label: "at most".into(), type_classes: all, case_sensitive: None },
-        FilterOpDecl { id: "contains".into(), label: "contains".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(false) },
-        FilterOpDecl { id: "starts_with".into(), label: "starts with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(false) },
-        FilterOpDecl { id: "is_null".into(), label: "is null".into(), type_classes: vec![], case_sensitive: None },
-        FilterOpDecl { id: "is_not_null".into(), label: "is not null".into(), type_classes: vec![], case_sensitive: None },
+        FilterOpDecl { id: "eq".into(), label: "equals".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "ne".into(), label: "not equals".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "gt".into(), label: "greater than".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "gte".into(), label: "at least".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "lt".into(), label: "less than".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "lte".into(), label: "at most".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "contains".into(), label: "contains".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "starts_with".into(), label: "starts with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "ends_with".into(), label: "ends with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "in".into(), label: "is one of".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "between".into(), label: "between".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "is_null".into(), label: "is null".into(), type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "is_not_null".into(), label: "is not null".into(), type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
     ]
 }
 
@@ -911,10 +933,23 @@ mod tests {
         assert_eq!(col, "body");
     }
 
+    /// T-013: the Postgres driver declares every core operator (D-005).
+    #[test]
+    fn every_core_filter_operator_is_declared() {
+        let missing = sluice_core::missing_core_ops(&filter_ops(true));
+        assert!(missing.is_empty(), "core operators not declared: {missing:?}");
+    }
+
     #[test]
     fn contains_declares_case_insensitivity_matching_the_mongo_driver() {
-        let ops = filter_ops();
+        // T-015 / R-009: the engine's semantics are reported, not overridden —
+        // under a deterministic collation `LIKE` distinguishes case — and the
+        // toggle is offered on string operators only.
+        let ops = filter_ops(true);
         let c = ops.iter().find(|o| o.id == "contains").unwrap();
-        assert_eq!(c.case_sensitive, Some(false));
+        assert_eq!(c.case_sensitive, Some(true));
+        assert!(c.case_insensitive_toggle);
+        assert!(!ops.iter().find(|o| o.id == "gt").unwrap().case_insensitive_toggle);
+        assert_eq!(filter_ops(false).iter().find(|o| o.id == "eq").unwrap().case_sensitive, Some(false));
     }
 }

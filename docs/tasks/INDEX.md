@@ -10,9 +10,9 @@ T-009 | done | M | D-029 | Structured browse request compiled per driver | 2026-
 T-010 | done | M | D-029 | Statement-outcome sequence as the execution result envelope | 2026-08-03
 T-011 | done | M | D-029,R-040 | Dialect-aware script splitting used only for display attribution | 2026-08-03
 T-012 | done | M | D-029,R-041 | Transactional context on the execution result | 2026-08-03
-T-013 | todo | M | D-005 | Core filter operator set with AND/OR tree and type classes |
+T-013 | done | M | D-005 | Core filter operator set with AND/OR tree and type classes | 2026-11-06
 T-014 | todo | S | D-005 | Driver-declared filter extension operators |
-T-015 | todo | M | D-005,R-009 | Literal string matching and declared case-sensitivity for filters |
+T-015 | done | M | D-005,R-009 | Literal string matching and declared case-sensitivity for filters | 2026-11-06
 T-016 | done | L | D-006 | Lossless wire value encoding with per-column type descriptors | 2026-08-03
 T-017 | done | M | D-006,R-014 | Unknown type OID fallback so exotic types reach the UI as strings | 2026-08-03
 T-018 | done | M | D-006,R-008 | Per-value size ceiling with on-demand full-value fetch | 2026-08-03

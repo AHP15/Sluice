@@ -28,6 +28,12 @@ pub struct Predicate {
     /// An operator id the driver declared in `Capabilities::filter_ops`.
     pub op: String,
     pub value: WireValue,
+    /// T-015 / R-009: compare case-insensitively, whatever the engine's
+    /// collation does by default. Off means the engine's own semantics, which
+    /// the capability descriptor reports (`FilterOpDecl::case_sensitive`).
+    /// Each driver compiles it its own way (`ILIKE`, `LOWER()`, a collation).
+    #[serde(default)]
+    pub case_insensitive: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

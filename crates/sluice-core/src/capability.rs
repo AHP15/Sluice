@@ -95,6 +95,43 @@ pub struct NodeKind {
     pub is_relation: bool,
 }
 
+/// D-005's universal core: every driver must compile and declare each of these.
+///
+/// Value shapes, which every driver honours identically:
+/// - `eq` `ne` `lt` `lte` `gt` `gte` `contains` `starts_with` `ends_with` — one
+///   non-null value (compare to NULL with `is_null`, never `eq`);
+/// - `in` — a `WireValue::Array` of non-null values; an empty list matches
+///   nothing;
+/// - `between` — a `WireValue::Array` of exactly two non-null values, inclusive;
+/// - `is_null` `is_not_null` — no value.
+///
+/// Engine-specific operators are *extensions*, declared beside these (T-014).
+pub const CORE_FILTER_OPS: &[&str] = &[
+    "eq",
+    "ne",
+    "lt",
+    "lte",
+    "gt",
+    "gte",
+    "in",
+    "between",
+    "is_null",
+    "is_not_null",
+    "contains",
+    "starts_with",
+    "ends_with",
+];
+
+/// Core operators a driver's capability descriptor fails to declare — the
+/// conformance check every driver's tests run (T-013).
+pub fn missing_core_ops(declared: &[FilterOpDecl]) -> Vec<&'static str> {
+    CORE_FILTER_OPS
+        .iter()
+        .copied()
+        .filter(|op| !declared.iter().any(|d| d.id == *op))
+        .collect()
+}
+
 /// A filter operator the driver can compile (T-013/T-014).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FilterOpDecl {
@@ -105,6 +142,10 @@ pub struct FilterOpDecl {
     /// and case-sensitive on Mongo (`$regex`) unless the driver opts out.
     /// T-073 F-9 reproduced this live. `None` means not a string operator.
     pub case_sensitive: Option<bool>,
+    /// T-015 / R-009: the operator honours `Predicate::case_insensitive`, so
+    /// the filter bar may offer the toggle. False means the flag is refused.
+    #[serde(default)]
+    pub case_insensitive_toggle: bool,
 }
 
 /// Transaction behaviour an editor tab can rely on.
@@ -151,4 +192,10 @@ pub struct Capabilities {
     /// T-073 F-5: false on Mongo, where the outcome *sequence* (T-010) is
     /// permanently length 1 and T-011's script splitting has no meaning.
     pub supports_script: bool,
+    /// T-015 / R-009: the server's default string collation, as the engine
+    /// names it — shown in the filter bar beside each operator's declared
+    /// case sensitivity, because that sensitivity is the collation's, not the
+    /// tool's. `None` where the engine has no such notion.
+    #[serde(default)]
+    pub string_collation: Option<String>,
 }

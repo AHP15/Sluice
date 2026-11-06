@@ -30,7 +30,7 @@ pub mod redact;
 pub mod secret;
 pub mod value;
 
-pub use capability::{
+pub use capability::{missing_core_ops, CORE_FILTER_OPS, 
     CancelSupport, Capabilities, FilterOpDecl, NodeKind, RawPayloadKind, ResetSupport,
     SessionAffinity, TransactionSupport,
 };
@@ -134,9 +134,11 @@ mod contract_tests {
                 label: "contains".into(),
                 type_classes: vec![TypeClass::Text],
                 case_sensitive: Some(false),
+                case_insensitive_toggle: true,
             }],
             fixed_schema: true,
             supports_script: true,
+            string_collation: Some("en_US.utf8".into()),
         };
 
         let json = serde_json::to_string(&caps).expect("serialize");

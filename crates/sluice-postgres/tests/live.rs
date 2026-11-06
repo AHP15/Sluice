@@ -406,9 +406,10 @@ async fn structured_browse_compiles_filters_sorts_and_cursors() {
     )
     .await;
 
-    // contains is case-insensitive (R-009), and must be declared so.
+    // T-015 / R-009: case-insensitive `contains` is the explicit toggle now —
+    // the default reports the engine's semantics (case-sensitive LIKE).
     let mut req = browse_req("browse_t");
-    req.filter = Some(sluice_core::FilterTree::Pred(sluice_core::Predicate {
+    req.filter = Some(sluice_core::FilterTree::Pred(sluice_core::Predicate { case_insensitive: true,
         column: "name".into(),
         op: "contains".into(),
         value: WireValue::Text("A".into()),
@@ -423,7 +424,7 @@ async fn structured_browse_compiles_filters_sorts_and_cursors() {
             v => format!("{v:?}"),
         })
         .collect();
-    assert_eq!(names, vec!["Alpha", "beta", "GAMMA"], "ILIKE must match all three");
+    assert_eq!(names, vec!["Alpha", "beta", "GAMMA"], "the case-insensitive toggle must match all three");
 
     // D-029: browse is always exactly one rows outcome.
     assert_eq!(r.outcomes.len(), 1);
