@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronRight, ChevronDown, Loader2 } from "lucide-react";
+import { ChevronRight, ChevronDown, Loader2, RefreshCw } from "lucide-react";
 import type { Capabilities, NavNode, NodeId, NodeKind } from "../lib/contract";
-import { navigatorChildren } from "../lib/ipc";
+import { navigatorChildren, refreshNavigator } from "../lib/ipc";
 import { cn } from "../lib/utils";
 
 /**
@@ -29,10 +29,35 @@ export function Navigator({
   onSelect: (node: NavNode, kind: NodeKind) => void;
 }) {
   const kindsById = new Map(capabilities.node_kinds.map((k) => [k.id, k]));
+  // T-053 / D-016: the core caches each level; refresh drops that cache and
+  // remounts the tree, which re-fetches whatever is currently open.
+  const [generation, setGeneration] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
 
   return (
     <div className="text-sm">
+      <div className="flex items-center justify-end px-1 pb-1">
+        <button
+          type="button"
+          className="flex items-center gap-1 rounded px-1 text-xs text-muted-foreground hover:bg-accent"
+          title="Re-read the catalog (changes made outside this app are not detected automatically)"
+          disabled={refreshing}
+          onClick={async () => {
+            setRefreshing(true);
+            try {
+              await refreshNavigator(sessionId);
+              setGeneration((g) => g + 1);
+            } finally {
+              setRefreshing(false);
+            }
+          }}
+        >
+          <RefreshCw className={cn("h-3 w-3", refreshing && "animate-spin")} />
+          Refresh
+        </button>
+      </div>
       <Level
+        key={generation}
         sessionId={sessionId}
         parent={null}
         depth={0}

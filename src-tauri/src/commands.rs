@@ -409,6 +409,20 @@ pub async fn save_session_as_profile(
     .await
 }
 
+/// T-053 / D-016: drop the session's navigator cache. External DDL cannot be
+/// detected without polling, so this is the contract, not a fallback.
+#[tauri::command]
+pub async fn refresh_navigator(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), DriverError> {
+    guard_driver_call(&sid(&session_id), async {
+        state.driver(&session_id).await?.refresh_catalog();
+        Ok(())
+    })
+    .await
+}
+
 /// Rows across every `rows` outcome of a result, for the shape log.
 fn rows_in(r: &ExecutionResult) -> Option<usize> {
     Some(

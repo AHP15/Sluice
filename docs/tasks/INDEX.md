@@ -50,7 +50,7 @@ T-049 | done | M | D-010,R-006 | Credit-based backpressure protocol for streamed
 T-050 | todo | M | D-010,R-007,R-043 | Per-execution row and byte budget shared across the outcome sequence |
 T-051 | todo | M | D-010 | Real query cancellation and per-profile statement timeout |
 T-052 | todo | M | D-010,R-042 | Decouple socket draining from webview consumption with a spill buffer |
-T-053 | todo | L | D-016 | Native catalog introspection loaded lazily with explicit refresh |
+T-053 | done | L | D-016 | Native catalog introspection loaded lazily with explicit refresh | 2026-11-06
 T-054 | todo | M | D-016 | Server version and flavour detection into the capability descriptor |
 T-055 | todo | M | D-016,R-028 | Probe catalog capabilities rather than trusting the version banner |
 T-056 | todo | L | D-027 | Staged edits applied in one transaction behind a unique-key gate |

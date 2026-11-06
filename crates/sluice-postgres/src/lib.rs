@@ -99,6 +99,10 @@ pub struct PgDriver {
     /// deterministic, read at connect. Deterministic means `=` and `LIKE`
     /// distinguish case — the semantics the filter bar reports.
     collation: Option<(String, bool)>,
+    /// T-053 / D-016: one level of the navigator tree per parent, filled on
+    /// first expand and kept until DDL the app ran, or an explicit refresh.
+    /// Shared across `with_*` copies, like the pool.
+    nav_cache: Arc<std::sync::Mutex<std::collections::HashMap<Option<NodeId>, Vec<NavNode>>>>,
 }
 
 impl PgDriver {
@@ -164,6 +168,7 @@ impl PgDriver {
             stats: Arc::new(PoolStats::default()),
             redactor: sluice_core::Redactor::new(spec.password.clone()),
             collation: None,
+            nav_cache: Arc::default(),
         };
 
         // Prove the credentials work now rather than on first browse, and pick
@@ -199,6 +204,7 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            nav_cache: self.nav_cache.clone(),
         })
     }
 
@@ -215,6 +221,7 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            nav_cache: self.nav_cache.clone(),
         })
     }
 
@@ -562,6 +569,12 @@ impl PgDriver {
         &self.redactor
     }
 
+    /// T-053 / D-016: drop the navigator cache. External DDL is undetectable
+    /// without polling, so refresh is the contract, not a fallback.
+    pub fn refresh_catalog(&self) {
+        self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
     /// Release counters for this driver's pool (T-040).
     pub fn pool_stats(&self) -> PoolStatsSnapshot {
         self.stats.snapshot()
@@ -601,10 +614,21 @@ impl Driver for PgDriver {
         &self,
         parent: Option<NodeId>,
     ) -> Result<Vec<NavNode>, DriverError> {
-        self.with_lease(false, async |client: &tokio_postgres::Client| {
-            navigator::children(&client, parent).await
-        })
-        .await
+        if let Some(hit) = self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).get(&parent) {
+            return Ok(hit.clone());
+        }
+        let key = parent.clone();
+        let nodes = self
+            .with_lease(false, async |client: &tokio_postgres::Client| {
+                navigator::children(&client, parent).await
+            })
+            .await?;
+        // A notice (permission-denied, a vanished relation) is not catalog
+        // content: never cached, so the next expand tries again.
+        if !nodes.iter().any(navigator::is_notice) {
+            self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, nodes.clone());
+        }
+        Ok(nodes)
     }
 
     async fn browse(&self, request: BrowseRequest) -> Result<ExecutionResult, DriverError> {
@@ -650,6 +674,7 @@ impl Driver for PgDriver {
                 ))
             }
         };
+        let script_for_cache = script.clone();
 
         let result = self.with_lease(true, async |client: &tokio_postgres::Client| {
     
@@ -752,6 +777,12 @@ impl Driver for PgDriver {
         // T-024: a failing statement arrives as an `Error` *outcome* inside an
         // `Ok` result, so `with_lease`'s error redaction never sees it — and the
         // engine quotes offending values back verbatim. Redact every one.
+        // T-053 / D-016: DDL this app ran invalidates the navigator cache.
+        // Done whether or not the script succeeded — a partially applied
+        // explicit transaction can still have changed the catalog.
+        if navigator::script_may_change_catalog(&script_for_cache) {
+            self.refresh_catalog();
+        }
         Ok(self.redact_outcomes(result))
     }
 }

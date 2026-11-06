@@ -80,6 +80,11 @@ export function navigatorChildren(
   return invoke<NavNode[]>("navigator_children", { sessionId, parent });
 }
 
+/** T-053: drop the core's navigator cache so the next expand re-reads it. */
+export function refreshNavigator(sessionId: string): Promise<void> {
+  return invoke("refresh_navigator", { sessionId });
+}
+
 export function browse(
   sessionId: string,
   request: BrowseRequest,
