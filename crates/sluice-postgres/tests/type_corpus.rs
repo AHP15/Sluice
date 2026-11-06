@@ -17,6 +17,15 @@
 //!    R-005's "assert edit round-trips as well as reads": if the read lost
 //!    anything, the server no longer considers it equal. Types with no `=`
 //!    operator (`json`, `point`, `xml`) say so instead.
+//! 4. **Concurrency (T-059 / R-034)** — the value read, sent back as an
+//!    edit's original through `apply_edits`, must **commit** against the
+//!    unmodified row (no spurious conflict: the bound original is cast to the
+//!    column's own type and equals the stored value) and, after the row is
+//!    changed behind its back, must **conflict**. A type the driver does not
+//!    declare concurrency-comparable must instead commit on the key alone and
+//!    report the column in `concurrency_omitted` — never error the way
+//!    `json = json` would. The NULL row's edit, with a NULL original, must
+//!    commit too (R-004).
 //!
 //! ## Running it
 //!
@@ -46,8 +55,8 @@
 use std::str::FromStr;
 
 use sluice_core::{
-    BrowseRequest, Driver, FilterTree, NodeId, OutcomeBody, Predicate, RawRequest, Secret,
-    SortKey, WireValue,
+    BrowseRequest, Driver, EditRequest, ErrorKind, FilterTree, NodeId, Original, OutcomeBody,
+    Predicate, RawRequest, Secret, SortKey, TxDisposition, WireValue,
 };
 use sluice_postgres::{tls::TlsMode, ConnectSpec, PgDriver};
 
@@ -216,6 +225,12 @@ fn corpus() -> Vec<Case> {
         case("numrange exact bounds", "numrange", "'[1.00000000000000000001,2)'",
              opaque("numrange", "[1.00000000000000000001,2)")),
         case("pg_lsn", "pg_lsn", "'FFFFFFFF/FFFFFFFF'", opaque("pg_lsn", "FFFFFFFF/FFFFFFFF")),
+        // T-059: the one-byte internal type. Bare `char` in a cast means
+        // bpchar(1), a different type; the cast must say "char".
+        case("\"char\"", "\"char\"", "'x'", text("x")),
+        // T-059: a user type outside the search path. Its cast must be
+        // schema-qualified or the write path cannot even name it.
+        case("enum outside the search path", "type_corpus.mood", "'happy'", opaque("mood", "happy")),
         Case {
             name: "point",
             sql_type: "point",
@@ -307,7 +322,10 @@ async fn every_type_round_trips_through_the_wire_encoding_unchanged() {
     };
     let d = PgDriver::connect(spec).await.expect("TEST_PG_URL is set but the server is unreachable");
 
-    exec(&d, &format!("drop schema if exists {SCHEMA} cascade; create schema {SCHEMA};"))
+    exec(&d, &format!(
+        "drop schema if exists {SCHEMA} cascade; create schema {SCHEMA}; \
+         create type {SCHEMA}.mood as enum ('sad', 'happy');"
+    ))
         .await
         .expect("corpus schema setup");
 
@@ -379,6 +397,76 @@ async fn every_type_round_trips_through_the_wire_encoding_unchanged() {
                 Err(e) => failures.push(format!("[{}] write-back failed: {e}", c.name)),
             }
         }
+    }
+
+    // 4. Concurrency (T-059 / R-034), per type.
+    let mut concurrency_checks = 0usize;
+    for (i, c) in cases.iter().enumerate() {
+        let table = format!("c{i:03}");
+        let Ok(rows) = browse(&d, &table, None).await else { continue };
+        let got = rows[0][1].clone();
+        let comparable = match d
+            .browse(BrowseRequest { relation: rel(&table), filter: None, sort: vec![], limit: 1, cursor: None, offset: None })
+            .await
+        {
+            Ok(r) => r.first_rows().and_then(|(cols, _)| cols.iter().find(|c| c.name == "v")).map(|c| c.concurrency_comparable),
+            Err(_) => None,
+        };
+        let Some(comparable) = comparable else {
+            failures.push(format!("[{}] concurrency: no descriptor for v", c.name));
+            continue;
+        };
+        if c.no_writeback.is_some() && comparable {
+            failures.push(format!("[{}] declared concurrency-comparable but has no equality", c.name));
+        }
+        let edit = |id: i32, original: WireValue| EditRequest {
+            relation: rel(&table),
+            key: vec![Original { column: "id".into(), value: WireValue::Int(id.into()) }],
+            set: vec![Original { column: "v".into(), value: original.clone() }],
+            originals: vec![Original { column: "v".into(), value: original }],
+        };
+
+        // Unmodified, and the NULL row with a NULL original: both must commit.
+        for (id, original) in [(1, got.clone()), (2, WireValue::Null)] {
+            concurrency_checks += 1;
+            match d.apply_edits(vec![edit(id, original.clone())], None).await {
+                Ok(r) if r.tx.disposition == TxDisposition::Committed => {
+                    let omitted = match &r.outcomes[0].body {
+                        OutcomeBody::Affected { concurrency_omitted, .. } => concurrency_omitted.clone(),
+                        _ => vec![],
+                    };
+                    let want: Vec<String> = if comparable { vec![] } else { vec!["v".into()] };
+                    if omitted != want {
+                        failures.push(format!("[{}] concurrency: omitted {omitted:?}, want {want:?}", c.name));
+                    }
+                }
+                Ok(r) => failures.push(format!(
+                    "[{}] concurrency: unmodified row {id} ({original:?}) did not commit: {:?}",
+                    c.name, r.outcomes
+                )),
+                Err(e) => failures.push(format!("[{}] concurrency: unmodified row {id} errored: {e}", c.name)),
+            }
+        }
+
+        // Modified behind its back: a comparable type must conflict.
+        if comparable {
+            concurrency_checks += 1;
+            if let Err(e) = exec(&d, &format!("update {SCHEMA}.{table} set v = null where id = 1")).await {
+                failures.push(format!("[{}] concurrency: could not modify the row: {e}", c.name));
+                continue;
+            }
+            match d.apply_edits(vec![edit(1, got.clone())], None).await {
+                Ok(r) => match (&r.tx.disposition, r.outcomes.last().map(|o| &o.body)) {
+                    (TxDisposition::RolledBack { .. }, Some(OutcomeBody::Error { error })) if error.kind == ErrorKind::Conflict => {}
+                    _ => failures.push(format!("[{}] concurrency: a modified row did not conflict: {:?}", c.name, r.outcomes)),
+                },
+                Err(e) => failures.push(format!("[{}] concurrency: modified row errored: {e}", c.name)),
+            }
+        }
+    }
+    checks += concurrency_checks;
+    if concurrency_checks == 0 {
+        failures.push("concurrency: no checks ran".into());
     }
 
     // Engine fact: text cannot hold NUL, and the server must say so rather

@@ -146,6 +146,10 @@ pub enum TxDisposition {
     RolledBack { rolled_back: Vec<u32> },
     /// Still open on a pinned session; durability is not yet decided.
     Open,
+    /// T-041: the script itself ended a transaction it did not begin, and the
+    /// driver could not determine whether that end was a commit. Stated, never
+    /// guessed: reporting it as committed would be R-041's false report.
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -171,6 +175,11 @@ pub struct ExecutionResult {
     /// T-050: the execution's result budget and how much of it was used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetReport>,
+    /// T-056 / D-027: for a structured browse of one relation, whether its rows
+    /// may be edited — and if not, why. `None` for raw scripts, whose results
+    /// are never editable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<crate::request::EditGate>,
 }
 
 /// T-050 / R-007, R-043: what one execution may retain for display — rows
@@ -316,6 +325,7 @@ impl ExecutionResult {
             tx: TxContext::autocommit(),
             page: None,
             budget: None,
+            edit: None,
         }
     }
 
@@ -386,6 +396,9 @@ impl ExecutionResult {
                     format!("{n} statement(s) reported success but were rolled back")
                 }
                 (TxDisposition::Committed, _) => format!("{n} statement(s) committed"),
+                (TxDisposition::Unknown, _) => format!(
+                    "{n} statement(s) succeeded; the transaction was ended, and whether it committed could not be determined"
+                ),
             };
             return base;
         }
@@ -426,6 +439,9 @@ impl ExecutionResult {
             }
             TxDisposition::Open => format!(
                 "statement {failed_txt} failed; transaction still open, nothing decided yet"
+            ),
+            TxDisposition::Unknown => format!(
+                "statement {failed_txt} failed; whether the transaction committed could not be determined"
             ),
         }
     }
@@ -525,6 +541,7 @@ mod tests {
             },
             page: None,
             budget: None,
+            edit: None,
         };
         let committed = ExecutionResult {
             outcomes,
@@ -534,6 +551,7 @@ mod tests {
             },
             page: None,
             budget: None,
+            edit: None,
         };
 
         assert_eq!(rolled.summary(), "statement 3 failed; statements 1-2 rolled back");
@@ -561,6 +579,7 @@ mod tests {
             tx: TxContext::autocommit(),
             page: None,
             budget: None,
+            edit: None,
         };
         assert!(r.summary().contains("cancelled"));
         assert!(!r.summary().contains("failed"), "summary: {}", r.summary());

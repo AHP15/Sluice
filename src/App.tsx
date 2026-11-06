@@ -4,10 +4,25 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Bug, Database, Play, Save, ShieldAlert, Square, Sun, Moon, Plug, Plus, X } from "lucide-react";
 import { Navigator } from "./components/Navigator";
 import { QueryEditor } from "./components/QueryEditor";
+import { EditPreview } from "./components/EditPreview";
+import { EditorSessionBar } from "./components/EditorSessionBar";
+import { editorSessionPolicy } from "./lib/sessionPolicy";
 import { ResultGrid } from "./components/ResultGrid";
+import {
+  EMPTY,
+  applyToRows,
+  buildEditRequests,
+  pendingCount,
+  stage,
+  unstage,
+  type Pending,
+} from "./lib/pendingEdits";
 import { Button } from "./components/ui/button";
 import type {
   ColumnDesc,
+  EditGate,
+  EditPlan,
+  EditRequest,
   Guardrails,
   LaunchOutcome,
   NavNode,
@@ -22,6 +37,15 @@ import {
   RowStream,
   cancelQuery,
   connect,
+  applyEdits,
+  previewEdits,
+  EDITOR_EVENT,
+  closeEditor,
+  editorTransaction,
+  openEditor,
+  runInEditor,
+  type EditorEvent,
+  type SessionStatus,
   connectLaunch,
   coreVersion,
   diagnosticsPreview,
@@ -40,6 +64,9 @@ interface RowsView {
   rows: WireValue[][];
   truncated: boolean;
   label: string;
+  /** T-056: set for a structured browse of one relation; raw results have none. */
+  relation?: NodeId;
+  edit?: EditGate;
 }
 
 /** What a tab was opened for. */
@@ -210,12 +237,93 @@ function Workspace({ seed }: { seed: TabSeed }) {
     },
     [],
   );
+  // T-041 / D-028: on an engine that can pin a connection, the editor gets
+  // one for this tab's lifetime. Decided from the declared affinity, never
+  // the engine name (D-003).
+  const [editor, setEditor] = useState<{ id: string; status: SessionStatus } | null>(null);
+  const [editorNotice, setEditorNotice] = useState<string | null>(null);
+  const editorRef = useRef<string | null>(null);
+  editorRef.current = editor?.id ?? null;
+  const pinsSocket = session ? editorSessionPolicy(session.capabilities).pin === "socket" : false;
+
+  const openEditorSession = useCallback(async () => {
+    if (!session) return;
+    try {
+      const opened = await openEditor(session.session_id);
+      setEditor({ id: opened.editor_id, status: opened.status });
+      setEditorNotice(null);
+    } catch (e) {
+      setEditorNotice(`Could not open an editor session: ${String((e as { message?: string })?.message ?? e)}`);
+    }
+  }, [session]);
+
+  useEffect(() => {
+    if (pinsSocket && !editorRef.current) void openEditorSession();
+  }, [pinsSocket, openEditorSession]);
+
+  // The tab closing rolls the editor back — never commits (the core does it).
+  useEffect(
+    () => () => {
+      if (editorRef.current) void closeEditor(editorRef.current).catch(() => {});
+    },
+    [],
+  );
+
+  // Core-initiated changes: an idle transaction was rolled back.
+  useEffect(() => {
+    const un = listen<EditorEvent>(EDITOR_EVENT, (ev) => {
+      if (ev.payload.editor_id !== editorRef.current) return;
+      setEditor((e) => (e ? { ...e, status: ev.payload.status } : e));
+      setEditorNotice(ev.payload.message);
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
+
+  const onEditorAction = useCallback(async (a: "begin" | "commit" | "rollback") => {
+    const id = editorRef.current;
+    if (!id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const status = await editorTransaction(id, a);
+      setEditor((e) => (e ? { ...e, status } : e));
+      setEditorNotice(a === "commit" ? "Committed." : a === "rollback" ? "Rolled back." : null);
+    } catch (e) {
+      setError(String((e as { message?: string })?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  /** Loss is explicit: the old session is closed and a new one opened. */
+  const onReconnect = useCallback(async () => {
+    const old = editorRef.current;
+    setEditor(null);
+    editorRef.current = null;
+    if (old) await closeEditor(old).catch(() => {});
+    await openEditorSession();
+    setEditorNotice("Reconnected with a new session: earlier temp tables, SET options and transactions are not carried over.");
+  }, [openEditorSession]);
+
   const [selected, setSelected] = useState<NodeId | null>(null);
   const [view, setView] = useState<RowsView | null>(null);
   const [outcomes, setOutcomes] = useState<Outcome[] | null>(null);
   const [summary, setSummary] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // T-056 / D-027: staged edits for the relation in view, until applied or
+  // discarded. Nothing replaces the view while any are pending, so they are
+  // never dropped silently.
+  const [pending, setPending] = useState<Pending>(EMPTY);
+  const [applying, setApplying] = useState(false);
+  const holdForPending = () => {
+    const n = pendingCount(pending);
+    if (n === 0) return false;
+    setError(`Apply or discard ${n} pending change${n === 1 ? "" : "s"} first.`);
+    return true;
+  };
 
   // T-049: the live browse stream, and how many of its batches have been
   // applied to state but not yet rendered. Credit goes back only after render.
@@ -235,6 +343,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
   const onSelectRelation = useCallback(
     (node: NavNode) => {
       if (!session) return;
+      if (holdForPending()) return;
       streamRef.current?.cancel();
       unretired.current = 0;
       setSelected(node.id);
@@ -252,7 +361,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
           if (streamRef.current !== stream) return; // superseded
           switch (e.kind) {
             case "columns":
-              setView({ columns: e.columns, rows: [], truncated: false, label });
+              setView({ columns: e.columns, rows: [], truncated: false, label, relation: node.id, edit: e.edit });
               break;
             case "rows":
               unretired.current += 1;
@@ -278,7 +387,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
       );
       streamRef.current = stream;
     },
-    [session],
+    [session, pending],
   );
 
   // T-051: the running script's id, so Stop can cancel it.
@@ -286,12 +395,35 @@ function Workspace({ seed }: { seed: TabSeed }) {
 
   const onRun = useCallback(async () => {
     if (!session) return;
+    if (holdForPending()) return;
     setBusy(true);
     setError(null);
     const queryId = crypto.randomUUID();
     runningQuery.current = queryId;
     try {
-      const run = await runScript(session.session_id, draftQuery, queryId);
+      let run;
+      if (pinsSocket) {
+        // T-041: a pinned editor never falls back to a pooled connection —
+        // that would run the user's statements outside their session.
+        const id = editorRef.current;
+        if (!id || editor?.status.lost) {
+          setError("The editor has no live session. Reconnect to continue.");
+          return;
+        }
+        try {
+          const r = await runInEditor(id, draftQuery, queryId);
+          setEditor((e) => (e ? { ...e, status: r.status } : e));
+          run = r.run;
+        } catch (e) {
+          const err = e as { kind?: string; message?: string };
+          if (err.kind === "connection_failed") {
+            setEditor((ed) => (ed ? { ...ed, status: { ...ed.status, lost: String(err.message ?? e) } } : ed));
+          }
+          throw e;
+        }
+      } else {
+        run = await runScript(session.session_id, draftQuery, queryId);
+      }
       setOutcomes(run.result.outcomes);
       setSummary(run.summary);
       const first = run.result.outcomes.find((o) => o.kind === "rows");
@@ -309,7 +441,69 @@ function Workspace({ seed }: { seed: TabSeed }) {
       runningQuery.current = null;
       setBusy(false);
     }
-  }, [session, draftQuery]);
+  }, [session, draftQuery, pending, pinsSocket, editor]);
+
+  // T-057 / R-003: Apply opens the core's preview of exactly what will run;
+  // only Confirm executes it, and only that previewed plan (by digest).
+  const [review, setReview] = useState<{ edits: EditRequest[]; plan: EditPlan; pending: Pending } | null>(null);
+
+  const onApply = useCallback(async () => {
+    if (!session || !view?.relation || !view.edit) return;
+    const built = buildEditRequests(pending, view.relation, view.columns, view.rows, view.edit);
+    if (!built.ok) {
+      setError(built.reason);
+      return;
+    }
+    setApplying(true);
+    setError(null);
+    try {
+      const plan = await previewEdits(session.session_id, built.edits);
+      setReview({ edits: built.edits, plan, pending });
+    } catch (e) {
+      setError(`${String((e as { message?: string })?.message ?? e)} — nothing was applied; your changes are still pending.`);
+    } finally {
+      setApplying(false);
+    }
+  }, [session, view, pending]);
+
+  const onConfirm = useCallback(async () => {
+    if (!session || !review) return;
+    const { edits, plan, pending: applied } = review;
+    setApplying(true);
+    setError(null);
+    try {
+      const run = await applyEdits(session.session_id, edits, plan.digest);
+      setReview(null);
+      if (run.result.tx.disposition.state === "committed") {
+        // There is no undo past this point (D-027): the staged values are
+        // now the rows, and the pending set is gone.
+        setView((v) => (v ? { ...v, rows: applyToRows(v.rows, applied) } : v));
+        setPending(EMPTY);
+        setSummary(`${edits.length} row${edits.length === 1 ? "" : "s"} updated`);
+      } else {
+        // Rolled back: nothing was written, so the changes stay staged.
+        const failed = run.result.outcomes.find((o) => o.kind === "error");
+        setError(
+          `${failed && failed.kind === "error" ? failed.error.message : run.summary} — nothing was applied; your changes are still pending.`,
+        );
+      }
+    } catch (e) {
+      setReview(null);
+      const err = e as { kind?: string; message?: string };
+      // A refusal (including a plan that changed since preview) comes back
+      // before the transaction opens. A timeout or a dropped connection does
+      // not say whether COMMIT reached the server, so claiming "nothing was
+      // applied" there could be false.
+      const unknown = err.kind === "timeout" || err.kind === "connection_failed" || err.kind === "driver_bug";
+      setError(
+        unknown
+          ? `${String(err.message ?? e)} — whether the changes were applied is unknown; reload the relation to check before applying again.`
+          : `${String(err.message ?? e)} — nothing was applied; your changes are still pending.`,
+      );
+    } finally {
+      setApplying(false);
+    }
+  }, [session, review]);
 
   const onStop = useCallback(() => {
     if (runningQuery.current) void cancelQuery(runningQuery.current);
@@ -397,6 +591,18 @@ function Workspace({ seed }: { seed: TabSeed }) {
           </aside>
 
           <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {editor && (
+              <EditorSessionBar
+                status={editor.status}
+                busy={busy}
+                notice={editorNotice}
+                onAction={onEditorAction}
+                onReconnect={onReconnect}
+              />
+            )}
+            {!editor && editorNotice && (
+              <div className="border-b px-3 py-1 text-xs text-destructive">{editorNotice}</div>
+            )}
             <section className="h-40 shrink-0 border-b">
               <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={onRun} />
             </section>
@@ -422,6 +628,24 @@ function Workspace({ seed }: { seed: TabSeed }) {
                   columns={view.columns}
                   rows={view.rows}
                   truncated={view.truncated}
+                  editing={
+                    view.edit
+                      ? {
+                          gate: view.edit,
+                          pending,
+                          // Staging is frozen while a preview is open, so what
+                          // runs is what was reviewed.
+                          applying: applying || review !== null,
+                          onStage: (r, c, v) => setPending((p) => stage(p, r, c, v, view.rows[r][c])),
+                          onUnstage: (r, c) => setPending((p) => unstage(p, r, c)),
+                          onApply,
+                          onDiscard: () => {
+                            setPending(EMPTY);
+                            setError(null);
+                          },
+                        }
+                      : undefined
+                  }
                 />
               ) : (
                 <div className="p-6 text-sm text-muted-foreground">
@@ -429,6 +653,15 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 </div>
               )}
             </section>
+
+            {review && (
+              <EditPreview
+                plan={review.plan}
+                applying={applying}
+                onConfirm={onConfirm}
+                onBack={() => setReview(null)}
+              />
+            )}
           </main>
         </div>
     </>
@@ -729,6 +962,20 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
       {field("port", "Port", "number")}
       {field("user", "User")}
       {field("dbname", "Database")}
+      <label className="block px-2 py-1 text-xs">
+        <span className="text-muted-foreground">Connection budget</span>
+        <input
+          type="text"
+          inputMode="numeric"
+          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          value={form.connection_budget == null ? "" : String(form.connection_budget)}
+          placeholder="5 — shared by browsing and editor tabs"
+          onChange={(e) => {
+            const t = e.target.value.trim();
+            setForm({ ...form, connection_budget: /^\d+$/.test(t) ? Number(t) : null });
+          }}
+        />
+      </label>
       <label className="block px-2 py-1 text-xs">
         <span className="text-muted-foreground">Password</span>
         <input

@@ -168,6 +168,15 @@ pub struct ColumnDesc {
     /// creeps in; the domain also carries what range validation needs.
     #[serde(default)]
     pub exact: Option<ExactDomain>,
+    /// T-058 / D-027: the driver vouches that this column's type has a usable
+    /// equality, so an edit to it can be checked against its value as read.
+    ///
+    /// False for types with no equality or an ill-defined one (`json`, `xml`,
+    /// floating point) and for any type the driver does not vouch for. An edit
+    /// to such a column is protected by the unique key only, and the UI says
+    /// so. Defaults to false: a guarantee is never assumed.
+    #[serde(default)]
+    pub concurrency_comparable: bool,
 }
 
 /// The value domain of an exact numeric column, for string-only validation in

@@ -301,16 +301,31 @@ fn placeholder(n: usize) -> String {
     format!("${n}")
 }
 
-/// A SQL cast target for a parameter.
+/// A SQL cast target for a parameter: the column's own type, as resolved
+/// from its OID by the prepared probe (T-059 / R-034).
 ///
-/// `Type::name()` gives Postgres' internal name, where array types are spelled
-/// `_int4`. That is not valid cast syntax, so it is rewritten to `int4[]`.
+/// - Built-ins (`pg_catalog`) use their bare name, which resolves to
+///   `pg_catalog` first under any search path that does not list it
+///   explicitly — except `"char"`, the one-byte internal type, which must be
+///   quoted: bare `char` means `bpchar(1)`, a different type that silently
+///   truncates.
+/// - Every other type (enums, domains, composites, extension types) is
+///   schema-qualified and quoted, so a type outside the session's search
+///   path, or one shadowed by a same-named type earlier in it, still casts
+///   to the column's own type rather than failing or resolving elsewhere.
+/// - Arrays cast to their element's target plus `[]`. `Type::name()` spells
+///   arrays `_int4`, which is not valid cast syntax.
 pub fn cast_target(ty: &Type) -> String {
-    let n = ty.name();
-    match n.strip_prefix('_') {
-        Some(base) => format!("{base}[]"),
-        None => n.to_string(),
+    if let tokio_postgres::types::Kind::Array(elem) = ty.kind() {
+        return format!("{}[]", cast_target(elem));
     }
+    if ty.schema() == "pg_catalog" {
+        if *ty == Type::CHAR {
+            return "\"char\"".into();
+        }
+        return ty.name().to_string();
+    }
+    format!("{}.{}", quote_ident(ty.schema()), quote_ident(ty.name()))
 }
 
 /// The SQL that turns text parameter `$n` into a value of the column's type.
@@ -321,11 +336,43 @@ pub fn cast_target(ty: &Type) -> String {
 /// silently wrong, and an edit would write the base64 text into the column.
 /// T-068's corpus found this through its write-back check.
 pub fn typed_param(n: usize, ty: &Type) -> String {
+    render_segs(&typed_param_segs(n, ty), |i| placeholder(i + 1))
+}
+
+/// A piece of a statement under construction: SQL text, or the slot of the
+/// parameter at a 0-based index (T-057).
+///
+/// Statements built from segments are rendered twice from the *same* pieces —
+/// once with `$n` placeholders to execute, once with literals to preview — so
+/// the two can differ only in what fills the slots, never in structure.
+/// Substituting into a rendered string instead would corrupt any identifier
+/// that happens to contain `$1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seg {
+    Sql(String),
+    Param(usize),
+}
+
+/// `typed_param` as segments; `n` is the 1-based parameter number.
+pub fn typed_param_segs(n: usize, ty: &Type) -> Vec<Seg> {
+    let i = n - 1;
     if *ty == Type::BYTEA {
-        format!("decode(({})::text, 'base64')", placeholder(n))
+        vec![Seg::Sql("decode((".into()), Seg::Param(i), Seg::Sql(")::text, 'base64')".into())]
     } else {
-        format!("({})::text::{}", placeholder(n), cast_target(ty))
+        vec![Seg::Sql("(".into()), Seg::Param(i), Seg::Sql(format!(")::text::{}", cast_target(ty)))]
     }
+}
+
+/// Join segments, filling each parameter slot with `fill(index)`.
+pub fn render_segs(segs: &[Seg], mut fill: impl FnMut(usize) -> String) -> String {
+    let mut out = String::new();
+    for s in segs {
+        match s {
+            Seg::Sql(t) => out.push_str(t),
+            Seg::Param(i) => out.push_str(&fill(*i)),
+        }
+    }
+    out
 }
 
 fn lookup<'a>(columns: &'a [(String, Type)], col: &str) -> Option<&'a Type> {
@@ -708,6 +755,9 @@ mod tests {
         assert_eq!(typed_param(1, &Type::BYTEA), "decode(($1)::text, 'base64')");
         assert_eq!(typed_param(2, &Type::NUMERIC), "($2)::text::numeric");
         assert_eq!(typed_param(3, &Type::INT4_ARRAY), "($3)::text::int4[]");
+        // T-059: the one-byte "char" is not bpchar.
+        assert_eq!(typed_param(4, &Type::CHAR), "($4)::text::\"char\"");
+        assert_eq!(typed_param(5, &Type::CHAR_ARRAY), "($5)::text::\"char\"[]");
     }
 
     #[test]

@@ -249,9 +249,10 @@ impl Driver for MongoDriver {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "mongodb".into(),
-            // Left to the caller to set from T-046's evidence rather than
-            // guessed here — see main.rs.
-            affinity: SessionAffinity::None,
+            // T-046 settled this on evidence (SESSION-VERDICT.md): a logical
+            // session carrying interactive transactions can be pinned. T-045
+            // replaced the pre-verdict `None` placeholder.
+            affinity: SessionAffinity::Session,
             reset: ResetSupport::NotApplicable,
             node_kinds: vec![
                 NodeKind {

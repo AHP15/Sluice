@@ -61,6 +61,12 @@ export interface ColumnDesc {
    * `ExactNumericEditor`, which never turns the value into a JS number.
    */
   exact: ExactDomain | null;
+  /**
+   * T-058 / D-027: the driver vouches this column can be checked against its
+   * value as read. When false, an edit to it is protected by the unique key
+   * only, and the grid says so before apply.
+   */
+  concurrency_comparable: boolean;
 }
 
 /**
@@ -144,6 +150,56 @@ export interface BrowseRequest {
   offset?: number | null;
 }
 
+/**
+ * T-056 / D-027: whether a browsed relation's rows may be edited. Decides what
+ * the grid *offers*; the core re-derives it on apply and is what *allows*.
+ */
+export type EditGate =
+  | { state: "editable"; key: string[] }
+  | { state: "read_only"; reason: string };
+
+export interface Original {
+  column: string;
+  value: WireValue;
+}
+
+/** T-056: one staged row edit, as the core receives it — never SQL (D-029). */
+export interface EditRequest {
+  relation: NodeId;
+  /** Unique-key columns and their values as read. */
+  key: Original[];
+  /** Columns being written, with their new values. */
+  set: Original[];
+  /** The written columns' values as read (T-058's concurrency predicate). */
+  originals: Original[];
+}
+
+/** T-057: one bound parameter of a planned statement, as sent. */
+export interface BoundParam {
+  placeholder: string;
+  type_name: string;
+  /** Exactly as bound; `null` is SQL NULL. */
+  value: string | null;
+}
+
+/**
+ * T-057 / R-003: one statement apply will run. `statement` + `params` is what
+ * executes; `inline` is a display rendering of that same artifact, `null`
+ * when a value cannot be shown inline faithfully.
+ */
+export interface PlannedStatement {
+  statement: string;
+  params: BoundParam[];
+  inline: string | null;
+  concurrency_omitted: string[];
+}
+
+/** T-057: what staged edits compile to. Apply must present `digest`. */
+export interface EditPlan {
+  statements: PlannedStatement[];
+  digest: string;
+}
+
 /** T-047: how a browse paged, declared by the driver. */
 export type PageInfo =
   | { strategy: "keyset"; key: string[]; next_cursor: WireValue[] | null }
@@ -200,12 +256,16 @@ export type Outcome = { attribution: Attribution } & OutcomeBody;
 export type TxDisposition =
   | { state: "committed" }
   | { state: "rolled_back"; rolled_back: number[] }
-  | { state: "open" };
+  | { state: "open" }
+  /** T-041: a script ended a transaction and whether it committed is unknown. */
+  | { state: "unknown" };
 
 export interface ExecutionResult {
   outcomes: Outcome[];
   /** T-047: present for structured browse. */
   page?: PageInfo;
+  /** T-056: present for structured browse of one relation. */
+  edit?: EditGate;
   /** T-050: the execution's result budget; `exhausted_at` indexes `outcomes`. */
   budget?: {
     max_rows: number;
@@ -231,6 +291,11 @@ export interface ProfileMeta {
   tls: "verify" | "accept_invalid_certs" | "disabled";
   /** T-051: statement timeout in seconds; absent = default, 0 = none. */
   statement_timeout_secs?: number | null;
+  /**
+   * T-042 / D-028: the profile's connection budget, pooled and pinned editor
+   * sessions together. Absent = the core's default (5).
+   */
+  connection_budget?: number | null;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */

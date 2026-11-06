@@ -7,6 +7,7 @@ mod commands;
 mod consent_dialog;
 mod credentials;
 mod diagnostics;
+mod editor;
 mod execution;
 mod guardrails;
 mod launcher;
@@ -30,9 +31,26 @@ pub fn run() {
         .manage(commands::AppState::default())
         .manage(launcher::Launcher::default())
         .manage(stream::Streams::default())
+        .manage(std::sync::Arc::new(editor::Editors::default()))
         .setup(|app| {
             launcher::on_first_launch(app.handle().clone());
+            // T-041: idle open transactions are rolled back by the core, even
+            // when the webview is not looking.
+            use tauri::Manager;
+            let editors = app.state::<std::sync::Arc<editor::Editors>>().inner().clone();
+            editor::spawn_reaper(app.handle().clone(), editors);
             Ok(())
+        })
+        // T-041 / D-028: closing the window rolls back every editor's open
+        // transaction — rollback, never commit — before the process can go.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                use tauri::Manager;
+                let editors = window.state::<std::sync::Arc<editor::Editors>>().inner().clone();
+                tauri::async_runtime::block_on(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), editors.close_all()).await;
+                });
+            }
         })
         .invoke_handler(build_handler())
         .run(tauri::generate_context!())
@@ -59,6 +77,12 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::grant_stream_credit,
         commands::cancel_stream,
         commands::run_script,
+        commands::open_editor,
+        commands::run_in_editor,
+        commands::editor_transaction,
+        commands::close_editor,
+        commands::preview_edits,
+        commands::apply_edits,
         commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file,
@@ -86,6 +110,12 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::grant_stream_credit,
         commands::cancel_stream,
         commands::run_script,
+        commands::open_editor,
+        commands::run_in_editor,
+        commands::editor_transaction,
+        commands::close_editor,
+        commands::preview_edits,
+        commands::apply_edits,
         commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file

@@ -5,10 +5,12 @@
 //! D-006's tagged encoding is built on.
 
 pub mod browse;
+pub mod edit;
 pub mod encode;
 pub mod error_map;
 pub mod lease;
 pub mod navigator;
+pub mod pinned;
 pub mod tls;
 pub mod version;
 
@@ -17,7 +19,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use sluice_core::{
-    Attribution, BrowseRequest, CancelSupport, Capabilities, Driver, DriverError, EditRequest,
+    Attribution, BrowseRequest, CancelSupport, Capabilities, Driver, DriverError, EditGate,
+    EditPlan, EditRequest,
     ErrorKind, ExecutionResult, FilterOpDecl, NavNode, NodeId, NodeKind, Outcome, OutcomeBody,
     RawPayloadKind, RawRequest, ResetSupport, ScriptDialect, Secret, SessionAffinity,
     TransactionSupport, TxContext, TxDisposition, TxMode, TypeClass, WireValue,
@@ -76,9 +79,18 @@ impl Default for ConnectSpec {
 /// One item of a streamed browse (T-049).
 #[derive(Debug, Clone)]
 pub enum BrowseBatch {
-    /// Always first: the page's column descriptors (D-006).
-    Columns(Vec<sluice_core::ColumnDesc>),
+    /// Always first: the page's column descriptors (D-006), and whether the
+    /// relation's rows may be edited (T-056).
+    Columns(Vec<sluice_core::ColumnDesc>, EditGate),
     Rows(Vec<Vec<WireValue>>),
+}
+
+/// What the catalog says about one relation (T-047, T-056).
+struct RelationShape {
+    columns: Vec<(String, tokio_postgres::types::Type)>,
+    keys: browse::KeyInfo,
+    gate: EditGate,
+    is_table: bool,
 }
 
 /// How a streamed browse ended.
@@ -92,6 +104,15 @@ pub struct BrowseStreamEnd {
     /// T-047: the strategy used and the next page's position (unstopped only).
     pub page: Option<sluice_core::PageInfo>,
 }
+
+/// D-028's per-profile connection budget, "~5, configurable" (T-042). One
+/// ceiling for pooled and pinned connections together.
+pub const DEFAULT_CONNECTION_BUDGET: usize = 5;
+
+/// How long a request waits for a connection inside the budget before it is
+/// refused (T-042). Long enough to queue behind a running query; short enough
+/// that an exhausted budget is reported rather than looking like a hang.
+pub const BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct PgDriver {
     pool: Pool,
@@ -123,9 +144,14 @@ pub struct PgDriver {
 
 impl PgDriver {
     pub async fn connect(spec: ConnectSpec) -> Result<Arc<Self>, DriverError> {
-        // D-028 keeps the budget deliberately small; T-042 owns the real
-        // per-profile budget. Four is enough to browse while a query runs.
-        Self::connect_with_pool_size(spec, 4).await
+        Self::connect_with_pool_size(spec, DEFAULT_CONNECTION_BUDGET).await
+    }
+
+    /// T-042 / D-028: the profile's connection budget — the pool's ceiling,
+    /// which pooled *and* pinned connections share, since a pinned editor
+    /// session is a lease held from this same pool.
+    pub fn connection_budget(&self) -> usize {
+        self.pool.status().max_size
     }
 
     /// As [`connect`](Self::connect), with an explicit pool ceiling. Tests use
@@ -173,8 +199,12 @@ impl PgDriver {
             Manager::from_config(cfg, connector, mgr_cfg)
         };
 
+        // T-042: a request that cannot get a connection within the budget
+        // fails with an explanation instead of waiting forever.
         let pool = Pool::builder(manager)
             .max_size(max_size.max(1))
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .wait_timeout(Some(BUDGET_WAIT))
             .build()
             .map_err(|e| DriverError::new(ErrorKind::ConnectionFailed, e.to_string()))?;
 
@@ -433,17 +463,18 @@ impl PgDriver {
         .await
     }
 
-    /// Prepare the relation's probe and compile the structured request.
+    /// The relation's real columns and types, its paging keys, and whether it
+    /// may be edited (T-047, T-056).
     ///
     /// Learning the real column types from the server is what makes R-014 a
     /// non-issue: types with no Rust mapping arrive as ordinary `Type` values
     /// and are rendered server-side.
-    async fn compile_browse(
+    async fn relation_shape(
         &self,
         client: &tokio_postgres::Client,
-        request: &BrowseRequest,
-    ) -> Result<browse::CompiledBrowse, DriverError> {
-        let rel = browse::qualified(&request.relation)?;
+        relation: &NodeId,
+    ) -> Result<RelationShape, DriverError> {
+        let rel = browse::qualified(relation)?;
         let probe = client
             .prepare(&format!("SELECT * FROM {rel} LIMIT 0"))
             .await
@@ -455,10 +486,11 @@ impl PgDriver {
             .collect();
         // `ctid` exists on physical tables only; T-018 uses it to build
         // re-fetch handles for oversized values.
-        let with_ctid = request.relation.kind == "table";
+        let is_table = relation.kind == "table";
         // T-047: what the catalog says about paging this relation. The
         // primary key in key order and the NOT NULL columns; a view has none.
-        let keys = if with_ctid {
+        // T-056: and every unique key, for the edit gate.
+        let (keys, candidates) = if is_table {
             const PK: &str = "
                 SELECT a.attname
                 FROM pg_index x
@@ -470,14 +502,62 @@ impl PgDriver {
                 WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped AND attnotnull";
             let pk = client.query(PK, &[&rel]).await.map_err(|e| error_map::map_error(&e, Some(PK)))?;
             let nn = client.query(NOT_NULL, &[&rel]).await.map_err(|e| error_map::map_error(&e, Some(NOT_NULL)))?;
-            browse::KeyInfo {
-                primary_key: pk.iter().map(|r| r.get(0)).collect(),
-                not_null: nn.iter().map(|r| r.get(0)).collect(),
-            }
+            let uk = client
+                .query(edit::UNIQUE_KEYS_SQL, &[&rel])
+                .await
+                .map_err(|e| error_map::map_error(&e, Some(edit::UNIQUE_KEYS_SQL)))?;
+            (
+                browse::KeyInfo {
+                    primary_key: pk.iter().map(|r| r.get(0)).collect(),
+                    not_null: nn.iter().map(|r| r.get(0)).collect(),
+                },
+                uk.iter()
+                    .map(|r| edit::KeyCandidate { primary: r.get(0), columns: r.get(1) })
+                    .collect::<Vec<_>>(),
+            )
         } else {
-            browse::KeyInfo::default()
+            (browse::KeyInfo::default(), Vec::new())
         };
-        browse::compile(&request.relation, &columns, request, self.ceiling, with_ctid, &keys)
+        let gate = edit::edit_gate(&relation.kind, &candidates, &keys.not_null);
+        Ok(RelationShape { columns, keys, gate, is_table })
+    }
+
+    /// Compile staged edits against the catalog as it stands now — the one
+    /// build both preview and apply use (T-056, T-057).
+    async fn compile_edits(
+        &self,
+        client: &tokio_postgres::Client,
+        edits: &[EditRequest],
+    ) -> Result<Vec<edit::CompiledEdit>, DriverError> {
+        let mut shapes: Vec<(NodeId, RelationShape)> = Vec::new();
+        let mut compiled = Vec::with_capacity(edits.len());
+        for (i, e) in edits.iter().enumerate() {
+            if !shapes.iter().any(|(r, _)| r == &e.relation) {
+                let shape = self.relation_shape(client, &e.relation).await?;
+                shapes.push((e.relation.clone(), shape));
+            }
+            let (_, shape) = shapes.iter().find(|(r, _)| r == &e.relation).expect("inserted above");
+            compiled.push(edit::compile_update(i, e, &shape.columns, &shape.gate)?);
+        }
+        Ok(compiled)
+    }
+
+    /// Prepare the relation's probe and compile the structured request.
+    async fn compile_browse(
+        &self,
+        client: &tokio_postgres::Client,
+        request: &BrowseRequest,
+    ) -> Result<(browse::CompiledBrowse, EditGate), DriverError> {
+        let shape = self.relation_shape(client, &request.relation).await?;
+        let compiled = browse::compile(
+            &request.relation,
+            &shape.columns,
+            request,
+            self.ceiling,
+            shape.is_table,
+            &shape.keys,
+        )?;
+        Ok((compiled, shape.gate))
     }
 
     fn decode_row(
@@ -527,8 +607,8 @@ impl PgDriver {
 
         let batch_rows = batch_rows.max(1);
         self.with_lease(false, async |client: &tokio_postgres::Client| {
-            let compiled = self.compile_browse(client, &request).await?;
-            if !emit(BrowseBatch::Columns(compiled.column_descs())).await {
+            let (compiled, gate) = self.compile_browse(client, &request).await?;
+            if !emit(BrowseBatch::Columns(compiled.column_descs(), gate)).await {
                 return Ok(BrowseStreamEnd { rows: 0, truncated: false, stopped: true, page: None });
             }
 
@@ -701,6 +781,39 @@ impl PgDriver {
         }
     }
 
+    /// T-041 / D-028: pin a connection for an editor tab's lifetime. Only
+    /// meaningful because this driver declares `affinity: connection`.
+    pub async fn open_pinned(&self) -> Result<pinned::PinnedSession, DriverError> {
+        let lease = Lease::acquire(&self.pool, self.reset, self.stats.clone())
+            .await
+            .map_err(|e| self.redactor.error(e))?;
+        Ok(pinned::PinnedSession::new(lease))
+    }
+
+    /// T-041: run a raw script on a pinned session, with the same redaction
+    /// and catalog invalidation as the pooled raw path. On a per-call copy
+    /// made with `with_cancel` (T-051), the slot is armed with the pinned
+    /// connection's token for the run, so Stop cancels it on the server.
+    pub async fn run_pinned(
+        &self,
+        session: &mut pinned::PinnedSession,
+        script: &str,
+    ) -> Result<ExecutionResult, DriverError> {
+        if let (Some(slot), Some(token)) = (&self.cancel, session.cancel_token()) {
+            if !slot.arm(token) {
+                return Err(DriverError::new(ErrorKind::Cancelled, "cancelled before it started"));
+            }
+        }
+        let r = session.run(script, self.budget).await.map_err(|e| self.redactor.error(e));
+        if let Some(slot) = &self.cancel {
+            slot.disarm();
+        }
+        if navigator::script_may_change_catalog(script) {
+            self.refresh_catalog();
+        }
+        Ok(self.redact_outcomes(r?))
+    }
+
     /// T-053 / D-016: drop the navigator cache. External DDL is undetectable
     /// without polling, so refresh is the contract, not a fallback.
     pub fn refresh_catalog(&self) {
@@ -771,7 +884,7 @@ impl Driver for PgDriver {
 
     async fn browse(&self, request: BrowseRequest) -> Result<ExecutionResult, DriverError> {
         self.with_lease(false, async |client: &tokio_postgres::Client| {
-            let compiled = self.compile_browse(client, &request).await?;
+            let (compiled, gate) = self.compile_browse(client, &request).await?;
             let params: Vec<&(dyn ToSql + Sync)> =
                 compiled.params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
@@ -796,19 +909,135 @@ impl Driver for PgDriver {
             // D-029: structured browse always yields exactly one `rows` outcome.
             let mut result = ExecutionResult::single_rows(compiled.column_descs(), out_rows, truncated);
             result.page = Some(page);
+            result.edit = Some(gate);
             Ok(result)
         })
         .await
     }
 
-    async fn apply_edits(&self, _edits: Vec<EditRequest>) -> Result<ExecutionResult, DriverError> {
-        // T-056 owns staged edits (Phase 6). Refusing explicitly beats a
-        // half-implementation that writes without the unique-key gate D-027
-        // requires.
-        Err(DriverError::new(
-            ErrorKind::Unknown,
-            "editing is not implemented yet (T-056)",
-        ))
+    /// D-027 / T-056: every staged edit in ONE transaction, or none of them.
+    ///
+    /// Each edit is compiled against the catalog as it stands now — the gate
+    /// the webview saw is not trusted — before `BEGIN`, so a refused edit never
+    /// opens a transaction. Inside it, each `UPDATE` must affect exactly one
+    /// row; anything else (zero: the row is gone or its key changed) rolls the
+    /// whole batch back and is reported as a conflict at that edit's ordinal.
+    async fn preview_edits(&self, edits: Vec<EditRequest>) -> Result<EditPlan, DriverError> {
+        // Structured catalog reads only: the connection stays clean.
+        self.with_lease(false, async |client: &tokio_postgres::Client| {
+            let compiled = self.compile_edits(client, &edits).await?;
+            Ok(EditPlan::new(compiled.iter().map(edit::CompiledEdit::planned).collect()))
+        })
+        .await
+    }
+
+    async fn apply_edits(
+        &self,
+        edits: Vec<EditRequest>,
+        expected_digest: Option<String>,
+    ) -> Result<ExecutionResult, DriverError> {
+        if edits.is_empty() {
+            return Ok(ExecutionResult {
+                outcomes: vec![],
+                tx: TxContext { mode: TxMode::ImplicitSingle, disposition: TxDisposition::Committed },
+                page: None,
+                budget: None,
+                edit: None,
+            });
+        }
+        // Dirty: a dropped connection mid-transaction must not be returned to
+        // the pool as though clean; the reset path rolls it back.
+        let result = self
+            .with_lease(true, async |client: &tokio_postgres::Client| {
+                let compiled = self.compile_edits(client, &edits).await?;
+                // T-057 / R-003: run only what was previewed. The plan is
+                // rebuilt by the same code as the preview; a different
+                // digest means the statements would differ from what the
+                // user was shown, so nothing runs.
+                if let Some(expected) = &expected_digest {
+                    let plan = EditPlan::new(compiled.iter().map(edit::CompiledEdit::planned).collect());
+                    if &plan.digest != expected {
+                        return Err(DriverError::new(
+                            ErrorKind::Conflict,
+                            "the statements these edits compile to have changed since they were previewed; review the preview again",
+                        ));
+                    }
+                }
+
+                client.batch_execute("BEGIN").await.map_err(|e| error_map::map_error(&e, Some("BEGIN")))?;
+                let mut outcomes = Vec::with_capacity(compiled.len());
+                for (i, c) in compiled.iter().enumerate() {
+                    let params: Vec<&(dyn ToSql + Sync)> =
+                        c.params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                    let failure = match client.execute(&c.sql, &params).await {
+                        Ok(1) => None,
+                        Ok(0) => {
+                            // T-058: tell "gone" from "changed since read".
+                            let pp: Vec<&(dyn ToSql + Sync)> =
+                                c.probe_params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                            let exists = client.query_opt(&c.probe_sql, &pp).await.ok().flatten().is_some();
+                            Some(c.conflict(i, exists))
+                        }
+                        Ok(n) => Some(DriverError::new(
+                            ErrorKind::Conflict,
+                            format!("edit {}: matched {n} rows instead of one; no edits were applied", i + 1),
+                        )),
+                        Err(e) => Some(error_map::map_error(&e, Some(&c.sql))),
+                    };
+                    let ordinal = i as u32;
+                    if let Some(error) = failure {
+                        let _ = client.batch_execute("ROLLBACK").await;
+                        outcomes.push(Outcome {
+                            attribution: Attribution::Ordinal { ordinal },
+                            body: OutcomeBody::Error { error },
+                        });
+                        return Ok(ExecutionResult {
+                            outcomes,
+                            tx: TxContext {
+                                mode: TxMode::ImplicitSingle,
+                                disposition: TxDisposition::RolledBack { rolled_back: (0..ordinal).collect() },
+                            },
+                            page: None,
+                            budget: None,
+                            edit: None,
+                        });
+                    }
+                    outcomes.push(Outcome {
+                        attribution: Attribution::Ordinal { ordinal },
+                        body: OutcomeBody::Affected {
+                            count: 1,
+                            statement_kind: Some("UPDATE".into()),
+                            concurrency_omitted: c.concurrency_omitted.clone(),
+                            document_errors: vec![],
+                        },
+                    });
+                }
+                if let Err(e) = client.batch_execute("COMMIT").await {
+                    let n = outcomes.len() as u32;
+                    return Ok(ExecutionResult {
+                        outcomes: vec![Outcome {
+                            attribution: Attribution::Ordinal { ordinal: n.saturating_sub(1) },
+                            body: OutcomeBody::Error { error: error_map::map_error(&e, Some("COMMIT")) },
+                        }],
+                        tx: TxContext {
+                            mode: TxMode::ImplicitSingle,
+                            disposition: TxDisposition::RolledBack { rolled_back: (0..n).collect() },
+                        },
+                        page: None,
+                        budget: None,
+                        edit: None,
+                    });
+                }
+                Ok(ExecutionResult {
+                    outcomes,
+                    tx: TxContext { mode: TxMode::ImplicitSingle, disposition: TxDisposition::Committed },
+                    page: None,
+                    budget: None,
+                    edit: None,
+                })
+            })
+            .await?;
+        Ok(self.redact_outcomes(result))
     }
 
     async fn raw(&self, request: RawRequest) -> Result<ExecutionResult, DriverError> {
@@ -823,108 +1052,9 @@ impl Driver for PgDriver {
         };
         let script_for_cache = script.clone();
 
-        let result = self.with_lease(true, async |client: &tokio_postgres::Client| {
-    
-            // R-040: the user's text goes to the engine VERBATIM as one batch. No
-            // client-side rewriting, so a splitter bug cannot manufacture a syntax
-            // error the user did not write.
-            // T-050: streamed, metered against the per-execution budget —
-            // rows past it are dropped on arrival, never materialized.
-            let result = collect_budgeted(client, &script, self.budget).await;
-    
-            let split = sluice_core::script::split(&script, ScriptDialect::Postgres);
-    
-            match result {
-                Ok((bodies, report)) => {
-                    let attributions = sluice_core::script::attribute(&split, bodies.len());
-                    let outcomes: Vec<Outcome> = bodies
-                        .into_iter()
-                        .zip(attributions)
-                        .map(|(body, attribution)| Outcome { attribution, body })
-                        .collect();
-    
-                    // T-012 / R-041: state what actually survived. Postgres wraps a
-                    // multi-statement simple query in one implicit transaction; a
-                    // single statement is its own autocommit unit.
-                    let mode = if outcomes.len() > 1 {
-                        TxMode::ImplicitSingle
-                    } else {
-                        TxMode::AutocommitPerStatement
-                    };
-                    Ok(ExecutionResult {
-                        outcomes,
-                        tx: TxContext { mode, disposition: TxDisposition::Committed },
-                        page: None,
-                        budget: Some(report),
-                    })
-                }
-                Err(e) => {
-                    // The batch failed. Postgres wrapped it in one implicit
-                    // transaction, so every earlier statement was rolled back —
-                    // reporting them as successes is exactly R-041's false
-                    // partial-success, and the reason nothing is fabricated here.
-                    //
-                    // tokio-postgres surfaces a failed simple query as a single
-                    // Err with no partial messages, so the successful statements'
-                    // outcomes are genuinely unavailable. What IS recoverable is
-                    // *which* statement failed: the error carries a position, and
-                    // T-011 already computed the spans, so intersecting the two
-                    // identifies the failing ordinal instead of blaming statement 1.
-                    let err = error_map::map_error(&e, Some(&script));
-                    let statement_count = split.statements.len().max(1);
-    
-                    let failing = err
-                        .hints
-                        .position
-                        .filter(|_| split.confident)
-                        .and_then(|p| {
-                            split.statements.iter().position(|s| {
-                                p.utf16_offset >= s.start_utf16 && p.utf16_offset <= s.end_utf16
-                            })
-                        });
-    
-                    let ordinal = failing.unwrap_or(0) as u32;
-                    let attribution = match failing {
-                        Some(i) => Attribution::Span {
-                            ordinal,
-                            start_utf16: split.statements[i].start_utf16,
-                            end_utf16: split.statements[i].end_utf16,
-                        },
-                        None => Attribution::Ordinal { ordinal },
-                    };
-    
-                    let outcomes = vec![Outcome {
-                        attribution,
-                        body: OutcomeBody::Error { error: err },
-                    }];
-    
-                    // Everything before the failing statement ran and was undone.
-                    // When the failing statement is unknown, the honest answer is
-                    // that the whole batch was undone.
-                    let undone_count = failing.unwrap_or(statement_count) as u32;
-                    let rolled_back: Vec<u32> = (0..undone_count).collect();
-    
-                    let multi = statement_count > 1;
-                    Ok(ExecutionResult {
-                        outcomes,
-                        tx: TxContext {
-                            mode: if multi {
-                                TxMode::ImplicitSingle
-                            } else {
-                                TxMode::AutocommitPerStatement
-                            },
-                            disposition: if multi && !rolled_back.is_empty() {
-                                TxDisposition::RolledBack { rolled_back }
-                            } else {
-                                TxDisposition::Committed
-                            },
-                        },
-                        page: None,
-                        budget: None,
-                    })
-                }
-            }
-        })
+        let budget = self.budget;
+        let result = self
+            .with_lease(true, async |client: &tokio_postgres::Client| run_script(client, &script, budget).await)
         .await?;
         // T-024: a failing statement arrives as an `Error` *outcome* inside an
         // `Ok` result, so `with_lease`'s error redaction never sees it — and the
@@ -936,6 +1066,118 @@ impl Driver for PgDriver {
             self.refresh_catalog();
         }
         Ok(self.redact_outcomes(result))
+    }
+}
+
+/// Run a raw script verbatim on `client` and build its outcome sequence
+/// (R-040, T-012, T-050). Shared by the pooled raw path and pinned editor
+/// sessions (T-041), which then correct `tx` for an explicit transaction.
+pub(crate) async fn run_script(
+    client: &tokio_postgres::Client,
+    script: &str,
+    budget: sluice_core::ExecBudget,
+) -> Result<ExecutionResult, DriverError> {
+
+    // R-040: the user's text goes to the engine VERBATIM as one batch. No
+    // client-side rewriting, so a splitter bug cannot manufacture a syntax
+    // error the user did not write.
+    // T-050: streamed, metered against the per-execution budget —
+    // rows past it are dropped on arrival, never materialized.
+    let result = collect_budgeted(client, script, budget).await;
+
+    let split = sluice_core::script::split(script, ScriptDialect::Postgres);
+
+    match result {
+        Ok((bodies, report)) => {
+            let attributions = sluice_core::script::attribute(&split, bodies.len());
+            let outcomes: Vec<Outcome> = bodies
+                .into_iter()
+                .zip(attributions)
+                .map(|(body, attribution)| Outcome { attribution, body })
+                .collect();
+
+            // T-012 / R-041: state what actually survived. Postgres wraps a
+            // multi-statement simple query in one implicit transaction; a
+            // single statement is its own autocommit unit.
+            let mode = if outcomes.len() > 1 {
+                TxMode::ImplicitSingle
+            } else {
+                TxMode::AutocommitPerStatement
+            };
+            Ok(ExecutionResult {
+                outcomes,
+                tx: TxContext { mode, disposition: TxDisposition::Committed },
+                page: None,
+                budget: Some(report),
+                edit: None,
+            })
+        }
+        Err(e) => {
+            // The batch failed. Postgres wrapped it in one implicit
+            // transaction, so every earlier statement was rolled back —
+            // reporting them as successes is exactly R-041's false
+            // partial-success, and the reason nothing is fabricated here.
+            //
+            // tokio-postgres surfaces a failed simple query as a single
+            // Err with no partial messages, so the successful statements'
+            // outcomes are genuinely unavailable. What IS recoverable is
+            // *which* statement failed: the error carries a position, and
+            // T-011 already computed the spans, so intersecting the two
+            // identifies the failing ordinal instead of blaming statement 1.
+            let err = error_map::map_error(&e, Some(script));
+            let statement_count = split.statements.len().max(1);
+
+            let failing = err
+                .hints
+                .position
+                .filter(|_| split.confident)
+                .and_then(|p| {
+                    split.statements.iter().position(|s| {
+                        p.utf16_offset >= s.start_utf16 && p.utf16_offset <= s.end_utf16
+                    })
+                });
+
+            let ordinal = failing.unwrap_or(0) as u32;
+            let attribution = match failing {
+                Some(i) => Attribution::Span {
+                    ordinal,
+                    start_utf16: split.statements[i].start_utf16,
+                    end_utf16: split.statements[i].end_utf16,
+                },
+                None => Attribution::Ordinal { ordinal },
+            };
+
+            let outcomes = vec![Outcome {
+                attribution,
+                body: OutcomeBody::Error { error: err },
+            }];
+
+            // Everything before the failing statement ran and was undone.
+            // When the failing statement is unknown, the honest answer is
+            // that the whole batch was undone.
+            let undone_count = failing.unwrap_or(statement_count) as u32;
+            let rolled_back: Vec<u32> = (0..undone_count).collect();
+
+            let multi = statement_count > 1;
+            Ok(ExecutionResult {
+                outcomes,
+                tx: TxContext {
+                    mode: if multi {
+                        TxMode::ImplicitSingle
+                    } else {
+                        TxMode::AutocommitPerStatement
+                    },
+                    disposition: if multi && !rolled_back.is_empty() {
+                        TxDisposition::RolledBack { rolled_back }
+                    } else {
+                        TxDisposition::Committed
+                    },
+                },
+                page: None,
+                budget: None,
+                edit: None,
+            })
+        }
     }
 }
 
@@ -1017,6 +1259,8 @@ fn script_column(c: &tokio_postgres::SimpleColumn) -> sluice_core::ColumnDesc {
         mixed: false,
         derived: true,
         exact: None,
+        // Raw results are never editable.
+        concurrency_comparable: false,
     }
 }
 

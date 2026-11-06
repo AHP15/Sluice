@@ -11,6 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { ResultGrid } from "../../src/components/ResultGrid";
 import type { ColumnDesc, WireValue } from "../../src/lib/contract";
+import { EMPTY, stage, type Pending } from "../../src/lib/pendingEdits";
 
 const col = (name: string, type_name: string, extra: Partial<ColumnDesc> = {}): ColumnDesc => ({
   name,
@@ -20,6 +21,7 @@ const col = (name: string, type_name: string, extra: Partial<ColumnDesc> = {}): 
   mixed: false,
   derived: false,
   exact: null,
+  concurrency_comparable: true,
   ...extra,
 });
 
@@ -59,4 +61,61 @@ describe("ResultGrid on TanStack Table", () => {
   test("the footer counts the rows handed to the model", () => {
     expect(html).toContain("1 rows");
   });
+});
+
+describe("T-056: staged editing in the footer", () => {
+  const editing = (gate: import("../../src/lib/contract").EditGate, pending: Pending) => ({
+    gate,
+    pending,
+    applying: false,
+    onStage: () => {},
+    onUnstage: () => {},
+    onApply: () => {},
+    onDiscard: () => {},
+  });
+  const render = (e: ReturnType<typeof editing>) =>
+    renderToStaticMarkup(<ResultGrid sessionId="s" columns={columns} rows={rows} truncated={false} editing={e} />);
+
+  test("a read-only relation says why", () => {
+    const out = render(editing({ state: "read_only", reason: "This table has no primary key" }, EMPTY));
+    expect(out).toContain("read-only: This table has no primary key");
+    expect(out).not.toContain("Review &amp; apply");
+  });
+
+  test("pending changes offer apply and discard, and no post-apply undo", () => {
+    const p = stage(EMPTY, 0, 1, { t: "text", v: "y" }, rows[0][1]);
+    const out = render(editing({ state: "editable", key: ["id"] }, p));
+    expect(out).toContain("1 pending change");
+    expect(out).toContain("Review &amp; apply");
+    expect(out).toContain("Discard");
+    expect(out).toContain("no undo after");
+    expect(out).not.toMatch(/>Undo</);
+  });
+
+  test("nothing staged shows no apply bar", () => {
+    expect(render(editing({ state: "editable", key: ["id"] }, EMPTY))).not.toContain("Review &amp; apply");
+  });
+});
+
+test("T-058: the footer names staged columns protected by unique key only", () => {
+  const cols = [col("id", "int8"), col("doc", "json", { type_class: "structural", concurrency_comparable: false })];
+  const r: WireValue[][] = [[{ t: "numeric", v: "1" }, { t: "text", v: "{}" }]];
+  const out = renderToStaticMarkup(
+    <ResultGrid
+      sessionId="s"
+      columns={cols}
+      rows={r}
+      truncated={false}
+      editing={{
+        gate: { state: "editable", key: ["id"] },
+        pending: stage(EMPTY, 0, 1, { t: "text", v: "[]" }, r[0][1]),
+        applying: false,
+        onStage: () => {},
+        onUnstage: () => {},
+        onApply: () => {},
+        onDiscard: () => {},
+      }}
+    />,
+  );
+  expect(out).toContain("protected by unique key only): doc");
 });

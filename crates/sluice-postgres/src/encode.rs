@@ -172,7 +172,41 @@ pub fn column_desc(name: &str, ty: &Type) -> ColumnDesc {
         mixed: false,
         derived: false,
         exact: exact_domain_for(ty),
+        concurrency_comparable: concurrency_comparable(ty),
     }
+}
+
+/// T-058 / D-027: types this driver vouches have a usable equality *and*
+/// round-trip exactly through the text form browse ships them in, so a value
+/// as read compares equal to the stored value when nothing changed.
+///
+/// An allowlist, never a denylist: `json` and `xml` have no equality operator,
+/// floats have no exact text round-trip worth trusting, and anything not named
+/// here (domains, enums, ranges, geometric and exotic types) is excluded until
+/// T-060 probes the catalog for it.
+pub fn concurrency_comparable(ty: &Type) -> bool {
+    matches!(
+        *ty,
+        Type::BOOL
+            | Type::INT2
+            | Type::INT4
+            | Type::INT8
+            | Type::NUMERIC
+            | Type::MONEY
+            | Type::TEXT
+            | Type::VARCHAR
+            | Type::BPCHAR
+            | Type::CHAR
+            | Type::NAME
+            | Type::UUID
+            | Type::DATE
+            | Type::TIME
+            | Type::TIMETZ
+            | Type::TIMESTAMP
+            | Type::TIMESTAMPTZ
+            | Type::INTERVAL
+            | Type::BYTEA
+    )
 }
 
 /// T-019 / R-005: the edit-path marker for exact numerics.

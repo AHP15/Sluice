@@ -3,6 +3,9 @@ import { QueryClient } from "@tanstack/react-query";
 import type {
   BrowseRequest,
   ColumnDesc,
+  EditGate,
+  EditPlan,
+  EditRequest,
   ExecutionResult,
   LaunchOutcome,
   NavNode,
@@ -103,6 +106,79 @@ export function runScript(sessionId: string, script: string, queryId?: string): 
 }
 
 /**
+ * T-057 / R-003: the exact statements staged edits compile to, built by the
+ * same core code path that runs them.
+ */
+export function previewEdits(sessionId: string, edits: EditRequest[]): Promise<EditPlan> {
+  return invoke<EditPlan>("preview_edits", { sessionId, edits });
+}
+
+/**
+ * T-056 / D-027: apply staged edits, all in one transaction or none. The
+ * result's `tx.disposition` says which; there is no undo after it commits.
+ *
+ * T-057: only a previewed plan can be applied — `digest` is that plan's, and
+ * the core refuses if the edits no longer compile to exactly it.
+ */
+export function applyEdits(sessionId: string, edits: EditRequest[], digest: string): Promise<ScriptRun> {
+  return invoke<ScriptRun>("apply_edits", { sessionId, edits, expectedDigest: digest, queryId: null });
+}
+
+/** T-041: the editor's pinned session, as the core reports it. */
+export interface SessionStatus {
+  tx: { state: "idle" } | { state: "open" } | { state: "failed" };
+  tx_idle_secs: number | null;
+  idle_timeout_secs: number;
+  /** The connection is gone; set means nothing more runs until reconnect. */
+  lost: string | null;
+  /**
+   * T-043: session state the server says this session holds (SET, temp
+   * tables, prepared statements, cursors, locks, LISTEN, a transaction).
+   */
+  holds: string[];
+}
+
+export interface EditorOpened {
+  editor_id: string;
+  status: SessionStatus;
+}
+
+export interface EditorRun {
+  run: ScriptRun;
+  status: SessionStatus;
+}
+
+/** T-041 / T-042: core-initiated session changes (idle rollback, release). */
+export interface EditorEvent {
+  editor_id: string;
+  /** `released`: the session was released to fit the profile's budget (T-042). */
+  kind: "idle_rollback" | "released";
+  message: string;
+  status: SessionStatus;
+}
+
+export const EDITOR_EVENT = "editor-session";
+
+/** T-041 / D-028: pin a connection for this editor tab's lifetime. */
+export function openEditor(sessionId: string): Promise<EditorOpened> {
+  return invoke<EditorOpened>("open_editor", { sessionId });
+}
+
+export function runInEditor(editorId: string, script: string, queryId?: string): Promise<EditorRun> {
+  return invoke<EditorRun>("run_in_editor", { editorId, script, queryId: queryId ?? null });
+}
+
+/** T-041: the opt-in transaction controls. */
+export function editorTransaction(editorId: string, action: "begin" | "commit" | "rollback"): Promise<SessionStatus> {
+  return invoke<SessionStatus>("editor_transaction", { editorId, action });
+}
+
+/** T-041: the tab is closing; the core rolls back — never commits. */
+export function closeEditor(editorId: string): Promise<void> {
+  return invoke("close_editor", { editorId });
+}
+
+/**
  * T-051: cancel a running query by the id it was started with. The server
  * stops it; if it does not stop in time, its connection is dropped.
  */
@@ -135,7 +211,7 @@ export function saveValueToFile(
 
 /** T-049: what a browse stream delivers, in order. */
 export type StreamEvent =
-  | { kind: "columns"; columns: ColumnDesc[] }
+  | { kind: "columns"; columns: ColumnDesc[]; edit: EditGate }
   | { kind: "rows"; seq: number; rows: WireValue[][] }
   | { kind: "done"; rows: number; truncated: boolean; page: import("./contract").PageInfo | null }
   | { kind: "cancelled" }
