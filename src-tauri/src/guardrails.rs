@@ -20,7 +20,7 @@
 
 use std::net::IpAddr;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How a session's connection details were obtained.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub enum Provenance {
     CommandLine,
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryPolicy {
     On,
@@ -100,6 +100,15 @@ impl Guardrails {
     /// After "save as profile": normal profile handling, per D-014 — history on
     /// unless the profile is production-flagged. The production flag itself is
     /// kept: saving is not a reason to trust a host more.
+    /// T-035: a profile's explicit history choice beats the derived default
+    /// (off for a production-flagged profile, on otherwise).
+    pub fn with_history(mut self, choice: Option<HistoryPolicy>) -> Self {
+        if let Some(h) = choice {
+            self.history = h;
+        }
+        self
+    }
+
     pub fn saved(mut self) -> Self {
         self.saved = true;
         self.history = if self.production.armed { HistoryPolicy::Off } else { HistoryPolicy::On };
@@ -193,5 +202,18 @@ mod tests {
         let prod = Guardrails::ephemeral(Provenance::Discovered, "db.prod", "shop").saved();
         assert!(prod.production.armed, "saving must not disarm the guard");
         assert_eq!(prod.history, HistoryPolicy::Off);
+    }
+
+    /// T-035: history defaults off for production and on otherwise, and an
+    /// explicit per-profile choice wins either way.
+    #[test]
+    fn history_defaults_follow_production_and_a_profile_choice_overrides() {
+        assert_eq!(Guardrails::manual("db.prod.internal", "shop").history, HistoryPolicy::Off);
+        assert_eq!(Guardrails::manual("localhost", "app_dev").history, HistoryPolicy::On);
+        let opted_out = Guardrails::manual("localhost", "app_dev").with_history(Some(HistoryPolicy::Off));
+        assert_eq!(opted_out.history, HistoryPolicy::Off);
+        let opted_in = Guardrails::manual("db.prod.internal", "shop").with_history(Some(HistoryPolicy::On));
+        assert_eq!(opted_in.history, HistoryPolicy::On);
+        assert_eq!(Guardrails::manual("db.prod.internal", "shop").with_history(None).history, HistoryPolicy::Off);
     }
 }

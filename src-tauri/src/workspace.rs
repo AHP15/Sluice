@@ -30,6 +30,7 @@ use sluice_state::config::{self, DocumentSpec, Migration};
 use sluice_state::profile::{CredentialProvider, Transport};
 
 use crate::commands::ProfileMeta;
+use crate::guardrails::HistoryPolicy;
 use crate::state::{state_error, Stores};
 
 pub const FILE_NAME: &str = "profiles.toml";
@@ -103,6 +104,10 @@ pub struct ProfileEntry {
     /// (`keychain`).
     #[serde(default, skip_serializing_if = "CredentialProvider::is_keychain")]
     pub auth: CredentialProvider,
+    /// T-035: `"on"` / `"off"`; omitted means the default — off for a
+    /// production-flagged profile, on otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryPolicy>,
 }
 
 /// One `[[query]]` table.
@@ -141,6 +146,7 @@ impl ProfileEntry {
             connection_budget: m.connection_budget,
             transport: m.transport.clone(),
             auth: m.auth.clone(),
+            history: m.history,
         }
     }
 
@@ -157,6 +163,7 @@ impl ProfileEntry {
             connection_budget: self.connection_budget,
             transport: self.transport.clone(),
             auth: self.auth.clone(),
+            history: self.history,
         }
     }
 }
@@ -298,6 +305,9 @@ pub async fn delete_profile(
             Ok(ws.clone())
         })?;
         app.forget_credential(&profile_id);
+        // …nor its history, which would otherwise sit under an id nothing
+        // refers to any more.
+        stores.purge_profile_history(&profile_id);
         Ok(view(&stores, ws))
     })
     .await
@@ -336,6 +346,7 @@ pub fn decompose_url(url: &sluice_core::Secret<String>, id: &str, label: &str) -
         connection_budget: None,
         transport: Transport::default(),
         auth: CredentialProvider::default(),
+        history: None,
     };
     Ok(ImportedUrl { entry, password: parsed.password })
 }
@@ -431,6 +442,7 @@ mod tests {
             connection_budget: Some(4),
             transport: Transport::default(),
             auth: CredentialProvider::default(),
+            history: None,
         }
     }
 

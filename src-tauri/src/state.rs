@@ -5,7 +5,10 @@
 //! resolvable home directory means nothing persists this run, said plainly,
 //! rather than the app refusing to open.
 
-use sluice_core::{guard_driver_call, DriverError, ErrorKind, SessionId};
+use std::sync::Mutex;
+
+use sluice_core::{guard_driver_call, DriverError, ErrorKind, SessionId, StoredStatement};
+use sluice_state::history::{History, HistoryEntry, NewEntry};
 use sluice_state::AppDirs;
 
 /// UI state is opaque to the core — the webview owns its shape — but it is
@@ -14,18 +17,61 @@ pub const MAX_UI_STATE_BYTES: usize = 256 * 1024;
 
 pub struct Stores {
     pub dirs: Option<AppDirs>,
+    /// Opened on first use. `Err` is remembered (as text) so a refused
+    /// database — written by a newer build — is reported, not retried on every
+    /// statement.
+    history: Mutex<Option<Result<History, String>>>,
 }
 
 impl Default for Stores {
     fn default() -> Self {
-        Self { dirs: AppDirs::from_os() }
+        Self { dirs: AppDirs::from_os(), history: Mutex::new(None) }
     }
 }
 
 impl Stores {
     #[cfg(test)]
     pub fn rooted(root: &std::path::Path) -> Self {
-        Self { dirs: Some(AppDirs::rooted(root)) }
+        Self { dirs: Some(AppDirs::rooted(root)), history: Mutex::new(None) }
+    }
+
+    fn with_history<R>(&self, f: impl FnOnce(&mut History) -> Result<R, DriverError>) -> Result<R, DriverError> {
+        let dirs = self.dirs()?;
+        let mut slot = self.history.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(History::open(&dirs.data).map_err(|e| e.to_string()));
+        }
+        match slot.as_mut().expect("just set") {
+            Ok(h) => f(h),
+            Err(why) => Err(DriverError::new(ErrorKind::Conflict, why.clone())),
+        }
+    }
+
+    /// T-035: append a statement that has **already** been redacted (T-025).
+    /// Best-effort by design — history failing must not fail the query — and
+    /// silent by design: the failure is not logged, because the only thing
+    /// worth saying about it would be the statement (D-014).
+    pub fn record_history(&self, profile_id: &str, stmt: &StoredStatement, outcome: &str, duration_ms: i64, rows: Option<i64>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let _ = self.with_history(|h| {
+            h.record(&NewEntry {
+                profile_id,
+                executed_at: now,
+                statement: &stmt.text,
+                redacted: stmt.redacted,
+                outcome,
+                duration_ms: Some(duration_ms),
+                rows,
+            })
+            .map_err(state_error)
+        });
+    }
+
+    pub fn purge_profile_history(&self, profile_id: &str) {
+        let _ = self.with_history(|h| h.purge_profile(profile_id).map_err(state_error));
     }
 
     pub fn dirs(&self) -> Result<&AppDirs, DriverError> {
@@ -73,3 +119,67 @@ pub async fn save_ui_state(stores: tauri::State<'_, Stores>, state: serde_json::
     .await
 }
 
+/// T-035: history, newest first, optionally for one profile and filtered by a
+/// substring. Statements were redacted before they were stored (T-025);
+/// `redacted` / `truncated` entries are not replayable as written.
+#[tauri::command]
+pub async fn list_history(
+    stores: tauri::State<'_, Stores>,
+    profile_id: Option<String>,
+    search: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<HistoryEntry>, DriverError> {
+    guard_driver_call(&sid(), async {
+        let limit = limit.unwrap_or(200).min(1000);
+        stores.with_history(|h| h.list(profile_id.as_deref(), search.as_deref(), limit).map_err(state_error))
+    })
+    .await
+}
+
+/// T-035: the one-click purge. Returns how many entries were removed.
+#[tauri::command]
+pub async fn clear_history(stores: tauri::State<'_, Stores>) -> Result<u64, DriverError> {
+    guard_driver_call(&sid(), async { stores.with_history(|h| h.purge().map_err(state_error)) }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_history_is_the_redacted_text_and_purges_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = Stores::rooted(dir.path());
+        let stmt = sluice_core::redact_statement("ALTER ROLE app PASSWORD 'hunter2'");
+        stores.record_history("p", &stmt, "ok", 3, None);
+        stores.record_history("p", &sluice_core::redact_statement("select 1"), "ok", 1, Some(1));
+
+        let entries = stores.with_history(|h| h.list(None, None, 10).map_err(state_error)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| !e.statement.contains("hunter2")));
+        assert_eq!(entries.iter().filter(|e| e.redacted).count(), 1);
+
+        // The raw text is not anywhere in the database file either.
+        let raw = std::fs::read(dir.path().join("data").join(sluice_state::history::FILE_NAME)).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("hunter2"));
+
+        assert_eq!(stores.with_history(|h| h.purge().map_err(state_error)).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_refused_history_database_is_reported_and_never_fails_a_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let c = rusqlite::Connection::open(data.join(sluice_state::history::FILE_NAME)).unwrap();
+        c.pragma_update(None, "user_version", 99).unwrap();
+        drop(c);
+
+        let stores = Stores::rooted(dir.path());
+        // Recording is silent and harmless…
+        stores.record_history("p", &sluice_core::redact_statement("select 1"), "ok", 1, None);
+        // …and listing says why.
+        let err = stores.with_history(|h| h.count().map_err(state_error)).unwrap_err();
+        assert!(err.message.contains("newer version"), "{}", err.message);
+    }
+}

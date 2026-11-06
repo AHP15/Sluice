@@ -59,6 +59,10 @@ pub struct ProfileMeta {
     /// password itself.
     #[serde(default)]
     pub auth: CredentialProvider,
+    /// T-035 / D-014: this profile's query-history choice. Unset means the
+    /// default — off for a production-flagged profile, on otherwise.
+    #[serde(default)]
+    pub history: Option<crate::guardrails::HistoryPolicy>,
 }
 
 /// What the UI learns after connecting.
@@ -120,6 +124,12 @@ impl AppState {
         self.creds
             .store(profile_id, secret)
             .map_err(|e| DriverError::new(ErrorKind::PermissionDenied, e.to_string()))
+    }
+
+    /// T-035: whose history a session's statements go to, and whether they go
+    /// at all. The policy is the core's copy of the guardrails, not the UI's.
+    async fn history_target(&self, session_id: &str) -> Option<(String, crate::guardrails::HistoryPolicy)> {
+        self.sessions.lock().await.get(session_id).map(|r| (r.target.id.clone(), r.guardrails.history))
     }
 
     /// A deleted profile must not leave its password behind (T-036).
@@ -293,7 +303,7 @@ pub async fn connect(
         let session_id = format!("{}::{}", profile.id, short_token());
         state.drivers.lock().await.insert(session_id.clone(), driver);
 
-        let guardrails = Guardrails::manual(&profile.host, &profile.dbname);
+        let guardrails = Guardrails::manual(&profile.host, &profile.dbname).with_history(profile.history);
         state.sessions.lock().await.insert(
             session_id.clone(),
             SessionRecord {
@@ -388,6 +398,7 @@ pub async fn connect_launch(
                     connection_budget: None,
                     transport: Transport::default(),
                     auth: CredentialProvider::default(),
+                    history: None,
                 },
                 statement_timeout: timeout,
                 // R-002: a launch is its own ephemeral profile, and its budget.
@@ -800,11 +811,14 @@ pub struct EditorRun {
 #[tauri::command]
 pub async fn run_in_editor(
     state: tauri::State<'_, AppState>,
+    stores: tauri::State<'_, crate::state::Stores>,
     editors: tauri::State<'_, Arc<crate::editor::Editors>>,
     editor_id: String,
     script: String,
     query_id: Option<String>,
 ) -> Result<EditorRun, DriverError> {
+    let started = std::time::Instant::now();
+    let for_history = script.clone();
     // T-042: a released editor is refused until it reconnects explicitly.
     if let Some(why) = editors.released(&editor_id).await {
         return Err(DriverError::new(ErrorKind::ConnectionFailed, why));
@@ -830,7 +844,10 @@ pub async fn run_in_editor(
         Ok(EditorRun { run: ScriptRun { result, summary }, status })
     })
     .await;
-    state.redacted(&session_id, r).await
+    let r = state.redacted(&session_id, r).await;
+    let target = state.history_target(&session_id).await;
+    record_history(&stores, target, &for_history, started, r.as_ref().map(|run| &run.run.result));
+    r
 }
 
 /// T-041: the opt-in transaction controls.
@@ -891,10 +908,14 @@ pub struct ScriptRun {
 #[tauri::command]
 pub async fn run_script(
     state: tauri::State<'_, AppState>,
+    stores: tauri::State<'_, crate::state::Stores>,
     session_id: String,
     script: String,
     query_id: Option<String>,
 ) -> Result<ScriptRun, DriverError> {
+    let started = std::time::Instant::now();
+    let target = state.history_target(&session_id).await;
+    let for_history = script.clone();
     let r = guard_driver_call(&sid(&session_id), async {
         let d = state.driver(&session_id).await?;
         let limit = state.timeout(&session_id).await;
@@ -910,7 +931,33 @@ pub async fn run_script(
         Ok(ScriptRun { result, summary })
     })
     .await;
-    state.redacted(&session_id, r).await
+    let r = state.redacted(&session_id, r).await;
+    record_history(&stores, target, &for_history, started, r.as_ref().map(|run| &run.result));
+    r
+}
+
+/// T-035 / T-025: append one execution to query history, if the session's
+/// policy allows it. The statement is redacted (R-030) **before** it reaches
+/// the store, which never sees the raw text. Best-effort: failing to record
+/// history must never fail the query that ran.
+fn record_history(
+    stores: &crate::state::Stores,
+    target: Option<(String, crate::guardrails::HistoryPolicy)>,
+    script: &str,
+    started: std::time::Instant,
+    result: Result<&ExecutionResult, &DriverError>,
+) {
+    let Some((profile_id, crate::guardrails::HistoryPolicy::On)) = target else { return };
+    if script.trim().is_empty() {
+        return;
+    }
+    let (outcome, rows) = match result {
+        Ok(r) => ("ok", rows_in(r).map(|n| n as i64)),
+        Err(e) if e.kind == ErrorKind::Cancelled => ("cancelled", None),
+        Err(_) => ("error", None),
+    };
+    let stored = sluice_core::redact_statement(script);
+    stores.record_history(&profile_id, &stored, outcome, started.elapsed().as_millis() as i64, rows);
 }
 
 /// T-018: pull one oversized value on demand.
@@ -1133,6 +1180,7 @@ mod boundary_tests {
             connection_budget: None,
             transport: Transport::default(),
             auth: CredentialProvider::Env { var: "APP_DB_PASS".into() },
+            history: Some(crate::guardrails::HistoryPolicy::Off),
         };
         let json = serde_json::to_string(&p).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {
@@ -1157,6 +1205,7 @@ mod boundary_tests {
                 connection_budget: None,
                 transport: Transport::default(),
                 auth: CredentialProvider::default(),
+                history: None,
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
             notice: None,

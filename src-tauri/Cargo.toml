@@ -63,4 +63,5 @@ panic = "unwind"
 panic = "unwind"
 
 [dev-dependencies]
+rusqlite = "0.41"
 tempfile = "3.27.0"

@@ -313,6 +313,11 @@ export interface ProfileMeta {
   transport?: Transport;
   /** T-038 / D-008: where the password comes from — never the password. */
   auth?: CredentialProvider;
+  /**
+   * T-035: this profile's query-history choice. Absent = the default: off for
+   * a production-flagged profile, on otherwise.
+   */
+  history?: "on" | "off" | null;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */
@@ -343,6 +348,23 @@ export interface Guardrails {
   production: { armed: boolean; reasons: string[] };
   history: "on" | "off";
   safety_mode: "unknown";
+}
+
+/**
+ * T-035: one query-history entry. `statement` was redacted in the core before
+ * it was stored (T-025); a `redacted` or `truncated` entry is not replayable
+ * as written.
+ */
+export interface HistoryEntry {
+  id: number;
+  profile_id: string;
+  executed_at: number;
+  statement: string;
+  redacted: boolean;
+  truncated: boolean;
+  outcome: "ok" | "error" | "cancelled";
+  duration_ms: number | null;
+  rows: number | null;
 }
 
 /** T-036: one `[[query]]` in the portable profile file. */

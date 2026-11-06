@@ -3670,6 +3670,7 @@ dependencies = [
  "dirs 5.0.1",
  "keyring",
  "rand 0.8.7",
+ "rusqlite",
  "serde",
  "serde_json",
  "sluice-config",

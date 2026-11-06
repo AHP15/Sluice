@@ -7,6 +7,7 @@ import type {
   EditPlan,
   EditRequest,
   ExecutionResult,
+  HistoryEntry,
   LaunchOutcome,
   NavNode,
   NodeId,
@@ -73,6 +74,16 @@ export function deleteQuery(queryId: string): Promise<WorkspaceView> {
 }
 
 export const WORKSPACE_KEY = ["workspace"] as const;
+
+/** T-035: query history, newest first. */
+export function listHistory(profileId: string | null, search: string): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("list_history", { profileId, search: search || null, limit: 200 });
+}
+
+/** T-035: the one-click purge; resolves to the number of entries removed. */
+export function clearHistory(): Promise<number> {
+  return invoke<number>("clear_history");
+}
 
 /** T-033: disposable UI state from the cache dir; `null` when there is none. */
 export function loadUiState(): Promise<unknown> {

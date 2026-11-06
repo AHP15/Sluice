@@ -35,6 +35,9 @@ const MIGRATIONS: &[&str] = &[
          -- T-025 / R-030: 1 when a credential literal was replaced before the
          -- statement was stored; such an entry is not replayable verbatim.
          redacted     INTEGER NOT NULL DEFAULT 0,
+         -- T-035: 1 when the statement exceeded MAX_STATEMENT_BYTES and only
+         -- its head was kept; also not replayable verbatim.
+         truncated    INTEGER NOT NULL DEFAULT 0,
          outcome      TEXT    NOT NULL,          -- ok | error | cancelled
          duration_ms  INTEGER,
          rows         INTEGER
@@ -42,6 +45,28 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX history_by_profile_time ON history (profile_id, executed_at DESC);
      CREATE INDEX history_by_time ON history (executed_at DESC);",
 ];
+
+/// T-035 / D-014: history is capped three ways, so it can never grow without
+/// bound however it is used. Oldest entries go first.
+pub const MAX_ENTRIES: u64 = 10_000;
+/// Total statement text kept across all entries.
+pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// One statement; a longer one keeps its head and is flagged `truncated`.
+pub const MAX_STATEMENT_BYTES: usize = 64 * 1024;
+
+/// The configurable caps (tests use small ones).
+#[derive(Debug, Clone, Copy)]
+pub struct Caps {
+    pub entries: u64,
+    pub total_bytes: u64,
+    pub statement_bytes: usize,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self { entries: MAX_ENTRIES, total_bytes: MAX_TOTAL_BYTES, statement_bytes: MAX_STATEMENT_BYTES }
+    }
+}
 
 /// One statement as it is stored. `statement` is already redacted (T-025)
 /// by the time it gets here — this store never sees the raw text.
@@ -52,6 +77,7 @@ pub struct HistoryEntry {
     pub executed_at: i64,
     pub statement: String,
     pub redacted: bool,
+    pub truncated: bool,
     pub outcome: String,
     pub duration_ms: Option<i64>,
     pub rows: Option<i64>,
@@ -72,6 +98,7 @@ pub struct NewEntry<'a> {
 pub struct History {
     conn: Connection,
     path: PathBuf,
+    caps: Caps,
 }
 
 impl History {
@@ -84,20 +111,60 @@ impl History {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn)?;
-        Ok(Self { conn, path })
+        Ok(Self { conn, path, caps: Caps::default() })
+    }
+
+    pub fn with_caps(mut self, caps: Caps) -> Self {
+        self.caps = caps;
+        self
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn record(&self, e: &NewEntry) -> Result<i64, StateError> {
-        self.conn.execute(
-            "INSERT INTO history (profile_id, executed_at, statement, redacted, outcome, duration_ms, rows)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![e.profile_id, e.executed_at, e.statement, e.redacted, e.outcome, e.duration_ms, e.rows],
+    /// Record one statement, then enforce the caps — in one transaction, so
+    /// the store is never observed over its limits.
+    pub fn record(&mut self, e: &NewEntry) -> Result<i64, StateError> {
+        let (statement, truncated) = truncate(e.statement, self.caps.statement_bytes);
+        let caps = self.caps;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO history (profile_id, executed_at, statement, redacted, truncated, outcome, duration_ms, rows)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![e.profile_id, e.executed_at, statement, e.redacted, truncated, e.outcome, e.duration_ms, e.rows],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        // Count cap: keep the newest `entries`.
+        tx.execute(
+            "DELETE FROM history WHERE id IN (
+                 SELECT id FROM history ORDER BY executed_at DESC, id DESC LIMIT -1 OFFSET ?1)",
+            params![caps.entries as i64],
+        )?;
+        // Byte cap: drop from the oldest end until the running total fits.
+        tx.execute(
+            "DELETE FROM history WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, SUM(length(CAST(statement AS BLOB))) OVER (ORDER BY executed_at DESC, id DESC) AS running
+                       FROM history)
+                  WHERE running > ?1)",
+            params![caps.total_bytes as i64],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// T-035: one-click purge. Everything goes, and the file is compacted so
+    /// the deleted text does not linger in free pages.
+    pub fn purge(&self) -> Result<u64, StateError> {
+        let n = self.conn.execute("DELETE FROM history", [])? as u64;
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(n)
+    }
+
+    /// Drop one profile's entries — used when a profile opts out or is deleted.
+    pub fn purge_profile(&self, profile_id: &str) -> Result<u64, StateError> {
+        Ok(self.conn.execute("DELETE FROM history WHERE profile_id = ?1", params![profile_id])? as u64)
     }
 
     /// Newest first. `profile_id: None` means every profile; `search` is a
@@ -105,7 +172,7 @@ impl History {
     pub fn list(&self, profile_id: Option<&str>, search: Option<&str>, limit: u32) -> Result<Vec<HistoryEntry>, StateError> {
         let pattern = search.filter(|s| !s.is_empty()).map(|s| format!("%{}%", escape_like(s)));
         let mut stmt = self.conn.prepare(
-            "SELECT id, profile_id, executed_at, statement, redacted, outcome, duration_ms, rows
+            "SELECT id, profile_id, executed_at, statement, redacted, truncated, outcome, duration_ms, rows
                FROM history
               WHERE (?1 IS NULL OR profile_id = ?1)
                 AND (?2 IS NULL OR statement LIKE ?2 ESCAPE '\\')
@@ -119,9 +186,10 @@ impl History {
                 executed_at: r.get(2)?,
                 statement: r.get(3)?,
                 redacted: r.get(4)?,
-                outcome: r.get(5)?,
-                duration_ms: r.get(6)?,
-                rows: r.get(7)?,
+                truncated: r.get(5)?,
+                outcome: r.get(6)?,
+                duration_ms: r.get(7)?,
+                rows: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -131,6 +199,18 @@ impl History {
         Ok(self.conn.query_row("SELECT count(*) FROM history", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
+}
+
+/// Keep at most `max` bytes, cut on a character boundary.
+fn truncate(s: &str, max: usize) -> (&str, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
 }
 
 fn escape_like(s: &str) -> String {
@@ -211,7 +291,7 @@ mod tests {
     #[test]
     fn lists_newest_first_filtered_by_profile_and_search() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::open(dir.path()).unwrap();
+        let mut h = History::open(dir.path()).unwrap();
         h.record(&entry("a", 1, "select 1")).unwrap();
         h.record(&entry("b", 2, "select 2")).unwrap();
         h.record(&entry("a", 3, "update t set x = 1")).unwrap();
@@ -224,9 +304,67 @@ mod tests {
     }
 
     #[test]
+    fn the_count_cap_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::open(dir.path()).unwrap().with_caps(Caps { entries: 3, ..Caps::default() });
+        for i in 0..10 {
+            h.record(&entry("a", i, "select 1")).unwrap();
+        }
+        let kept: Vec<i64> = h.list(None, None, 100).unwrap().iter().map(|e| e.executed_at).collect();
+        assert_eq!(kept, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn the_byte_cap_bounds_total_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::open(dir.path()).unwrap().with_caps(Caps { total_bytes: 250, ..Caps::default() });
+        let sql = "x".repeat(100);
+        for i in 0..10 {
+            h.record(&entry("a", i, &sql)).unwrap();
+        }
+        assert_eq!(h.count().unwrap(), 2, "only what fits in 250 bytes");
+    }
+
+    #[test]
+    fn an_oversized_statement_keeps_its_head_and_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::open(dir.path()).unwrap().with_caps(Caps { statement_bytes: 5, ..Caps::default() });
+        h.record(&entry("a", 1, "héllo world")).unwrap();
+        let e = &h.list(None, None, 1).unwrap()[0];
+        assert!(e.truncated);
+        assert_eq!(e.statement, "héll", "cut on a char boundary");
+    }
+
+    #[test]
+    fn purge_removes_everything_and_per_profile_purge_only_that_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::open(dir.path()).unwrap();
+        h.record(&entry("a", 1, "select 1")).unwrap();
+        h.record(&entry("b", 2, "select 2")).unwrap();
+        assert_eq!(h.purge_profile("a").unwrap(), 1);
+        assert_eq!(h.count().unwrap(), 1);
+        assert_eq!(h.purge().unwrap(), 1);
+        assert_eq!(h.count().unwrap(), 0);
+    }
+
+    /// T-035 / D-014: history text never enters a log file or crash report.
+    /// This store has no logging at all, and nothing here formats a statement
+    /// into an error or panic message.
+    #[test]
+    fn the_history_store_never_logs_or_panics_with_statement_text() {
+        let src = include_str!("history.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        for banned in ["tracing", "log::", "println!", "eprintln!", "dbg!", "panic!(", ".expect("] {
+            assert!(!code.contains(banned), "`{banned}` in the history store");
+        }
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("tracing") && !manifest.contains("\nlog"), "sluice-state must not depend on a logger");
+    }
+
+    #[test]
     fn search_treats_like_wildcards_literally() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::open(dir.path()).unwrap();
+        let mut h = History::open(dir.path()).unwrap();
         h.record(&entry("a", 1, "select 'x'")).unwrap();
         h.record(&entry("a", 2, "select '100%'")).unwrap();
         assert_eq!(h.list(None, Some("%"), 10).unwrap().len(), 1);

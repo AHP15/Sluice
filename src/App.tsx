@@ -68,6 +68,7 @@ import { useUiStore } from "./store/ui";
 import { cn } from "./lib/utils";
 import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
 import { SavedQueries } from "./components/SavedQueries";
+import { invalidateHistory } from "./components/HistoryPanel";
 
 interface RowsView {
   columns: ColumnDesc[];
@@ -450,6 +451,8 @@ function Workspace({ seed }: { seed: TabSeed }) {
     } finally {
       runningQuery.current = null;
       setBusy(false);
+      // T-035: the core recorded it (or not, per the profile's policy).
+      invalidateHistory();
     }
   }, [session, draftQuery, pending, pinsSocket, editor]);
 
@@ -1112,7 +1115,20 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
           <option value="disabled">Disabled</option>
         </select>
       </label>
-
+      <label className="block px-2 py-1 text-xs">
+        <span className="text-muted-foreground">Query history</span>
+        <select
+          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          value={form.history ?? ""}
+          onChange={(e) =>
+            setForm({ ...form, history: e.target.value === "" ? null : (e.target.value as "on" | "off") })
+          }
+        >
+          <option value="">Default — off for production, on otherwise</option>
+          <option value="on">Keep history for this profile</option>
+          <option value="off">Never keep history for this profile</option>
+        </select>
+      </label>
       {err && <p className="px-2 py-1 text-xs text-destructive">{err}</p>}
       <div className="px-2 py-1">
         <Button type="submit" size="sm" disabled={busy} className="w-full">

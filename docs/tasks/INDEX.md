@@ -22,7 +22,7 @@ T-021 | done | M | D-007 | TLS verification defaults and webview hardening | 202
 T-022 | done | M | D-020,R-017 | Wrap credentials in Secret<String> at every parse boundary | 2026-08-03
 T-023 | done | M | D-020 | Shape-only structured logging with verbose diagnostics behind a toggle | 2026-11-06
 T-024 | done | M | D-017,D-020,R-023 | Structural credential redaction across the full error chain | 2026-11-06
-T-025 | in_progress | M | D-014,R-030 | Redact credential-bearing statements on the history and diagnostics paths |
+T-025 | done | M | D-014,R-030 | Redact credential-bearing statements on the history and diagnostics paths | 2026-11-06
 T-026 | done | M | D-012 | Context-aware launcher with a fixed argument grammar | 2026-11-06
 T-027 | done | M | D-012,R-002 | Ephemeral profile with conservative defaults for discovered connections | 2026-11-06
 T-028 | done | S | D-026 | Native config discovery for DATABASE_URL, .env, and JSON/TOML | 2026-08-05
@@ -32,7 +32,7 @@ T-031 | done | M | D-026,R-032 | Precise subprocess environment policy with loud
 T-032 | done | M | D-026,R-033 | Platform-accurate consent text and Linux subprocess sandboxing | 2026-11-06
 T-033 | done | L | D-014 | Three-store app state with versioning and atomic writes | 2026-11-06
 T-034 | done | S | D-014,D-007 | Strip passwords out of imported connection URLs | 2026-11-06
-T-035 | todo | M | D-014 | Query history caps, purge, and per-profile opt-out |
+T-035 | done | M | D-014 | Query history caps, purge, and per-profile opt-out | 2026-11-06
 T-036 | done | M | D-011 | Portable profile and saved-query file format | 2026-11-06
 T-037 | done | S | D-011,R-019 | Correct the safe-to-commit claim on the profile file | 2026-11-06
 T-038 | done | S | D-008 | Model transport variants and credential providers in the profile schema | 2026-11-06

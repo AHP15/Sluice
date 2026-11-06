@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Save, Trash2 } from "lucide-react";
+import { Clock, Save, Trash2 } from "lucide-react";
+import { HistoryPanel } from "./HistoryPanel";
 import { WORKSPACE_KEY, deleteQuery, loadWorkspace, queryClient, saveQuery } from "../lib/ipc";
 
 /**
@@ -21,6 +22,7 @@ export function SavedQueries({
   const [label, setLabel] = useState("");
   const [selected, setSelected] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
   const queries = workspace.data?.queries ?? [];
 
   const run = async (op: () => Promise<unknown>) => {
@@ -33,7 +35,7 @@ export function SavedQueries({
   };
 
   return (
-    <div className="flex items-center gap-1 border-b px-2 py-0.5 text-xs">
+    <div className="relative flex items-center gap-1 border-b px-2 py-0.5 text-xs">
       <select
         aria-label="Saved queries"
         className="max-w-48 rounded border border-input bg-transparent px-1 py-0.5"
@@ -105,6 +107,25 @@ export function SavedQueries({
         </button>
       )}
       {err && <span className="truncate text-destructive">{err}</span>}
+      <button
+        type="button"
+        className="ml-auto flex items-center gap-1 rounded px-1 py-0.5 text-muted-foreground hover:text-foreground"
+        aria-expanded={showHistory}
+        onClick={() => setShowHistory((v) => !v)}
+      >
+        <Clock className="h-3.5 w-3.5" />
+        History
+      </button>
+      {showHistory && (
+        <HistoryPanel
+          profileId={profileId}
+          onLoad={(q) => {
+            onLoad(q);
+            setShowHistory(false);
+          }}
+          onClose={() => setShowHistory(false)}
+        />
+      )}
     </div>
   );
 }
