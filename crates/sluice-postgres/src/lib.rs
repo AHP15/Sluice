@@ -10,6 +10,7 @@ pub mod error_map;
 pub mod lease;
 pub mod navigator;
 pub mod tls;
+pub mod version;
 
 use std::sync::Arc;
 
@@ -86,7 +87,9 @@ pub struct BrowseStreamEnd {
 pub struct PgDriver {
     pool: Pool,
     ceiling: i64,
-    server_version: Option<String>,
+    /// T-054 / D-016: flavour and versions parsed from `version()` at connect;
+    /// catalog queries and features gate on it.
+    server: Option<version::ServerInfo>,
     tls: TlsMode,
     /// D-028: how a released connection is made clean. Postgres has
     /// `DISCARD ALL`, so `Native`; overridable for tests of the other paths.
@@ -162,7 +165,7 @@ impl PgDriver {
         let driver = Self {
             pool,
             ceiling: DEFAULT_VALUE_CEILING,
-            server_version: None,
+            server: None,
             tls: spec.tls,
             reset: ResetSupport::Native,
             stats: Arc::new(PoolStats::default()),
@@ -173,32 +176,51 @@ impl PgDriver {
 
         // Prove the credentials work now rather than on first browse, and pick
         // up the version banner while we are here (T-054 refines this).
-        let (version, collation) = driver
+        // T-054: the banner first — what answers decides which catalog
+        // queries are safe to run at all.
+        let banner = driver
             .with_lease(false, async |client: &tokio_postgres::Client| {
-                // T-015: the default collation's name and determinism. A
-                // nondeterministic (e.g. ICU case-insensitive) default would
-                // make `=` ignore case; the descriptor must say which it is.
                 let row = client
-                    .query_one(
-                        "select version(), \
-                                (select datcollate from pg_database where datname = current_database()), \
-                                coalesce((select collisdeterministic from pg_collation where collname = 'default'), true)",
-                        &[],
-                    )
+                    .query_one("select version()", &[])
                     .await
                     .map_err(|e| error_map::map_error(&e, None))?;
-                Ok((row.get::<_, String>(0), (row.get::<_, String>(1), row.get::<_, bool>(2))))
+                Ok(row.get::<_, String>(0))
             })
             .await?;
+        let server = version::parse(&banner);
 
-        Ok(Arc::new(Self { server_version: Some(version), collation: Some(collation), ..driver }))
+        // T-015: the default collation and its determinism — gated, because
+        // `collisdeterministic` only exists on PostgreSQL 12+ catalogs.
+        let collation = if server.has_collation_determinism() {
+            let c = driver
+                .with_lease(false, async |client: &tokio_postgres::Client| {
+                    let row = client
+                        .query_one(
+                            "select (select datcollate from pg_database where datname = current_database()), \
+                                    coalesce((select collisdeterministic from pg_collation where collname = 'default'), true)",
+                            &[],
+                        )
+                        .await
+                        .map_err(|e| error_map::map_error(&e, None))?;
+                    Ok((row.get::<_, String>(0), row.get::<_, bool>(1)))
+                })
+                .await?;
+            Some(c)
+        } else {
+            None
+        };
+
+        // D-028: no `DISCARD ALL` means no native reset — reopen instead.
+        let reset = if server.has_discard_all() { ResetSupport::Native } else { ResetSupport::ReopenOnly };
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
         Arc::new(Self {
             pool: self.pool.clone(),
             ceiling,
-            server_version: self.server_version.clone(),
+            server: self.server.clone(),
             tls: self.tls,
             reset: self.reset,
             stats: self.stats.clone(),
@@ -215,7 +237,7 @@ impl PgDriver {
         Arc::new(Self {
             pool: self.pool.clone(),
             ceiling: self.ceiling,
-            server_version: self.server_version.clone(),
+            server: self.server.clone(),
             tls: self.tls,
             reset,
             stats: self.stats.clone(),
@@ -586,8 +608,9 @@ impl Driver for PgDriver {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "postgres".into(),
-            server_version: self.server_version.clone(),
-            flavour: None,
+            // T-054: the product's own version and the flavour, parsed.
+            server_version: self.server.as_ref().and_then(|s| s.display_version()),
+            flavour: self.server.as_ref().map(|s| s.flavour.name()),
             // A Postgres socket can be pinned for a tab's lifetime.
             affinity: SessionAffinity::Connection,
             // `DISCARD ALL` is a real primitive — the contrast T-072 measured
@@ -618,9 +641,14 @@ impl Driver for PgDriver {
             return Ok(hit.clone());
         }
         let key = parent.clone();
+        let hidden: Vec<String> = self
+            .server
+            .as_ref()
+            .map(|s| s.hidden_schemas().iter().map(|h| h.to_string()).collect())
+            .unwrap_or_default();
         let nodes = self
             .with_lease(false, async |client: &tokio_postgres::Client| {
-                navigator::children(&client, parent).await
+                navigator::children(&client, parent, &hidden).await
             })
             .await?;
         // A notice (permission-denied, a vanished relation) is not catalog

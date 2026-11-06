@@ -44,9 +44,15 @@ pub fn node_kinds() -> Vec<NodeKind> {
     ]
 }
 
-pub async fn children(client: &Client, parent: Option<NodeId>) -> Result<Vec<NavNode>, DriverError> {
+/// `hidden_schemas`: flavour-internal schemas to leave out (T-054), beside the
+/// `pg_*` and `information_schema` filter every flavour gets.
+pub async fn children(
+    client: &Client,
+    parent: Option<NodeId>,
+    hidden_schemas: &[String],
+) -> Result<Vec<NavNode>, DriverError> {
     let result = match &parent {
-        None => schemas(client).await,
+        None => schemas(client, hidden_schemas).await,
         Some(node) if node.kind == "schema" => {
             let schema = node.path.first().cloned().unwrap_or_default();
             relations(client, &schema).await
@@ -91,7 +97,7 @@ fn notice(parent: Option<&NodeId>, text: &str) -> NavNode {
     NavNode { id: NodeId { kind: "notice".into(), path }, label: text.to_string(), has_children: false }
 }
 
-async fn schemas(client: &Client) -> Result<Vec<NavNode>, DriverError> {
+async fn schemas(client: &Client, hidden: &[String]) -> Result<Vec<NavNode>, DriverError> {
     // Catalog schemas are noise for a browsing tool. `pg_toast_temp_%` and
     // friends are covered by the prefix test.
     const SQL: &str = "
@@ -99,9 +105,10 @@ async fn schemas(client: &Client) -> Result<Vec<NavNode>, DriverError> {
         FROM pg_namespace
         WHERE nspname NOT LIKE 'pg\\_%'
           AND nspname <> 'information_schema'
+          AND nspname <> ALL($1)
         ORDER BY nspname";
 
-    let rows = client.query(SQL, &[]).await.map_err(|e| map_error(&e, Some(SQL)))?;
+    let rows = client.query(SQL, &[&hidden]).await.map_err(|e| map_error(&e, Some(SQL)))?;
     Ok(rows
         .iter()
         .map(|r| {

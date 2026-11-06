@@ -99,3 +99,18 @@ async fn the_tree_is_lazy_cached_and_invalidated_only_by_our_own_ddl() {
 
     run(&other, "drop schema nav_t cascade").await;
 }
+
+/// T-054: connect parses `version()` into the descriptor's version and
+/// flavour, and the gated features follow from them.
+#[tokio::test]
+async fn connect_records_the_parsed_version_and_flavour() {
+    let Some(d) = connect().await else { return };
+    let caps = d.capabilities();
+    assert_eq!(caps.flavour.as_deref(), Some("postgres"));
+    let version = caps.server_version.clone().expect("a version");
+    assert!(version.chars().next().is_some_and(|c| c.is_ascii_digit()), "a clean version, not the banner: {version}");
+    assert!(!version.contains("PostgreSQL"), "{version}");
+    assert_eq!(caps.reset, sluice_core::ResetSupport::Native, "vanilla Postgres has DISCARD ALL");
+    assert!(caps.string_collation.is_some(), "PG 12+ runs the gated collation probe");
+    eprintln!("detected: {} {version}", caps.flavour.unwrap());
+}

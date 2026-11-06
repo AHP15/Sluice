@@ -315,9 +315,11 @@ function Workspace({ seed }: { seed: TabSeed }) {
           {session && (
             <span className="rounded bg-secondary px-1.5 py-0.5 text-xs">
               {session.capabilities.engine}
-              {session.capabilities.server_version
-                ? ` · ${session.capabilities.server_version.split(" ").slice(0, 2).join(" ")}`
+              {/* T-054: the parsed flavour and the product's own version. */}
+              {session.capabilities.flavour && session.capabilities.flavour !== session.capabilities.engine
+                ? ` · ${session.capabilities.flavour}`
                 : ""}
+              {session.capabilities.server_version ? ` ${session.capabilities.server_version}` : ""}
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
