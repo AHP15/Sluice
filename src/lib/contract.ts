@@ -330,6 +330,22 @@ export interface Guardrails {
   safety_mode: "unknown";
 }
 
+/** T-036: one `[[query]]` in the portable profile file. */
+export interface SavedQuery {
+  id: string;
+  label: string;
+  profile?: string | null;
+  sql: string;
+}
+
+/** T-036: the profile file as the webview sees it — metadata only (D-007). */
+export interface WorkspaceView {
+  profiles: ProfileMeta[];
+  queries: SavedQuery[];
+  /** Where the file lives, so the user can open or commit it themselves. */
+  path: string | null;
+}
+
 export interface SavedProfile {
   profile: ProfileMeta;
   guardrails: Guardrails;

@@ -13,6 +13,7 @@ mod guardrails;
 mod launcher;
 mod state;
 mod stream;
+mod workspace;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -31,6 +32,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::default())
         .manage(state::Stores::default())
+        .manage(workspace::WorkspaceFile::default())
         .manage(launcher::Launcher::default())
         .manage(stream::Streams::default())
         .manage(std::sync::Arc::new(editor::Editors::default()))
@@ -65,6 +67,11 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::core_version,
         state::load_ui_state,
         state::save_ui_state,
+        workspace::load_workspace,
+        workspace::save_profile,
+        workspace::delete_profile,
+        workspace::save_query,
+        workspace::delete_query,
         commands::store_credential,
         commands::connect,
         commands::take_launches,
@@ -100,6 +107,11 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::core_version,
         state::load_ui_state,
         state::save_ui_state,
+        workspace::load_workspace,
+        workspace::save_profile,
+        workspace::delete_profile,
+        workspace::save_query,
+        workspace::delete_query,
         commands::store_credential,
         commands::connect,
         commands::take_launches,

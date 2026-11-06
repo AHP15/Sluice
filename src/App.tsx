@@ -49,6 +49,11 @@ import {
   type SessionStatus,
   connectLaunch,
   coreVersion,
+  deleteProfile,
+  loadWorkspace,
+  queryClient,
+  saveProfile,
+  WORKSPACE_KEY,
   diagnosticsPreview,
   disconnect,
   runScript,
@@ -60,6 +65,8 @@ import {
 } from "./lib/ipc";
 import { useUiStore } from "./store/ui";
 import { cn } from "./lib/utils";
+import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
+import { SavedQueries } from "./components/SavedQueries";
 
 interface RowsView {
   columns: ColumnDesc[];
@@ -563,6 +570,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
             onSave={async (label) => {
               const saved = await saveSessionAsProfile(session.session_id, label);
               setSession({ ...session, guardrails: saved.guardrails });
+              void queryClient.invalidateQueries({ queryKey: WORKSPACE_KEY });
               return saved.profile.label;
             }}
           />
@@ -605,6 +613,11 @@ function Workspace({ seed }: { seed: TabSeed }) {
             {!editor && editorNotice && (
               <div className="border-b px-3 py-1 text-xs text-destructive">{editorNotice}</div>
             )}
+            <SavedQueries
+              sql={draftQuery}
+              profileId={session ? session.session_id.split("::")[0] : null}
+              onLoad={setDraftQuery}
+            />
             <section className="h-40 shrink-0 border-b">
               <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={onRun} />
             </section>
@@ -915,7 +928,7 @@ function OutcomeStrip({ outcomes }: { outcomes: Outcome[] }) {
  */
 function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }) {
   const [form, setForm] = useState<ProfileMeta>({
-    id: "local",
+    id: newProfileId(),
     label: "Local",
     host: "localhost",
     port: 55432,
@@ -923,6 +936,9 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
     dbname: "sluice_dev",
     tls: "disabled",
   });
+  // T-036: the portable profile file, re-read from disk by the core.
+  const workspace = useQuery({ queryKey: WORKSPACE_KEY, queryFn: loadWorkspace });
+  const [saveNote, setSaveNote] = useState<string | null>(null);
   const [secret, setSecret] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -967,7 +983,45 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
         }
       }}
     >
-      <p className="px-2 py-1 text-xs font-medium uppercase text-muted-foreground">Connect</p>
+      <SavedProfiles
+        workspace={workspace.data}
+        selectedId={form.id}
+        onPick={(p) => {
+          setForm(p);
+          setSecret("");
+          setReentry(false);
+          setErr(null);
+          setSaveNote(null);
+        }}
+        onDelete={async (id) => {
+          try {
+            queryClient.setQueryData(WORKSPACE_KEY, await deleteProfile(id));
+            if (id === form.id) setForm({ ...form, id: newProfileId() });
+          } catch (e2) {
+            setErr(String((e2 as { message?: string })?.message ?? e2));
+          }
+        }}
+      />
+      {workspace.error && (
+        <p className="px-2 py-1 text-xs text-destructive">
+          {String((workspace.error as { message?: string })?.message ?? workspace.error)}
+        </p>
+      )}
+      <div className="flex items-center justify-between px-2 py-1">
+        <p className="text-xs font-medium uppercase text-muted-foreground">Connect</p>
+        <button
+          type="button"
+          className="text-xs text-muted-foreground hover:text-foreground"
+          onClick={() => {
+            setForm({ ...form, id: newProfileId(), label: "New profile" });
+            setSecret("");
+            setSaveNote(null);
+          }}
+        >
+          New
+        </button>
+      </div>
+      {field("label", "Name")}
       {field("host", "Host")}
       {field("port", "Port", "number")}
       {field("user", "User")}
@@ -1015,12 +1069,37 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
           <option value="disabled">Disabled</option>
         </select>
       </label>
+
       {err && <p className="px-2 py-1 text-xs text-destructive">{err}</p>}
       <div className="px-2 py-1">
         <Button type="submit" size="sm" disabled={busy} className="w-full">
           <Plug className="h-3.5 w-3.5" />
           {busy ? "Connecting…" : "Connect"}
         </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          disabled={busy}
+          className="mt-1 w-full"
+          onClick={async () => {
+            setErr(null);
+            setSaveNote(null);
+            try {
+              // D-007: the password goes to the keychain; the file gets metadata.
+              if (secret) await storeCredential(form.id, secret);
+              setSecret("");
+              queryClient.setQueryData(WORKSPACE_KEY, await saveProfile(form));
+              setSaveNote("Saved to the profile file.");
+            } catch (e2) {
+              setErr(String((e2 as { message?: string })?.message ?? e2));
+            }
+          }}
+        >
+          <Save className="h-3.5 w-3.5" />
+          Save profile
+        </Button>
+        {saveNote && <p className="pt-1 text-xs text-muted-foreground">{saveNote}</p>}
       </div>
     </form>
   );

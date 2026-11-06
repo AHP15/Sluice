@@ -33,7 +33,7 @@ T-032 | done | M | D-026,R-033 | Platform-accurate consent text and Linux subpro
 T-033 | done | L | D-014 | Three-store app state with versioning and atomic writes | 2026-11-06
 T-034 | todo | S | D-014,D-007 | Strip passwords out of imported connection URLs |
 T-035 | todo | M | D-014 | Query history caps, purge, and per-profile opt-out |
-T-036 | todo | M | D-011 | Portable profile and saved-query file format |
+T-036 | done | M | D-011 | Portable profile and saved-query file format | 2026-11-06
 T-037 | todo | S | D-011,R-019 | Correct the safe-to-commit claim on the profile file |
 T-038 | todo | S | D-008 | Model transport variants and credential providers in the profile schema |
 T-039 | done | M | D-028 | Per-profile pool with capability-declared connection reset | 2026-11-06

@@ -107,6 +107,11 @@ impl AppState {
         }
     }
 
+    /// A deleted profile must not leave its password behind (T-036).
+    pub fn forget_credential(&self, profile_id: &str) {
+        let _ = self.creds.delete(profile_id);
+    }
+
     async fn profile_key(&self, session_id: &str) -> Option<String> {
         self.sessions.lock().await.get(session_id).map(|r| r.profile_key.clone())
     }
@@ -463,12 +468,14 @@ pub struct SavedProfile {
 ///
 /// The inline password, if any, moves into the keychain **here, in the core**
 /// (D-007) — the webview receives profile metadata only. The session then gets
-/// normal profile handling (D-014), keeping its production flag. Persisting the
-/// profile's metadata across restarts is T-036's; within this run the returned
-/// `ProfileMeta` connects through the ordinary `connect` command.
+/// normal profile handling (D-014), keeping its production flag, and (T-036)
+/// its metadata is written to the portable profile file so it survives a
+/// restart.
 #[tauri::command]
 pub async fn save_session_as_profile(
     state: tauri::State<'_, AppState>,
+    stores: tauri::State<'_, crate::state::Stores>,
+    file: tauri::State<'_, crate::workspace::WorkspaceFile>,
     session_id: String,
     label: String,
 ) -> Result<SavedProfile, DriverError> {
@@ -492,6 +499,18 @@ pub async fn save_session_as_profile(
                 record.ephemeral_url = Some(url);
                 return Err(DriverError::new(ErrorKind::PermissionDenied, e.to_string()));
             }
+        }
+        let persisted = stores.dirs().and_then(|d| {
+            file.update(&d.config, |ws| {
+                ws.profiles.push(crate::workspace::ProfileEntry::from_meta(&profile));
+                Ok(())
+            })
+        });
+        if let Err(e) = persisted {
+            // Same rule: undo the keychain write and keep the session unsaved.
+            let _ = state.creds.delete(&profile.id);
+            record.ephemeral_url = Some(url);
+            return Err(e);
         }
 
         record.guardrails = record.guardrails.clone().saved();
@@ -952,7 +971,7 @@ mod boundary_tests {
         const MARKER: &str = "#[tauri::command]";
         // Every module that defines IPC commands, not just this one.
         let mut src = command_source().to_string();
-        for (name, other) in [("state.rs", include_str!("state.rs"))] {
+        for (name, other) in [("state.rs", include_str!("state.rs")), ("workspace.rs", include_str!("workspace.rs"))] {
             // Cut at the test *module*, not the first `#[cfg(test)]` — a
             // test-only helper above the commands must not hide them.
             let other = &other[..other.find("#[cfg(test)]\nmod tests").unwrap_or(other.len())];

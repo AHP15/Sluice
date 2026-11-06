@@ -12,8 +12,10 @@ import type {
   NodeId,
   ProfileMeta,
   SavedProfile,
+  SavedQuery,
   SessionInfo,
   WireValue,
+  WorkspaceView,
 } from "./contract";
 
 /**
@@ -39,6 +41,30 @@ export const queryClient = new QueryClient({
 export function coreVersion(): Promise<string> {
   return invoke<string>("core_version");
 }
+
+/** T-036: the portable profile file. Re-read from disk on every call. */
+export function loadWorkspace(): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("load_workspace");
+}
+
+export function saveProfile(profile: ProfileMeta): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("save_profile", { profile });
+}
+
+/** Removes the profile and its stored password. */
+export function deleteProfile(profileId: string): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("delete_profile", { profileId });
+}
+
+export function saveQuery(query: SavedQuery): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("save_query", { query });
+}
+
+export function deleteQuery(queryId: string): Promise<WorkspaceView> {
+  return invoke<WorkspaceView>("delete_query", { queryId });
+}
+
+export const WORKSPACE_KEY = ["workspace"] as const;
 
 /** T-033: disposable UI state from the cache dir; `null` when there is none. */
 export function loadUiState(): Promise<unknown> {
