@@ -1,0 +1,30 @@
+[package]
+name = "sluice-postgres"
+description = "Postgres driver implementing the Sluice contract."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sluice-core = { path = "../sluice-core" }
+
+# D-002: low-level driver crates, never sqlx — not even its `Any` driver.
+# tokio-postgres exposes the raw row plus type OID, which is exactly the input
+# D-006's tagged encoding needs.
+tokio-postgres = { version = "0.7", features = ["runtime"] }
+deadpool-postgres = "0.14"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

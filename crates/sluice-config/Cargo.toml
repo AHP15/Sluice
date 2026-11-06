@@ -1,0 +1,29 @@
+[package]
+name = "sluice-config"
+description = "Working-directory connection discovery (D-026, D-012)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sluice-core = { path = "../sluice-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# D-026 names JSON/TOML as inert, parse-only config. `toml` deserializes into
+# `serde_json::Value`, so both formats traverse through one code path.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+# Hand-rolling connection-URL parsing would mean hand-rolling percent-decoding,
+# and R-023 is specifically about URL-encoded password forms being mishandled.
+url = "2"
+percent-encoding = "2"
+
+# Consent fingerprints (T-029/T-030). Content hashes, not signatures — the
+# question is only "is this the same code I approved", so a plain digest fits.
+sha2 = "0.10"
+
+# D-026: NO process-spawning dependency here. The inert discovery path in this
+# crate must not be able to execute anything — see the `no_subprocess_on_the`
+# lint in tests/. T-029 adds the consent-gated evaluator as a separate module.

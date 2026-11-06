@@ -1,0 +1,21 @@
+[package]
+name = "sluice-core"
+description = "The engine-agnostic Driver contract and capability model."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+async-trait = "0.1"
+# FutureExt::catch_unwind — T-006 must contain panics across await points, which
+# std::panic::catch_unwind alone cannot do.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# D-001/D-003: NO database crates here. This crate defines the contract; drivers
+# implement it in their own crates and link their engine libraries there.
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }

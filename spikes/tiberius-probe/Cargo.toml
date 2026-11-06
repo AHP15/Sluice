@@ -1,0 +1,15 @@
+[package]
+name = "tiberius-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Throwaway spike for T-072 (R-024). Not a workspace member.
+
+[dependencies]
+# tds73 is mandatory: without it DATETIME2/DATETIMEOFFSET/TIME do not decode at
+# all, which would make the type-fidelity findings meaningless.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"

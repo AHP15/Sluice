@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* D-023 / D-019: WebKitGTK 4.1 is the compatibility floor, because Tauri uses
+   the OS webview and Linux is the awkward target.
+
+   DELIBERATELY AVOIDED throughout this file and every component:
+     - CSS subgrid                (named explicitly in D-023)
+     - @property / @container     (above the floor)
+     - color-mix() / oklch()      (the reason Tailwind v3 is used, not v4)
+     - :has()                     (support is uneven at the floor)
+     - text-wrap: balance, anchor positioning
+
+   Layout uses flexbox and plain grid only; theming uses custom properties and
+   hsl(), which the floor has supported for years. */
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 187 65% 40%;
+    --primary: 187 65% 36%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 210 40% 96%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 200 30% 8%;
+    --foreground: 210 40% 96%;
+    --border: 200 20% 20%;
+    --input: 200 20% 20%;
+    --ring: 174 60% 45%;
+    --primary: 174 60% 45%;
+    --primary-foreground: 200 30% 8%;
+    --secondary: 200 24% 15%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 200 24% 15%;
+    --muted-foreground: 210 16% 65%;
+    --accent: 200 24% 15%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 62% 45%;
+    --destructive-foreground: 0 0% 100%;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 0;
+    /* The webview is a window chrome, not a document: never scroll the body. */
+    overflow: hidden;
+  }
+}

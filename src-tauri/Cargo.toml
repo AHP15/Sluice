@@ -1,0 +1,56 @@
+[package]
+name = "sluice"
+description = "A database studio for Postgres, SQL Server and MongoDB."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "sluice"
+
+[lib]
+# Tauri v2 convention: the app lives in a lib so mobile targets and tests can
+# both reach it; main.rs is a thin shim.
+name = "sluice_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sluice-core = { path = "../crates/sluice-core" }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+dirs = "5"
+sluice-postgres = { version = "0.1.0", path = "../crates/sluice-postgres" }
+sluice-config = { path = "../crates/sluice-config" }
+
+# T-029/D-026: the consent dialog is NATIVE, not a webview modal — it must be
+# showable before the webview exists and must not share a surface with content
+# the scanned repository could influence.
+tauri-plugin-dialog = "2"
+
+# T-026/D-012: one process. Without it, invoking in three project directories
+# gives three processes, three pools and three keychain prompts; a second
+# invocation instead hands its argv and working directory to the running
+# instance, which opens a tab.
+tauri-plugin-single-instance = "2"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+
+# D-001: database crates link HERE, in the Rust process, and nowhere else. The
+# webview gets data over IPC only. Driver crates arrive with T-007 (Postgres).
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+# D-003 explicitly forbids `panic = "abort"`: T-006 wraps every IPC command
+# boundary in catch_unwind, which only works while panics unwind. Do not add it.
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"

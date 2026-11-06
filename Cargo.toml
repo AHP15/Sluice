@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/sluice-core", "crates/sluice-config", "crates/sluice-postgres"]
+
+# The spikes are throwaway probes (T-072, T-073, T-046) with their own
+# lockfiles. They must not contribute dependencies to the shipped app.
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/OWNER/sluice"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip`: the default parser is fast but can be one ULP off, so an
+# f64 sent to the webview and returned in a filter or edit came back as a
+# *different* float (T-068's corpus caught float4::MAX doing it). Exactness
+# on the way back matters as much as on the way out (R-005, T-058).
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

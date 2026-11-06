@@ -1,0 +1,653 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { useQuery } from "@tanstack/react-query";
+import { AlertTriangle, Database, Play, Save, ShieldAlert, Sun, Moon, Plug, Plus, X } from "lucide-react";
+import { Navigator } from "./components/Navigator";
+import { QueryEditor } from "./components/QueryEditor";
+import { ResultGrid } from "./components/ResultGrid";
+import { Button } from "./components/ui/button";
+import type {
+  ColumnDesc,
+  Guardrails,
+  LaunchOutcome,
+  NavNode,
+  NodeId,
+  Outcome,
+  ProfileMeta,
+  SessionInfo,
+  WireValue,
+} from "./lib/contract";
+import {
+  LAUNCH_PENDING_EVENT,
+  RowStream,
+  connect,
+  connectLaunch,
+  coreVersion,
+  disconnect,
+  runScript,
+  saveSessionAsProfile,
+  storeCredential,
+  takeLaunches,
+} from "./lib/ipc";
+import { useUiStore } from "./store/ui";
+
+interface RowsView {
+  columns: ColumnDesc[];
+  rows: WireValue[][];
+  truncated: boolean;
+  label: string;
+}
+
+/** What a tab was opened for. */
+type TabSeed = { kind: "blank" } | { kind: "launch"; outcome: LaunchOutcome };
+
+interface Tab {
+  id: number;
+  seed: TabSeed;
+  title: string;
+}
+
+function titleFor(o: LaunchOutcome): string {
+  switch (o.kind) {
+    case "connect":
+      return `${o.target.database}@${o.target.host}`;
+    case "choose":
+      return "New connection";
+    case "error":
+      return "Launch failed";
+  }
+}
+
+/**
+ * The tab shell (T-026 / D-012). One process, one window: the first launch and
+ * every later `sluice` invocation each arrive as a launch outcome from the core
+ * and open a tab here. Tabs stay mounted while hidden so each keeps its state.
+ */
+export function App() {
+  const theme = useUiStore((s) => s.theme);
+  const [tabs, setTabs] = useState<Tab[]>([{ id: 0, seed: { kind: "blank" }, title: "New connection" }]);
+  const [active, setActive] = useState(0);
+  const nextId = useRef(1);
+
+  const open = useCallback((outcomes: LaunchOutcome[], replaceInitial: boolean) => {
+    const created: Tab[] = outcomes.map((o) => ({
+      id: nextId.current++,
+      seed: { kind: "launch", outcome: o },
+      title: titleFor(o),
+    }));
+    if (created.length === 0) return;
+    // The first launch replaces the placeholder tab rather than sitting beside it.
+    setTabs((prev) =>
+      replaceInitial && prev.length === 1 && prev[0].id === 0 ? created : [...prev, ...created],
+    );
+    setActive(created[created.length - 1].id);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    // Pull on mount: the first launch may have resolved before this listener
+    // existed. Then pull again every time the core says there is more.
+    const drain = async (replaceInitial: boolean) => {
+      const outcomes = await takeLaunches().catch(() => [] as LaunchOutcome[]);
+      if (!disposed) open(outcomes, replaceInitial);
+    };
+    void drain(true);
+    const unlisten = listen(LAUNCH_PENDING_EVENT, () => void drain(false));
+    return () => {
+      disposed = true;
+      void unlisten.then((f) => f());
+    };
+  }, [open]);
+
+  const close = (id: number) => {
+    setTabs((prev) => {
+      const next = prev.filter((t) => t.id !== id);
+      if (active === id && next.length > 0) setActive(next[next.length - 1].id);
+      return next.length > 0 ? next : [{ id: nextId.current++, seed: { kind: "blank" }, title: "New connection" }];
+    });
+  };
+
+  const addBlank = () => {
+    const id = nextId.current++;
+    setTabs((prev) => [...prev, { id, seed: { kind: "blank" }, title: "New connection" }]);
+    setActive(id);
+  };
+
+  return (
+    <div className={theme === "dark" ? "dark" : undefined}>
+      <div className="flex h-screen flex-col bg-background text-foreground">
+        <nav className="flex items-center gap-0.5 border-b bg-muted/40 px-1 pt-1 text-xs" role="tablist">
+          {tabs.map((t) => (
+            <div
+              key={t.id}
+              role="tab"
+              aria-selected={t.id === active}
+              className={
+                "flex items-center gap-1 rounded-t border border-b-0 px-2 py-1 " +
+                (t.id === active ? "bg-background" : "border-transparent text-muted-foreground")
+              }
+            >
+              <button type="button" onClick={() => setActive(t.id)} className="max-w-48 truncate">
+                {t.title}
+              </button>
+              <button type="button" aria-label={`Close ${t.title}`} onClick={() => close(t.id)}>
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+          <button type="button" aria-label="New tab" className="px-1.5 py-1" onClick={addBlank}>
+            <Plus className="h-3.5 w-3.5" />
+          </button>
+        </nav>
+        {tabs.map((t) => (
+          <div key={t.id} className={t.id === active ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+            <Workspace seed={t.seed} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One tab: one connection, its navigator, editor and results. */
+function Workspace({ seed }: { seed: TabSeed }) {
+  const theme = useUiStore((s) => s.theme);
+  const toggleTheme = useUiStore((s) => s.toggleTheme);
+  const initialQuery = useUiStore((s) => s.draftQuery);
+  const [draftQuery, setDraftQuery] = useState(initialQuery);
+
+  const core = useQuery({ queryKey: ["core-version"], queryFn: coreVersion });
+
+  const launch = seed.kind === "launch" ? seed.outcome : null;
+  const [session, setSession] = useState<SessionInfo | null>(null);
+  const [launchError, setLaunchError] = useState<string | null>(
+    launch?.kind === "error" ? launch.message : null,
+  );
+  const [connecting, setConnecting] = useState(false);
+  const started = useRef(false);
+
+  // D-012: a launched connection connects immediately. The ref keeps React's
+  // dev double-mount from connecting twice.
+  const connectLaunched = useCallback(async () => {
+    if (launch?.kind !== "connect") return;
+    setConnecting(true);
+    setLaunchError(null);
+    try {
+      setSession(await connectLaunch(launch.launch_id));
+    } catch (e) {
+      setLaunchError(String((e as { message?: string })?.message ?? e));
+    } finally {
+      setConnecting(false);
+    }
+  }, [launch]);
+
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    void connectLaunched();
+  }, [connectLaunched]);
+
+  // Closing the tab releases its connection.
+  const sessionRef = useRef<SessionInfo | null>(null);
+  sessionRef.current = session;
+  useEffect(
+    () => () => {
+      if (sessionRef.current) void disconnect(sessionRef.current.session_id).catch(() => {});
+    },
+    [],
+  );
+  const [selected, setSelected] = useState<NodeId | null>(null);
+  const [view, setView] = useState<RowsView | null>(null);
+  const [outcomes, setOutcomes] = useState<Outcome[] | null>(null);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // T-049: the live browse stream, and how many of its batches have been
+  // applied to state but not yet rendered. Credit goes back only after render.
+  const streamRef = useRef<RowStream | null>(null);
+  const unretired = useRef(0);
+
+  useEffect(() => {
+    if (unretired.current > 0) {
+      streamRef.current?.retire(unretired.current);
+      unretired.current = 0;
+    }
+  }, [view]);
+
+  // A closed tab stops its stream.
+  useEffect(() => () => streamRef.current?.cancel(), []);
+
+  const onSelectRelation = useCallback(
+    (node: NavNode) => {
+      if (!session) return;
+      streamRef.current?.cancel();
+      unretired.current = 0;
+      setSelected(node.id);
+      setBusy(true);
+      setError(null);
+      setOutcomes(null);
+      setSummary(null);
+      const label = node.id.path.join(".");
+      // T-009: the grid issues ONLY this structured request. It never builds
+      // SQL, and it does not know what engine is on the other end.
+      const stream = RowStream.open(
+        session.session_id,
+        { relation: node.id, filter: null, sort: [], limit: 500, cursor: null },
+        (e) => {
+          if (streamRef.current !== stream) return; // superseded
+          switch (e.kind) {
+            case "columns":
+              setView({ columns: e.columns, rows: [], truncated: false, label });
+              break;
+            case "rows":
+              unretired.current += 1;
+              setView((v) => (v ? { ...v, rows: v.rows.concat(e.rows) } : v));
+              break;
+            case "done":
+              setView((v) => (v ? { ...v, truncated: e.truncated } : v));
+              setBusy(false);
+              break;
+            case "cancelled":
+              setBusy(false);
+              break;
+            case "timed_out":
+              setError("The browse took too long and was stopped.");
+              setBusy(false);
+              break;
+            case "error":
+              setError(e.error.message);
+              setBusy(false);
+              break;
+          }
+        },
+      );
+      streamRef.current = stream;
+    },
+    [session],
+  );
+
+  const onRun = useCallback(async () => {
+    if (!session) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const run = await runScript(session.session_id, draftQuery);
+      setOutcomes(run.result.outcomes);
+      setSummary(run.summary);
+      const first = run.result.outcomes.find((o) => o.kind === "rows");
+      if (first && first.kind === "rows") {
+        setView({
+          columns: first.columns,
+          rows: first.rows,
+          truncated: first.truncated,
+          label: "query result",
+        });
+      }
+    } catch (e) {
+      setError(String((e as { message?: string })?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }, [session, draftQuery]);
+
+  return (
+    <>
+        <header className="flex items-center gap-3 border-b px-3 py-2">
+          <Database className="h-4 w-4 text-primary" />
+          <span className="text-sm font-semibold">Sluice</span>
+          <span className="text-xs text-muted-foreground">
+            {core.isPending ? "starting…" : core.isError ? "core unreachable" : core.data}
+          </span>
+          {session && (
+            <span className="rounded bg-secondary px-1.5 py-0.5 text-xs">
+              {session.capabilities.engine}
+              {session.capabilities.server_version
+                ? ` · ${session.capabilities.server_version.split(" ").slice(0, 2).join(" ")}`
+                : ""}
+            </span>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
+              <Play className="h-3.5 w-3.5" />
+              Run
+            </Button>
+            <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
+              {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            </Button>
+          </div>
+        </header>
+
+        {/* D-007: an opt-out from TLS verification must be visible wherever the
+            connection is. The text comes from the core with the session. */}
+        {session?.tls_warning && (
+          <div className="flex items-center gap-2 border-b bg-destructive px-3 py-1 text-xs text-destructive-foreground">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span>{session.tls_warning}</span>
+          </div>
+        )}
+
+        {session && (
+          <GuardrailBar
+            guardrails={session.guardrails}
+            origin={launch?.kind === "connect" ? launch : null}
+            onSave={async (label) => {
+              const saved = await saveSessionAsProfile(session.session_id, label);
+              setSession({ ...session, guardrails: saved.guardrails });
+              return saved.profile.label;
+            }}
+          />
+        )}
+
+        <div className="flex min-h-0 flex-1">
+          <aside className="flex w-64 shrink-0 flex-col border-r">
+            {session ? (
+              <div className="min-h-0 flex-1 overflow-auto p-1">
+                <Navigator
+                  sessionId={session.session_id}
+                  capabilities={session.capabilities}
+                  selected={selected}
+                  onSelect={onSelectRelation}
+                />
+              </div>
+            ) : (
+              <>
+                <LaunchBanner
+                  launch={launch}
+                  connecting={connecting}
+                  error={launchError}
+                  onRetry={launch?.kind === "connect" ? connectLaunched : undefined}
+                />
+                {!connecting && <ConnectPanel onConnected={setSession} />}
+              </>
+            )}
+          </aside>
+
+          <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+            <section className="h-40 shrink-0 border-b">
+              <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={onRun} />
+            </section>
+
+            {(summary || error) && (
+              <div
+                className={
+                  error
+                    ? "border-b bg-destructive px-3 py-1 text-xs text-destructive-foreground"
+                    : "border-b px-3 py-1 text-xs text-muted-foreground"
+                }
+              >
+                {error ?? summary}
+              </div>
+            )}
+
+            {outcomes && outcomes.length > 1 && <OutcomeStrip outcomes={outcomes} />}
+
+            <section className="min-h-0 flex-1">
+              {session && view ? (
+                <ResultGrid
+                  sessionId={session.session_id}
+                  columns={view.columns}
+                  rows={view.rows}
+                  truncated={view.truncated}
+                />
+              ) : (
+                <div className="p-6 text-sm text-muted-foreground">
+                  {session ? "Pick a relation, or run a query." : "Connect to a database to start."}
+                </div>
+              )}
+            </section>
+          </main>
+        </div>
+    </>
+  );
+}
+
+const PROVENANCE_LABEL: Record<Guardrails["provenance"], string> = {
+  manual: "Entered manually",
+  discovered: "Discovered",
+  evaluated: "From project config",
+  command_line: "From command line",
+};
+
+/**
+ * T-027 / R-002: the session's guardrails, always visible. A discovered or
+ * command-line session says it is unsaved and offers to become a profile; the
+ * production guard says *why* it is armed; history and safety mode are stated
+ * rather than implied.
+ */
+function GuardrailBar({
+  guardrails: g,
+  origin,
+  onSave,
+}: {
+  guardrails: Guardrails;
+  origin: Extract<LaunchOutcome, { kind: "connect" }> | null;
+  onSave: (label: string) => Promise<string>;
+}) {
+  const [savedAs, setSavedAs] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const t = origin?.target;
+  const source =
+    origin?.origin.kind === "discovered"
+      ? ` · ${origin.origin.source} in ${origin.origin.dir}`
+      : origin?.origin.kind === "evaluated"
+        ? ` · ${origin.origin.config}`
+        : "";
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b px-3 py-1 text-xs">
+      <span className="font-medium">
+        {PROVENANCE_LABEL[g.provenance]}
+        {g.saved ? "" : g.provenance === "manual" ? "" : " · not saved"}
+      </span>
+      {t && (
+        <span className="font-mono text-muted-foreground">
+          {t.user}@{t.host}:{t.port}/{t.database}
+          {source}
+        </span>
+      )}
+      <span className="rounded bg-secondary px-1.5 py-0.5">history {g.history}</span>
+      <span className="rounded bg-secondary px-1.5 py-0.5" title="Whether the database itself enforces read-only access is not known yet.">
+        safety mode: {g.safety_mode}
+      </span>
+      {g.production.armed && (
+        <span
+          className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
+          title={g.production.reasons.join("\n")}
+        >
+          <ShieldAlert className="h-3 w-3" />
+          production confirmation armed: {g.production.reasons[0]}
+        </span>
+      )}
+      {!g.saved && g.provenance !== "manual" && (
+        <Button
+          size="sm"
+          variant="secondary"
+          className="ml-auto h-6"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            setErr(null);
+            try {
+              setSavedAs(await onSave(t ? `${t.database}@${t.host}` : "Saved connection"));
+            } catch (e) {
+              setErr(String((e as { message?: string })?.message ?? e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <Save className="h-3 w-3" />
+          Save as profile
+        </Button>
+      )}
+      {savedAs && <span className="ml-auto text-muted-foreground">Saved as “{savedAs}”</span>}
+      {err && <span className="text-destructive">{err}</span>}
+    </div>
+  );
+}
+
+/**
+ * What a launch resolved to, shown until the tab is connected (T-026). A
+ * config that failed (R-032) or a declined consent (D-026) explains itself
+ * here, above the connect form it degraded to.
+ */
+function LaunchBanner({
+  launch,
+  connecting,
+  error,
+  onRetry,
+}: {
+  launch: LaunchOutcome | null;
+  connecting: boolean;
+  error: string | null;
+  onRetry?: () => void;
+}) {
+  if (!launch) return null;
+  const target =
+    launch.kind === "connect"
+      ? `${launch.target.scheme}://${launch.target.user}@${launch.target.host}:${launch.target.port}/${launch.target.database}`
+      : null;
+  return (
+    <div className="space-y-1 border-b p-2 text-xs">
+      {target && (
+        <p>
+          {connecting ? "Connecting to " : "Launch target "}
+          <span className="font-mono">{target}</span>
+        </p>
+      )}
+      {launch.kind === "choose" && <p className="text-muted-foreground">{launch.reason}</p>}
+      {error && <p className="text-destructive">{error}</p>}
+      {error && onRetry && (
+        <Button size="sm" variant="secondary" onClick={onRetry}>
+          Retry
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The outcome sequence (T-010/D-029). A script that fails at statement three
+ * shows two successes and one error, not one global failure.
+ */
+function OutcomeStrip({ outcomes }: { outcomes: Outcome[] }) {
+  return (
+    <div className="flex flex-wrap gap-1 border-b px-3 py-1 text-xs">
+      {outcomes.map((o, i) => (
+        <span
+          key={i}
+          className={
+            o.kind === "error"
+              ? "rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
+              : "rounded bg-secondary px-1.5 py-0.5"
+          }
+          title={
+            // T-011: only offer a position when attribution is a real span.
+            o.attribution.how === "span"
+              ? `characters ${o.attribution.start_utf16}–${o.attribution.end_utf16}`
+              : "position unknown (splitter disagreed with the engine)"
+          }
+        >
+          {i + 1}.{" "}
+          {o.kind === "rows"
+            ? `${o.rows.length} rows`
+            : o.kind === "affected"
+              ? `${o.count} affected`
+              : o.kind === "status"
+                ? o.message
+                : o.error.message}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * D-007: the password is sent inward to be stored in the keychain and is never
+ * read back. The webview keeps the profile id and metadata only.
+ */
+function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }) {
+  const [form, setForm] = useState<ProfileMeta>({
+    id: "local",
+    label: "Local",
+    host: "localhost",
+    port: 55432,
+    user: "postgres",
+    dbname: "sluice_dev",
+    tls: "disabled",
+  });
+  const [secret, setSecret] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const field = (k: keyof ProfileMeta, label: string, type = "text") => (
+    <label className="block px-2 py-1 text-xs">
+      <span className="text-muted-foreground">{label}</span>
+      <input
+        type={type}
+        className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+        value={String(form[k])}
+        onChange={(e) =>
+          setForm({ ...form, [k]: k === "port" ? Number(e.target.value) : e.target.value })
+        }
+      />
+    </label>
+  );
+
+  return (
+    <form
+      className="flex flex-col gap-0.5 overflow-auto p-1"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setBusy(true);
+        setErr(null);
+        try {
+          if (secret) await storeCredential(form.id, secret);
+          setSecret("");
+          onConnected(await connect(form));
+        } catch (e2) {
+          setErr(String((e2 as { message?: string })?.message ?? e2));
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <p className="px-2 py-1 text-xs font-medium uppercase text-muted-foreground">Connect</p>
+      {field("host", "Host")}
+      {field("port", "Port", "number")}
+      {field("user", "User")}
+      {field("dbname", "Database")}
+      <label className="block px-2 py-1 text-xs">
+        <span className="text-muted-foreground">Password</span>
+        <input
+          type="password"
+          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          value={secret}
+          onChange={(e) => setSecret(e.target.value)}
+          placeholder="stored in the OS keychain"
+        />
+      </label>
+      <label className="block px-2 py-1 text-xs">
+        <span className="text-muted-foreground">TLS</span>
+        <select
+          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          value={form.tls}
+          onChange={(e) => setForm({ ...form, tls: e.target.value as ProfileMeta["tls"] })}
+        >
+          <option value="verify">Verify certificates (default)</option>
+          <option value="accept_invalid_certs">Accept invalid certificates</option>
+          <option value="disabled">Disabled</option>
+        </select>
+      </label>
+      {err && <p className="px-2 py-1 text-xs text-destructive">{err}</p>}
+      <div className="px-2 py-1">
+        <Button type="submit" size="sm" disabled={busy} className="w-full">
+          <Plug className="h-3.5 w-3.5" />
+          {busy ? "Connecting…" : "Connect"}
+        </Button>
+      </div>
+    </form>
+  );
+}

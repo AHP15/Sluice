@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+*.log
+
+# Spike crates build independently of the app workspace.
+spikes/*/target/
+
+.DS_Store
+.vscode/
+.idea/
