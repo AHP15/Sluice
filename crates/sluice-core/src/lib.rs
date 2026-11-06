@@ -28,6 +28,7 @@ pub mod request;
 pub mod script;
 pub mod redact;
 pub mod secret;
+pub mod statement_redact;
 pub mod value;
 
 pub use capability::{missing_core_ops, CORE_FILTER_OPS, 
@@ -49,6 +50,7 @@ pub use request::{
     SortKey,
 };
 pub use redact::{redact_shapes, Redactor};
+pub use statement_redact::{redact_statement, StoredStatement};
 pub use secret::{deserialize_optional_secret, Secret, REDACTED};
 pub use value::{ColumnDesc, ExactDomain, TypeClass, WireValue};
 
