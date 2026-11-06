@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Database, Play, Save, ShieldAlert, Sun, Moon, Plug, Plus, X } from "lucide-react";
+import { AlertTriangle, Bug, Database, Play, Save, ShieldAlert, Square, Sun, Moon, Plug, Plus, X } from "lucide-react";
 import { Navigator } from "./components/Navigator";
 import { QueryEditor } from "./components/QueryEditor";
 import { ResultGrid } from "./components/ResultGrid";
@@ -20,14 +20,18 @@ import type {
 import {
   LAUNCH_PENDING_EVENT,
   RowStream,
+  cancelQuery,
   connect,
   connectLaunch,
   coreVersion,
+  diagnosticsPreview,
   disconnect,
   runScript,
   saveSessionAsProfile,
+  setVerboseDiagnostics,
   storeCredential,
   takeLaunches,
+  verboseDiagnostics,
 } from "./lib/ipc";
 import { useUiStore } from "./store/ui";
 
@@ -68,6 +72,7 @@ export function App() {
   const [tabs, setTabs] = useState<Tab[]>([{ id: 0, seed: { kind: "blank" }, title: "New connection" }]);
   const [active, setActive] = useState(0);
   const nextId = useRef(1);
+  const [diagOpen, setDiagOpen] = useState(false);
 
   const open = useCallback((outcomes: LaunchOutcome[], replaceInitial: boolean) => {
     const created: Tab[] = outcomes.map((o) => ({
@@ -138,7 +143,16 @@ export function App() {
           <button type="button" aria-label="New tab" className="px-1.5 py-1" onClick={addBlank}>
             <Plus className="h-3.5 w-3.5" />
           </button>
+          <button
+            type="button"
+            className="ml-auto flex items-center gap-1 px-1.5 py-1 text-muted-foreground"
+            onClick={() => setDiagOpen(true)}
+          >
+            <Bug className="h-3.5 w-3.5" />
+            Diagnostics
+          </button>
         </nav>
+        {diagOpen && <DiagnosticsPanel onClose={() => setDiagOpen(false)} />}
         {tabs.map((t) => (
           <div key={t.id} className={t.id === active ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
             <Workspace seed={t.seed} />
@@ -267,12 +281,17 @@ function Workspace({ seed }: { seed: TabSeed }) {
     [session],
   );
 
+  // T-051: the running script's id, so Stop can cancel it.
+  const runningQuery = useRef<string | null>(null);
+
   const onRun = useCallback(async () => {
     if (!session) return;
     setBusy(true);
     setError(null);
+    const queryId = crypto.randomUUID();
+    runningQuery.current = queryId;
     try {
-      const run = await runScript(session.session_id, draftQuery);
+      const run = await runScript(session.session_id, draftQuery, queryId);
       setOutcomes(run.result.outcomes);
       setSummary(run.summary);
       const first = run.result.outcomes.find((o) => o.kind === "rows");
@@ -287,9 +306,14 @@ function Workspace({ seed }: { seed: TabSeed }) {
     } catch (e) {
       setError(String((e as { message?: string })?.message ?? e));
     } finally {
+      runningQuery.current = null;
       setBusy(false);
     }
   }, [session, draftQuery]);
+
+  const onStop = useCallback(() => {
+    if (runningQuery.current) void cancelQuery(runningQuery.current);
+  }, []);
 
   return (
     <>
@@ -302,16 +326,25 @@ function Workspace({ seed }: { seed: TabSeed }) {
           {session && (
             <span className="rounded bg-secondary px-1.5 py-0.5 text-xs">
               {session.capabilities.engine}
-              {session.capabilities.server_version
-                ? ` · ${session.capabilities.server_version.split(" ").slice(0, 2).join(" ")}`
+              {/* T-054: the parsed flavour and the product's own version. */}
+              {session.capabilities.flavour && session.capabilities.flavour !== session.capabilities.engine
+                ? ` · ${session.capabilities.flavour}`
                 : ""}
+              {session.capabilities.server_version ? ` ${session.capabilities.server_version}` : ""}
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
-            <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
-              <Play className="h-3.5 w-3.5" />
-              Run
-            </Button>
+            {busy && runningQuery.current ? (
+              <Button size="sm" variant="secondary" onClick={onStop}>
+                <Square className="h-3.5 w-3.5" />
+                Stop
+              </Button>
+            ) : (
+              <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
+                <Play className="h-3.5 w-3.5" />
+                Run
+              </Button>
+            )}
             <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
@@ -399,6 +432,83 @@ function Workspace({ seed }: { seed: TabSeed }) {
           </main>
         </div>
     </>
+  );
+}
+
+/**
+ * T-023 / D-020: "copy diagnostics". The core builds the text; this shows all
+ * of it, and Copy copies that same string — nothing is sent anywhere, and
+ * nothing is copied that was not on screen.
+ */
+function DiagnosticsPanel({ onClose }: { onClose: () => void }) {
+  const [text, setText] = useState<string | null>(null);
+  const [verbose, setVerbose] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setCopied(false);
+    setVerbose(await verboseDiagnostics().catch(() => false));
+    setText(await diagnosticsPreview().catch((e) => `diagnostics unavailable: ${String(e)}`));
+  }, []);
+  useEffect(() => void refresh(), [refresh]);
+
+  const copy = async () => {
+    if (text === null) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Older webviews: select-and-copy from a hidden textarea.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopied(true);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-label="Diagnostics">
+      <div className="flex max-h-[85vh] w-[46rem] flex-col gap-2 rounded border bg-background p-3 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Diagnostics</span>
+          <button type="button" className="ml-auto" aria-label="Close" onClick={onClose}>
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={verbose}
+            onChange={async (e) => {
+              await setVerboseDiagnostics(e.target.checked);
+              await refresh();
+            }}
+          />
+          <span>
+            <span className="font-medium">Verbose diagnostics</span> — also log full query text, for this run
+            only. Query text can contain sensitive values, including passwords in statements like{" "}
+            <code>CREATE ROLE … PASSWORD</code>.
+          </span>
+        </label>
+        <p className="text-muted-foreground">
+          This is everything that will be copied. It stays on this machine unless you paste it somewhere.
+        </p>
+        <pre className="min-h-0 flex-1 overflow-auto rounded border bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap">
+          {text ?? "loading…"}
+        </pre>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="secondary" onClick={() => void refresh()}>
+            Refresh
+          </Button>
+          <Button size="sm" onClick={() => void copy()} disabled={text === null}>
+            Copy diagnostics
+          </Button>
+          {copied && <span className="text-muted-foreground">Copied.</span>}
+        </div>
+      </div>
+    </div>
   );
 }
 

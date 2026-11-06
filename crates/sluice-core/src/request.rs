@@ -28,6 +28,12 @@ pub struct Predicate {
     /// An operator id the driver declared in `Capabilities::filter_ops`.
     pub op: String,
     pub value: WireValue,
+    /// T-015 / R-009: compare case-insensitively, whatever the engine's
+    /// collation does by default. Off means the engine's own semantics, which
+    /// the capability descriptor reports (`FilterOpDecl::case_sensitive`).
+    /// Each driver compiles it its own way (`ILIKE`, `LOWER()`, a collation).
+    #[serde(default)]
+    pub case_insensitive: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -52,8 +58,13 @@ pub struct BrowseRequest {
     pub filter: Option<FilterTree>,
     pub sort: Vec<SortKey>,
     pub limit: u32,
-    /// Keyset cursor: the previous page's last sort-key values (T-047).
+    /// Keyset cursor: the previous result's `PageInfo::Keyset::next_cursor`
+    /// (T-047), one value per key column.
     pub cursor: Option<Vec<WireValue>>,
+    /// The previous result's `PageInfo::Offset::next_offset`, for relations
+    /// that cannot page by keyset (T-047).
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 /// One optimistic-concurrency original (T-058).

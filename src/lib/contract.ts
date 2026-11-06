@@ -95,6 +95,8 @@ export interface FilterOpDecl {
   label: string;
   type_classes: TypeClass[];
   case_sensitive: boolean | null;
+  /** T-015: the operator honours `Predicate.case_insensitive`. */
+  case_insensitive_toggle: boolean;
 }
 
 export interface Capabilities {
@@ -110,9 +112,17 @@ export interface Capabilities {
   filter_ops: FilterOpDecl[];
   fixed_schema: boolean;
   supports_script: boolean;
+  /** T-015: the server's default string collation (what `case_sensitive` reflects). */
+  string_collation: string | null;
 }
 
-export type Predicate = { column: string; op: string; value: WireValue };
+export type Predicate = {
+  column: string;
+  op: string;
+  value: WireValue;
+  /** T-015: compare ignoring case; only on ops declaring `case_insensitive_toggle`. */
+  case_insensitive?: boolean;
+};
 
 export type FilterTree =
   | { node: "and"; 0: FilterTree[] }
@@ -130,7 +140,14 @@ export interface BrowseRequest {
   sort: SortKey[];
   limit: number;
   cursor: WireValue[] | null;
+  /** T-047: next_offset from an offset-paged result. */
+  offset?: number | null;
 }
+
+/** T-047: how a browse paged, declared by the driver. */
+export type PageInfo =
+  | { strategy: "keyset"; key: string[]; next_cursor: WireValue[] | null }
+  | { strategy: "offset"; reason: string; next_offset: number | null };
 
 export interface QueryPosition {
   utf16_offset: number;
@@ -187,6 +204,17 @@ export type TxDisposition =
 
 export interface ExecutionResult {
   outcomes: Outcome[];
+  /** T-047: present for structured browse. */
+  page?: PageInfo;
+  /** T-050: the execution's result budget; `exhausted_at` indexes `outcomes`. */
+  budget?: {
+    max_rows: number;
+    max_bytes: number;
+    used_rows: number;
+    used_bytes: number;
+    exhausted_by: "rows" | "bytes" | null;
+    exhausted_at: number | null;
+  };
   tx: {
     mode: "implicit_single" | "explicit_user" | "autocommit_per_statement";
     disposition: TxDisposition;
@@ -201,6 +229,8 @@ export interface ProfileMeta {
   user: string;
   dbname: string;
   tls: "verify" | "accept_invalid_certs" | "disabled";
+  /** T-051: statement timeout in seconds; absent = default, 0 = none. */
+  statement_timeout_secs?: number | null;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */

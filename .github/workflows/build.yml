@@ -7,8 +7,11 @@ name: build
 # cheap to learn now and exponentially expensive to learn later.
 
 on:
+  # Pushes to main, and pull requests (opened, plus each new push to an open
+  # PR, so the PR's checks reflect its latest commit). Pushing a feature branch
+  # without a PR runs nothing; open a PR, or use workflow_dispatch, to build it.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -46,6 +49,12 @@ jobs:
 
       - name: Core contract and redaction tests
         run: cargo test -p sluice-core
+
+      # T-067 / D-021: filter compilation, type-class mapping and the rest of
+      # the driver's pure logic must run with NO database. This job has no
+      # service container, so a unit test that quietly needed one fails here.
+      - name: Driver unit tests without a database
+        run: cargo test -p sluice-postgres --lib
 
   # T-028 / R-001 (critical). D-026 splits config discovery into an inert tier
   # (parsed, never executed — automatic and unprompted) and an executable tier

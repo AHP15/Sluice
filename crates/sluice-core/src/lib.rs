@@ -26,16 +26,17 @@ pub mod outcome;
 pub mod panic_guard;
 pub mod request;
 pub mod script;
+pub mod redact;
 pub mod secret;
 pub mod value;
 
-pub use capability::{
+pub use capability::{missing_core_ops, CORE_FILTER_OPS, 
     CancelSupport, Capabilities, FilterOpDecl, NodeKind, RawPayloadKind, ResetSupport,
     SessionAffinity, TransactionSupport,
 };
 pub use driver::Driver;
 pub use error::{DriverError, EnginePayload, ErrorHints, ErrorKind, QueryPosition};
-pub use outcome::{
+pub use outcome::{row_cost, BudgetLimit, BudgetMeter, BudgetReport, ExecBudget, PageInfo, 
     Attribution, ExecutionResult, Outcome, OutcomeBody, TxContext, TxDisposition, TxMode,
 };
 pub use script::{ScriptDialect, SplitResult, StatementSpan};
@@ -47,6 +48,7 @@ pub use request::{
     BrowseRequest, EditRequest, FilterTree, NavNode, NodeId, Original, Predicate, RawRequest,
     SortKey,
 };
+pub use redact::{redact_shapes, Redactor};
 pub use secret::{deserialize_optional_secret, Secret, REDACTED};
 pub use value::{ColumnDesc, ExactDomain, TypeClass, WireValue};
 
@@ -132,9 +134,11 @@ mod contract_tests {
                 label: "contains".into(),
                 type_classes: vec![TypeClass::Text],
                 case_sensitive: Some(false),
+                case_insensitive_toggle: true,
             }],
             fixed_schema: true,
             supports_script: true,
+            string_collation: Some("en_US.utf8".into()),
         };
 
         let json = serde_json::to_string(&caps).expect("serialize");
@@ -169,6 +173,32 @@ mod contract_tests {
             rendered: "POINT(0 0)".into()
         }
         .is_comparable());
+    }
+
+    /// T-067: every wire value reports a class, and the per-value classes
+    /// cover every declared class except the column-only `Unknown` fallback.
+    #[test]
+    fn every_wire_value_maps_to_a_type_class() {
+        let cases = [
+            (WireValue::Null, TypeClass::Unknown),
+            (WireValue::Missing, TypeClass::Unknown),
+            (WireValue::Bool(true), TypeClass::Boolean),
+            (WireValue::Int(1), TypeClass::Integer),
+            (WireValue::Float(1.0), TypeClass::Float),
+            (WireValue::Numeric("1".into()), TypeClass::ExactNumeric),
+            (WireValue::Text("a".into()), TypeClass::Text),
+            (WireValue::Bytes("".into()), TypeClass::Binary),
+            (WireValue::Timestamp("2026-01-01".into()), TypeClass::Timestamp),
+            (WireValue::Uuid("0".into()), TypeClass::Uuid),
+            (WireValue::Document(vec![]), TypeClass::Structural),
+            (WireValue::Array(vec![]), TypeClass::Structural),
+            (WireValue::Opaque { type_name: "inet".into(), rendered: "x".into() }, TypeClass::Opaque),
+            (WireValue::Oversized { type_name: "bytea".into(), byte_len: 1, handle: None }, TypeClass::Oversized),
+            (WireValue::Unsupported { type_name: "x".into(), rendered: "x".into() }, TypeClass::Unknown),
+        ];
+        for (v, want) in &cases {
+            assert_eq!(v.type_class(), *want, "{v:?}");
+        }
     }
 
     /// T-068: Mongo `Decimal128` extremes — 34 significant digits and an

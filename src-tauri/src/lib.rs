@@ -6,12 +6,17 @@
 mod commands;
 mod consent_dialog;
 mod credentials;
+mod diagnostics;
+mod execution;
 mod guardrails;
 mod launcher;
 mod stream;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // T-023: shape-only logs and the crash hook, before anything can panic.
+    diagnostics::init();
+
     // D-003 forbids `panic = "abort"`, and Cargo.toml pins `panic = "unwind"` in
     // both profiles, because T-006's containment depends on panics unwinding.
     tauri::Builder::default()
@@ -44,12 +49,17 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::connect_launch,
         commands::save_session_as_profile,
         commands::disconnect,
+        commands::diagnostics_preview,
+        commands::set_verbose_diagnostics,
+        commands::verbose_diagnostics,
         commands::navigator_children,
+        commands::refresh_navigator,
         commands::browse,
         commands::open_browse_stream,
         commands::grant_stream_credit,
         commands::cancel_stream,
         commands::run_script,
+        commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file,
         commands::debug_panicking_driver_call
@@ -66,12 +76,17 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::connect_launch,
         commands::save_session_as_profile,
         commands::disconnect,
+        commands::diagnostics_preview,
+        commands::set_verbose_diagnostics,
+        commands::verbose_diagnostics,
         commands::navigator_children,
+        commands::refresh_navigator,
         commands::browse,
         commands::open_browse_stream,
         commands::grant_stream_credit,
         commands::cancel_stream,
         commands::run_script,
+        commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file
     ]

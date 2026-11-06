@@ -80,6 +80,11 @@ export function navigatorChildren(
   return invoke<NavNode[]>("navigator_children", { sessionId, parent });
 }
 
+/** T-053: drop the core's navigator cache so the next expand re-reads it. */
+export function refreshNavigator(sessionId: string): Promise<void> {
+  return invoke("refresh_navigator", { sessionId });
+}
+
 export function browse(
   sessionId: string,
   request: BrowseRequest,
@@ -93,8 +98,16 @@ export interface ScriptRun {
   summary: string;
 }
 
-export function runScript(sessionId: string, script: string): Promise<ScriptRun> {
-  return invoke<ScriptRun>("run_script", { sessionId, script });
+export function runScript(sessionId: string, script: string, queryId?: string): Promise<ScriptRun> {
+  return invoke<ScriptRun>("run_script", { sessionId, script, queryId: queryId ?? null });
+}
+
+/**
+ * T-051: cancel a running query by the id it was started with. The server
+ * stops it; if it does not stop in time, its connection is dropped.
+ */
+export function cancelQuery(queryId: string): Promise<boolean> {
+  return invoke<boolean>("cancel_query", { queryId });
 }
 
 /** T-018: pull one oversized value on demand. */
@@ -124,7 +137,7 @@ export function saveValueToFile(
 export type StreamEvent =
   | { kind: "columns"; columns: ColumnDesc[] }
   | { kind: "rows"; seq: number; rows: WireValue[][] }
-  | { kind: "done"; rows: number; truncated: boolean }
+  | { kind: "done"; rows: number; truncated: boolean; page: import("./contract").PageInfo | null }
   | { kind: "cancelled" }
   | { kind: "timed_out" }
   | { kind: "error"; error: { message: string } };
@@ -178,4 +191,18 @@ export class RowStream {
     this.stopped = true;
     if (this.id !== null) void invoke("cancel_stream", { streamId: this.id }).catch(() => {});
   }
+}
+
+/** T-023: the exact text "copy diagnostics" will copy. */
+export function diagnosticsPreview(): Promise<string> {
+  return invoke<string>("diagnostics_preview");
+}
+
+/** T-023: the run-scoped verbose toggle (off at every launch). */
+export function setVerboseDiagnostics(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_verbose_diagnostics", { enabled });
+}
+
+export function verboseDiagnostics(): Promise<boolean> {
+  return invoke<boolean>("verbose_diagnostics");
 }

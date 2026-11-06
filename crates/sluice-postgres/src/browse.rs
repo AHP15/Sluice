@@ -34,6 +34,66 @@ pub struct CompiledBrowse {
     /// Projection index of the hidden `ctid`, when the relation has one.
     /// T-018 uses it to build a re-fetch handle for oversized values.
     pub ctid_idx: Option<usize>,
+    /// T-047: how this page was selected, and how to describe the next one.
+    pub paging: Paging,
+}
+
+/// What the catalog says about paging a relation (T-047).
+#[derive(Clone, Debug, Default)]
+pub struct KeyInfo {
+    /// Primary-key columns in key order; empty for views and keyless tables.
+    pub primary_key: Vec<String>,
+    /// Columns declared NOT NULL.
+    pub not_null: Vec<String>,
+}
+
+/// The pagination plan the compiler chose (T-047 / D-010).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Paging {
+    /// Ordered by `key` (the requested sort, then the primary key); each
+    /// entry is (column, descending).
+    Keyset { key: Vec<(String, bool)> },
+    Offset { reason: String, offset: u64 },
+}
+
+impl Paging {
+    /// The `PageInfo` for a page that returned `rows`, of which `last` is the
+    /// final row, against a `limit`.
+    pub fn page_info(
+        &self,
+        columns: &[ColumnPlan],
+        last: Option<&[WireValue]>,
+        rows: usize,
+        limit: u32,
+    ) -> sluice_core::PageInfo {
+        let full = rows as u64 >= u64::from(limit);
+        match self {
+            Paging::Keyset { key } => {
+                let next_cursor = full
+                    .then(|| last)
+                    .flatten()
+                    .and_then(|row| {
+                        key.iter()
+                            .map(|(col, _)| {
+                                let i = columns.iter().position(|c| &c.name == col)?;
+                                let v = row.get(i)?.clone();
+                                // A cursor value must bind back exactly;
+                                // a placeholder or a NULL cannot.
+                                (!matches!(v, WireValue::Oversized { .. } | WireValue::Null)).then_some(v)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    });
+                sluice_core::PageInfo::Keyset {
+                    key: key.iter().map(|(c, _)| c.clone()).collect(),
+                    next_cursor,
+                }
+            }
+            Paging::Offset { reason, offset } => sluice_core::PageInfo::Offset {
+                reason: reason.clone(),
+                next_offset: full.then(|| offset + rows as u64),
+            },
+        }
+    }
 }
 
 impl CompiledBrowse {
@@ -63,6 +123,7 @@ pub fn compile(
     req: &BrowseRequest,
     ceiling: i64,
     with_ctid: bool,
+    keys: &KeyInfo,
 ) -> Result<CompiledBrowse, DriverError> {
     let rel = qualified(relation)?;
 
@@ -117,26 +178,38 @@ pub fn compile(
         }
     }
 
-    // Keyset cursor. T-047/T-048 own the full multi-column keyset and its
-    // per-relation declaration; this is the single-key form the contract's
-    // `cursor` field already implies.
-    if let (Some(cursor), Some(first)) = (&req.cursor, req.sort.first()) {
-        if let Some(v) = cursor.first() {
-            let ty = lookup(columns, &first.column).ok_or_else(|| {
-                DriverError::new(
-                    ErrorKind::NotFound,
-                    format!("sort column `{}` not found in relation", first.column),
-                )
-            })?;
-            let op = if first.descending { "<" } else { ">" };
-            params.push(wire_to_text(v));
-            where_parts.push(format!(
-                "{} {} {}",
-                quote_ident(&first.column),
-                op,
-                typed_param(params.len(), ty)
+    for sk in &req.sort {
+        if lookup(columns, &sk.column).is_none() {
+            return Err(DriverError::new(
+                ErrorKind::NotFound,
+                format!("sort column `{}` not found in relation", sk.column),
             ));
         }
+    }
+
+    // T-047 / D-010: keyset on the primary key wherever it is sound; otherwise
+    // LIMIT/OFFSET, declared with the reason.
+    let paging = plan_paging(req, keys);
+    let order: Vec<(String, bool)> = match &paging {
+        Paging::Keyset { key } => key.clone(),
+        Paging::Offset { .. } => req.sort.iter().map(|s| (s.column.clone(), s.descending)).collect(),
+    };
+
+    match (&paging, &req.cursor) {
+        (Paging::Keyset { key }, Some(cursor)) => {
+            if cursor.len() != key.len() {
+                return Err(invalid(format!(
+                    "this relation pages on {} key column(s); the cursor has {}",
+                    key.len(),
+                    cursor.len()
+                )));
+            }
+            where_parts.push(keyset_predicate(key, cursor, columns, &mut params)?);
+        }
+        (Paging::Offset { .. }, Some(_)) => {
+            return Err(invalid("this relation pages by offset, not by keyset cursor".into()));
+        }
+        _ => {}
     }
 
     let mut sql = format!("SELECT {} FROM {}", select.join(", "), rel);
@@ -145,27 +218,83 @@ pub fn compile(
         sql.push_str(&where_parts.join(" AND "));
     }
 
-    if !req.sort.is_empty() {
-        let order: Vec<String> = req
-            .sort
+    if !order.is_empty() {
+        let order_sql: Vec<String> = order
             .iter()
-            .map(|s| {
-                format!(
-                    "{} {}",
-                    quote_ident(&s.column),
-                    if s.descending { "DESC" } else { "ASC" }
-                )
-            })
+            .map(|(c, desc)| format!("{} {}", quote_ident(c), if *desc { "DESC" } else { "ASC" }))
             .collect();
         sql.push_str(" ORDER BY ");
-        sql.push_str(&order.join(", "));
+        sql.push_str(&order_sql.join(", "));
     }
 
     // Bound in the SQL text rather than as a parameter: it is an integer the
     // compiler owns, never user text.
     sql.push_str(&format!(" LIMIT {}", req.limit.clamp(1, 100_000)));
+    if let Paging::Offset { offset, .. } = &paging {
+        if *offset > 0 {
+            sql.push_str(&format!(" OFFSET {offset}"));
+        }
+    }
 
-    Ok(CompiledBrowse { sql, params, columns: plans, ctid_idx })
+    Ok(CompiledBrowse { sql, params, columns: plans, ctid_idx, paging })
+}
+
+/// Keyset when the relation has a primary key and every requested sort column
+/// is NOT NULL; otherwise offset, with the reason the UI can show.
+fn plan_paging(req: &BrowseRequest, keys: &KeyInfo) -> Paging {
+    let offset = req.offset.unwrap_or(0);
+    if keys.primary_key.is_empty() {
+        return Paging::Offset {
+            reason: "the relation has no primary key (views and keyless tables page by offset)".into(),
+            offset,
+        };
+    }
+    // SQL's NULL ordering breaks the `>` comparisons a keyset relies on: rows
+    // with a NULL sort value would be skipped or repeated across pages.
+    if let Some(nullable) = req.sort.iter().find(|s| !keys.not_null.contains(&s.column)) {
+        return Paging::Offset {
+            reason: format!("sorting on `{}`, which can be NULL", nullable.column),
+            offset,
+        };
+    }
+    let mut key: Vec<(String, bool)> = req.sort.iter().map(|s| (s.column.clone(), s.descending)).collect();
+    for pk in &keys.primary_key {
+        if !key.iter().any(|(c, _)| c == pk) {
+            // The tiebreaker that makes the order total.
+            key.push((pk.clone(), false));
+        }
+    }
+    Paging::Keyset { key }
+}
+
+/// "After the cursor" in a mixed-direction total order, as an OR-chain:
+/// `(k1 > v1) OR (k1 = v1 AND k2 > v2) OR …`, with `<` for descending keys.
+/// A row-value comparison `(k1, k2) > (v1, v2)` is only correct when every key
+/// has the same direction, so the expanded form is used throughout.
+fn keyset_predicate(
+    key: &[(String, bool)],
+    cursor: &[WireValue],
+    columns: &[(String, Type)],
+    params: &mut Vec<Option<String>>,
+) -> Result<String, DriverError> {
+    let mut binds = Vec::with_capacity(key.len());
+    for ((col, _), v) in key.iter().zip(cursor) {
+        if matches!(v, WireValue::Null | WireValue::Missing | WireValue::Oversized { .. }) {
+            return Err(invalid(format!("cursor value for `{col}` cannot be bound")));
+        }
+        let ty = lookup(columns, col)
+            .ok_or_else(|| invalid(format!("key column `{col}` not found in relation")))?;
+        params.push(wire_to_text(v));
+        binds.push(typed_param(params.len(), ty));
+    }
+    let mut disjuncts = Vec::with_capacity(key.len());
+    for i in 0..key.len() {
+        let mut terms: Vec<String> = (0..i).map(|j| format!("{} = {}", quote_ident(&key[j].0), binds[j])).collect();
+        let op = if key[i].1 { "<" } else { ">" };
+        terms.push(format!("{} {op} {}", quote_ident(&key[i].0), binds[i]));
+        disjuncts.push(format!("({})", terms.join(" AND ")));
+    }
+    Ok(format!("({})", disjuncts.join(" OR ")))
 }
 
 fn placeholder(n: usize) -> String {
@@ -240,6 +369,23 @@ fn compile_predicate(
     })?;
     let col = quote_ident(&p.column);
 
+    // T-015 / R-009: the toggle exists for string operators on text columns.
+    // Anywhere else it is refused rather than silently ignored.
+    let fold = p.case_insensitive;
+    if fold {
+        let toggleable = matches!(p.op.as_str(), "eq" | "ne" | "in" | "contains" | "starts_with" | "ends_with");
+        if !toggleable {
+            return Err(invalid(format!("`{}` has no case-insensitive form", p.op)));
+        }
+        if crate::encode::type_class_for(ty) != sluice_core::TypeClass::Text {
+            return Err(invalid(format!(
+                "case-insensitive comparison applies to text columns; `{}` is {}",
+                p.column,
+                ty.name()
+            )));
+        }
+    }
+
     // Null tests take no parameter.
     match p.op.as_str() {
         "is_null" => return Ok(format!("{col} IS NULL")),
@@ -258,7 +404,19 @@ fn compile_predicate(
     };
 
     if let Some(op) = cmp {
+        // `col = NULL` is never true: a silently empty result, not an error the
+        // user would notice. D-005 has `is_null` for this; say so.
+        if matches!(p.value, WireValue::Null | WireValue::Missing) {
+            return Err(invalid(format!(
+                "`{}` cannot compare with NULL; use `is_null` or `is_not_null`",
+                p.op
+            )));
+        }
         params.push(wire_to_text(&p.value));
+        if fold {
+            // `lower()` on both sides: the toggle's meaning for `=`/`<>`.
+            return Ok(format!("lower(({col})::text) {op} lower(({})::text)", placeholder(params.len())));
+        }
         // `($1)::int4` makes PostgreSQL infer the PARAMETER as int4, so a text
         // value then fails to serialize. Going through ::text first pins the
         // parameter to text and lets the second cast do the conversion — which
@@ -267,9 +425,47 @@ fn compile_predicate(
     }
 
     match p.op.as_str() {
-        // R-009: Postgres `contains` is case-INSENSITIVE (ILIKE) and treats the
-        // needle literally. The Mongo driver was made to match this, and
-        // `FilterOpDecl::case_sensitive` declares it so the UI can say so.
+        // D-005: a list, each element bound and cast like any single value.
+        "in" => {
+            let items = non_null_items(p, "in")?;
+            if items.is_empty() {
+                // `col IN ()` is a syntax error; an empty list matches nothing.
+                return Ok("FALSE".to_string());
+            }
+            let mut binds = Vec::with_capacity(items.len());
+            for v in items {
+                params.push(wire_to_text(v));
+                binds.push(if fold {
+                    format!("lower(({})::text)", placeholder(params.len()))
+                } else {
+                    typed_param(params.len(), ty)
+                });
+            }
+            let lhs = if fold { format!("lower(({col})::text)") } else { col.clone() };
+            return Ok(format!("{lhs} IN ({})", binds.join(", ")));
+        }
+        "between" => {
+            let items = non_null_items(p, "between")?;
+            let [lo, hi] = items else {
+                return Err(invalid(format!(
+                    "`between` takes exactly two values, got {}",
+                    items.len()
+                )));
+            };
+            params.push(wire_to_text(lo));
+            let a = typed_param(params.len(), ty);
+            params.push(wire_to_text(hi));
+            let b = typed_param(params.len(), ty);
+            return Ok(format!("{col} BETWEEN {a} AND {b}"));
+        }
+        _ => {}
+    }
+
+    match p.op.as_str() {
+        // R-009: the needle always matches literally (`%`, `_` and the escape
+        // character are escaped, with an explicit ESCAPE clause). Case follows
+        // the engine — `LIKE` under the default collation, as the descriptor
+        // reports — unless the predicate asks for `ILIKE`.
         "contains" | "starts_with" | "ends_with" => {
             let needle = escape_like(&wire_to_text(&p.value).unwrap_or_default());
             let patterned = match p.op.as_str() {
@@ -278,8 +474,9 @@ fn compile_predicate(
                 _ => format!("%{needle}"),
             };
             params.push(Some(patterned));
+            let like = if fold { "ILIKE" } else { "LIKE" };
             Ok(format!(
-                "({col})::text ILIKE ({})::text ESCAPE '\\'",
+                "({col})::text {like} ({})::text ESCAPE '\\'",
                 placeholder(params.len())
             ))
         }
@@ -288,6 +485,22 @@ fn compile_predicate(
             format!("filter operator `{other}` is not declared by this driver"),
         )),
     }
+}
+
+/// The elements of a list-valued operator, refusing NULLs: `x IN (1, NULL)`
+/// never matches the NULL, which reads like a bug in the tool.
+fn non_null_items<'a>(p: &'a Predicate, op: &str) -> Result<&'a [WireValue], DriverError> {
+    let WireValue::Array(items) = &p.value else {
+        return Err(invalid(format!("`{op}` takes a list of values")));
+    };
+    if items.iter().any(|v| matches!(v, WireValue::Null | WireValue::Missing)) {
+        return Err(invalid(format!("`{op}` values cannot include NULL; combine with `is_null`")));
+    }
+    Ok(items)
+}
+
+fn invalid(msg: String) -> DriverError {
+    DriverError::new(ErrorKind::Unknown, msg)
 }
 
 /// Escape LIKE metacharacters so a needle containing `%` or `_` matches
@@ -345,13 +558,18 @@ mod tests {
         NodeId { kind: "table".into(), path: vec!["public".into(), "t".into()] }
     }
 
+    /// The test relation: primary key `id`; `id` and `big` NOT NULL.
+    fn keys() -> KeyInfo {
+        KeyInfo { primary_key: vec!["id".into()], not_null: vec!["id".into(), "big".into()] }
+    }
+
     fn req() -> BrowseRequest {
-        BrowseRequest { relation: rel(), filter: None, sort: vec![], limit: 50, cursor: None }
+        BrowseRequest { relation: rel(), filter: None, sort: vec![], limit: 50, cursor: None, offset: None }
     }
 
     #[test]
     fn projection_renders_non_native_columns_server_side() {
-        let c = compile(&rel(), &cols(), &req(), 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &req(), 1024, false, &keys()).unwrap();
         assert!(c.sql.contains("\"id\""), "{}", c.sql);
         assert!(c.sql.contains("(\"big\")::text"), "{}", c.sql);
         assert!(c.sql.contains("encode(\"blob\", 'base64')"), "{}", c.sql);
@@ -359,7 +577,7 @@ mod tests {
 
     #[test]
     fn size_capped_columns_get_a_companion_length_column() {
-        let c = compile(&rel(), &cols(), &req(), 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &req(), 1024, false, &keys()).unwrap();
         let name_plan = c.columns.iter().find(|p| p.name == "name").unwrap();
         let id_plan = c.columns.iter().find(|p| p.name == "id").unwrap();
         assert!(name_plan.len_idx.is_some(), "text needs a length column");
@@ -379,15 +597,108 @@ mod tests {
     #[test]
     fn filter_values_are_bound_not_interpolated() {
         let mut r = req();
-        r.filter = Some(FilterTree::Pred(Predicate {
+        r.filter = Some(FilterTree::Pred(Predicate { case_insensitive: false,
             column: "name".into(),
             op: "eq".into(),
             value: WireValue::Text("o'brien'; drop table t".into()),
         }));
-        let c = compile(&rel(), &cols(), &r, 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
         assert!(c.sql.contains("$1"), "{}", c.sql);
         assert!(!c.sql.contains("drop table"), "value must not reach the SQL text");
         assert_eq!(c.params[0].as_deref(), Some("o'brien'; drop table t"));
+    }
+
+    fn pred(column: &str, op: &str, value: WireValue) -> FilterTree {
+        FilterTree::Pred(Predicate { case_insensitive: false, column: column.into(), op: op.into(), value })
+    }
+
+    fn compile_filter_only(f: FilterTree) -> Result<CompiledBrowse, DriverError> {
+        let mut r = req();
+        r.filter = Some(f);
+        compile(&rel(), &cols(), &r, 1024, false, &keys())
+    }
+
+    const HOSTILE: &str = "o'brien'); drop table t; --";
+
+    fn hostile() -> WireValue {
+        WireValue::Text(HOSTILE.into())
+    }
+
+    /// T-013 / D-005: every core operator compiles, and no value ever reaches
+    /// the SQL text — a quote in a value must not silently change the query.
+    #[test]
+    fn every_core_operator_compiles_with_values_bound_not_interpolated() {
+        for op in sluice_core::CORE_FILTER_OPS {
+            let value = match *op {
+                "in" => WireValue::Array(vec![hostile(), WireValue::Text("b".into())]),
+                "between" => WireValue::Array(vec![WireValue::Text("a".into()), hostile()]),
+                "is_null" | "is_not_null" => WireValue::Null,
+                _ => hostile(),
+            };
+            let c = compile_filter_only(pred("name", op, value)).unwrap_or_else(|e| panic!("{op}: {e}"));
+            assert!(!c.sql.contains("drop table"), "{op}: value interpolated: {}", c.sql);
+            if !matches!(*op, "is_null" | "is_not_null") {
+                assert!(c.params.iter().any(|p| p.as_deref().is_some_and(|v| v.contains("o'brien"))), "{op}: value not bound");
+            }
+        }
+    }
+
+    #[test]
+    fn in_binds_each_element_with_the_column_cast() {
+        let c = compile_filter_only(pred(
+            "big",
+            "in",
+            WireValue::Array(vec![WireValue::Numeric("1".into()), WireValue::Numeric("9223372036854775807".into())]),
+        ))
+        .unwrap();
+        assert!(c.sql.contains("\"big\" IN (($1)::text::int8, ($2)::text::int8)"), "{}", c.sql);
+        assert_eq!(c.params.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_in_list_matches_nothing_rather_than_erroring() {
+        let c = compile_filter_only(pred("id", "in", WireValue::Array(vec![]))).unwrap();
+        assert!(c.sql.contains("WHERE FALSE"), "{}", c.sql);
+    }
+
+    #[test]
+    fn between_takes_exactly_two_values_inclusive() {
+        let c = compile_filter_only(pred(
+            "id",
+            "between",
+            WireValue::Array(vec![WireValue::Int(1), WireValue::Int(10)]),
+        ))
+        .unwrap();
+        assert!(c.sql.contains("\"id\" BETWEEN ($1)::text::int4 AND ($2)::text::int4"), "{}", c.sql);
+        for wrong in [vec![WireValue::Int(1)], vec![WireValue::Int(1), WireValue::Int(2), WireValue::Int(3)]] {
+            assert!(compile_filter_only(pred("id", "between", WireValue::Array(wrong))).is_err());
+        }
+    }
+
+    /// `col = NULL` is never true — refused, with the operator to use instead.
+    #[test]
+    fn comparing_with_null_is_refused_toward_is_null() {
+        let e = compile_filter_only(pred("id", "eq", WireValue::Null)).unwrap_err();
+        assert!(e.message.contains("is_null"), "{}", e.message);
+        assert!(compile_filter_only(pred("id", "in", WireValue::Array(vec![WireValue::Null]))).is_err());
+    }
+
+    /// D-005: the wire model carries an AND/OR tree, compiled with its grouping.
+    #[test]
+    fn a_nested_and_or_tree_keeps_its_grouping() {
+        let tree = FilterTree::Or(vec![
+            pred("id", "eq", WireValue::Int(1)),
+            FilterTree::And(vec![
+                pred("name", "starts_with", WireValue::Text("a".into())),
+                pred("big", "gt", WireValue::Numeric("5".into())),
+            ]),
+        ]);
+        let c = compile_filter_only(tree).unwrap();
+        assert!(
+            c.sql.contains("(\"id\" = ($1)::text::int4 OR ((\"name\")::text LIKE ($2)::text ESCAPE '\\' AND \"big\" > ($3)::text::int8))"),
+            "{}",
+            c.sql
+        );
     }
 
     /// T-068: bytea crosses as base64, so its parameter must be decoded, not
@@ -402,40 +713,62 @@ mod tests {
     #[test]
     fn exact_numeric_filters_are_cast_not_floated() {
         let mut r = req();
-        r.filter = Some(FilterTree::Pred(Predicate {
+        r.filter = Some(FilterTree::Pred(Predicate { case_insensitive: false,
             column: "big".into(),
             op: "eq".into(),
             value: WireValue::Numeric("9223372036854775807".into()),
         }));
-        let c = compile(&rel(), &cols(), &r, 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
         assert!(c.sql.contains("($1)::text::int8"), "{}", c.sql);
         assert_eq!(c.params[0].as_deref(), Some("9223372036854775807"));
     }
 
     #[test]
-    fn contains_is_case_insensitive_and_escapes_wildcards() {
+    fn contains_follows_the_engine_case_rules_and_escapes_wildcards() {
         let mut r = req();
         r.filter = Some(FilterTree::Pred(Predicate {
+            case_insensitive: false,
             column: "name".into(),
             op: "contains".into(),
             value: WireValue::Text("50%_off".into()),
         }));
-        let c = compile(&rel(), &cols(), &r, 1024, false).unwrap();
-        assert!(c.sql.contains("ILIKE"), "R-009: must match Mongo's declared behaviour");
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
+        // R-009: report the engine's semantics — LIKE — rather than override.
+        assert!(c.sql.contains("(\"name\")::text LIKE ($1)::text ESCAPE '\\'"), "{}", c.sql);
         assert_eq!(c.params[0].as_deref(), Some("%50\\%\\_off%"));
+    }
+
+    /// T-015: the explicit toggle, compiled the Postgres way per operator.
+    #[test]
+    fn the_case_insensitive_toggle_compiles_to_ilike_and_lower() {
+        let folded = |column: &str, op: &str, value: WireValue| {
+            let mut r = req();
+            r.filter = Some(FilterTree::Pred(Predicate { case_insensitive: true, column: column.into(), op: op.into(), value }));
+            compile(&rel(), &cols(), &r, 1024, false, &keys())
+        };
+        let c = folded("name", "starts_with", WireValue::Text("Al".into())).unwrap();
+        assert!(c.sql.contains("ILIKE"), "{}", c.sql);
+        let c = folded("name", "eq", WireValue::Text("ALICE".into())).unwrap();
+        assert!(c.sql.contains("lower((\"name\")::text) = lower(($1)::text)"), "{}", c.sql);
+        let c = folded("name", "in", WireValue::Array(vec![WireValue::Text("A".into())])).unwrap();
+        assert!(c.sql.contains("lower((\"name\")::text) IN (lower(($1)::text))"), "{}", c.sql);
+
+        // Refused, not silently ignored: a non-text column, a non-string operator.
+        assert!(folded("id", "eq", WireValue::Int(1)).unwrap_err().message.contains("text columns"));
+        assert!(folded("name", "gt", WireValue::Text("a".into())).unwrap_err().message.contains("no case-insensitive form"));
     }
 
     #[test]
     fn and_or_nesting_is_parenthesised() {
         let mut r = req();
         r.filter = Some(FilterTree::Or(vec![
-            FilterTree::Pred(Predicate { column: "id".into(), op: "gt".into(), value: WireValue::Int(1) }),
+            FilterTree::Pred(Predicate { case_insensitive: false, column: "id".into(), op: "gt".into(), value: WireValue::Int(1) }),
             FilterTree::And(vec![
-                FilterTree::Pred(Predicate { column: "id".into(), op: "lt".into(), value: WireValue::Int(9) }),
-                FilterTree::Pred(Predicate { column: "name".into(), op: "is_null".into(), value: WireValue::Null }),
+                FilterTree::Pred(Predicate { case_insensitive: false, column: "id".into(), op: "lt".into(), value: WireValue::Int(9) }),
+                FilterTree::Pred(Predicate { case_insensitive: false, column: "name".into(), op: "is_null".into(), value: WireValue::Null }),
             ]),
         ]));
-        let c = compile(&rel(), &cols(), &r, 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
         assert!(c.sql.contains(" OR "), "{}", c.sql);
         assert!(c.sql.contains(" AND "), "{}", c.sql);
         assert!(c.sql.contains("IS NULL"), "{}", c.sql);
@@ -444,12 +777,12 @@ mod tests {
     #[test]
     fn undeclared_operators_are_refused_rather_than_guessed() {
         let mut r = req();
-        r.filter = Some(FilterTree::Pred(Predicate {
+        r.filter = Some(FilterTree::Pred(Predicate { case_insensitive: false,
             column: "name".into(),
             op: "regex".into(),
             value: WireValue::Text("x".into()),
         }));
-        assert!(compile(&rel(), &cols(), &r, 1024, false).is_err());
+        assert!(compile(&rel(), &cols(), &r, 1024, false, &keys()).is_err());
     }
 
     #[test]
@@ -457,22 +790,108 @@ mod tests {
         let mut r = req();
         r.sort = vec![SortKey { column: "id".into(), descending: true }];
         r.cursor = Some(vec![WireValue::Int(100)]);
-        let c = compile(&rel(), &cols(), &r, 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
         assert!(c.sql.contains("\"id\" < ($1)::text::int4"), "{}", c.sql);
         assert!(c.sql.contains("ORDER BY \"id\" DESC"), "{}", c.sql);
+    }
+
+    fn sort(col: &str, desc: bool) -> SortKey {
+        SortKey { column: col.into(), descending: desc }
+    }
+
+    /// T-047: sorting by a non-key column appends the primary key, so the
+    /// order is total and equal sort values cannot straddle a page boundary.
+    #[test]
+    fn the_primary_key_is_appended_as_a_tiebreaker() {
+        let mut r = req();
+        r.sort = vec![sort("big", true)];
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
+        assert!(c.sql.contains("ORDER BY \"big\" DESC, \"id\" ASC"), "{}", c.sql);
+        assert_eq!(c.paging, Paging::Keyset { key: vec![("big".into(), true), ("id".into(), false)] });
+    }
+
+    /// Mixed directions need the expanded OR-chain; a row-value comparison
+    /// would be wrong.
+    #[test]
+    fn a_mixed_direction_cursor_compiles_to_an_or_chain() {
+        let mut r = req();
+        r.sort = vec![sort("big", true)];
+        r.cursor = Some(vec![WireValue::Numeric("50".into()), WireValue::Int(7)]);
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
+        assert!(
+            c.sql.contains(
+                "((\"big\" < ($1)::text::int8) OR (\"big\" = ($1)::text::int8 AND \"id\" > ($2)::text::int4))"
+            ),
+            "{}",
+            c.sql
+        );
+        assert_eq!(c.params, vec![Some("50".into()), Some("7".into())]);
+    }
+
+    #[test]
+    fn a_keyless_relation_pages_by_offset_and_says_why() {
+        let mut r = req();
+        r.offset = Some(150);
+        let c = compile(&rel(), &cols(), &r, 1024, false, &KeyInfo::default()).unwrap();
+        assert!(c.sql.ends_with("LIMIT 50 OFFSET 150"), "{}", c.sql);
+        let Paging::Offset { reason, offset } = &c.paging else { panic!("{:?}", c.paging) };
+        assert_eq!(*offset, 150);
+        assert!(reason.contains("no primary key"), "{reason}");
+    }
+
+    /// NULLs break keyset comparisons, so a nullable sort column falls back.
+    #[test]
+    fn sorting_on_a_nullable_column_falls_back_to_offset() {
+        let mut r = req();
+        r.sort = vec![sort("name", false)];
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
+        let Paging::Offset { reason, .. } = &c.paging else { panic!("{:?}", c.paging) };
+        assert!(reason.contains("`name`") && reason.contains("NULL"), "{reason}");
+        assert!(c.sql.contains("ORDER BY \"name\" ASC LIMIT"), "{}", c.sql);
+    }
+
+    #[test]
+    fn a_cursor_must_match_the_strategy_and_the_key() {
+        let mut r = req();
+        r.cursor = Some(vec![WireValue::Int(1), WireValue::Int(2)]);
+        assert!(compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap_err().message.contains("1 key column"));
+        r.cursor = Some(vec![WireValue::Int(1)]);
+        assert!(compile(&rel(), &cols(), &r, 1024, false, &KeyInfo::default()).unwrap_err().message.contains("offset"));
+    }
+
+    #[test]
+    fn page_info_gives_the_next_position_only_for_a_full_page() {
+        let c = compile(&rel(), &cols(), &req(), 1024, false, &keys()).unwrap();
+        let last = vec![WireValue::Int(42), WireValue::Numeric("9".into()), WireValue::Text("x".into()), WireValue::Null];
+        match c.paging.page_info(&c.columns, Some(&last), 50, 50) {
+            sluice_core::PageInfo::Keyset { key, next_cursor } => {
+                assert_eq!(key, vec!["id".to_string()]);
+                assert_eq!(next_cursor, Some(vec![WireValue::Int(42)]));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            c.paging.page_info(&c.columns, Some(&last), 10, 50),
+            sluice_core::PageInfo::Keyset { next_cursor: None, .. }
+        ));
+        let off = Paging::Offset { reason: "r".into(), offset: 100 };
+        assert!(matches!(
+            off.page_info(&c.columns, None, 50, 50),
+            sluice_core::PageInfo::Offset { next_offset: Some(150), .. }
+        ));
     }
 
     #[test]
     fn limit_is_clamped_not_trusted() {
         let mut r = req();
         r.limit = 10_000_000;
-        let c = compile(&rel(), &cols(), &r, 1024, false).unwrap();
+        let c = compile(&rel(), &cols(), &r, 1024, false, &keys()).unwrap();
         assert!(c.sql.contains("LIMIT 100000"), "{}", c.sql);
     }
 
     #[test]
     fn ctid_is_projected_first_when_requested() {
-        let c = compile(&rel(), &cols(), &req(), 1024, true).unwrap();
+        let c = compile(&rel(), &cols(), &req(), 1024, true, &keys()).unwrap();
         assert_eq!(c.ctid_idx, Some(0));
         assert!(c.sql.starts_with("SELECT ctid::text,"), "{}", c.sql);
         assert_eq!(c.columns[0].value_idx, 1, "value indices must shift past ctid");

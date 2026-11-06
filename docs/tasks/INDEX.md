@@ -10,9 +10,9 @@ T-009 | done | M | D-029 | Structured browse request compiled per driver | 2026-
 T-010 | done | M | D-029 | Statement-outcome sequence as the execution result envelope | 2026-08-03
 T-011 | done | M | D-029,R-040 | Dialect-aware script splitting used only for display attribution | 2026-08-03
 T-012 | done | M | D-029,R-041 | Transactional context on the execution result | 2026-08-03
-T-013 | todo | M | D-005 | Core filter operator set with AND/OR tree and type classes |
+T-013 | done | M | D-005 | Core filter operator set with AND/OR tree and type classes | 2026-11-06
 T-014 | todo | S | D-005 | Driver-declared filter extension operators |
-T-015 | todo | M | D-005,R-009 | Literal string matching and declared case-sensitivity for filters |
+T-015 | done | M | D-005,R-009 | Literal string matching and declared case-sensitivity for filters | 2026-11-06
 T-016 | done | L | D-006 | Lossless wire value encoding with per-column type descriptors | 2026-08-03
 T-017 | done | M | D-006,R-014 | Unknown type OID fallback so exotic types reach the UI as strings | 2026-08-03
 T-018 | done | M | D-006,R-008 | Per-value size ceiling with on-demand full-value fetch | 2026-08-03
@@ -20,8 +20,8 @@ T-019 | done | M | D-006,R-005 | String-preserving cell editors for exact numeri
 T-020 | done | M | D-007 | Keychain credential storage with a webview that never sees secrets | 2026-08-03
 T-021 | done | M | D-007 | TLS verification defaults and webview hardening | 2026-08-03
 T-022 | done | M | D-020,R-017 | Wrap credentials in Secret<String> at every parse boundary | 2026-08-03
-T-023 | todo | M | D-020 | Shape-only structured logging with verbose diagnostics behind a toggle |
-T-024 | todo | M | D-017,D-020,R-023 | Structural credential redaction across the full error chain |
+T-023 | done | M | D-020 | Shape-only structured logging with verbose diagnostics behind a toggle | 2026-11-06
+T-024 | done | M | D-017,D-020,R-023 | Structural credential redaction across the full error chain | 2026-11-06
 T-025 | todo | M | D-014,R-030 | Redact credential-bearing statements on the history and diagnostics paths |
 T-026 | done | M | D-012 | Context-aware launcher with a fixed argument grammar | 2026-11-06
 T-027 | done | M | D-012,R-002 | Ephemeral profile with conservative defaults for discovered connections | 2026-11-06
@@ -44,14 +44,14 @@ T-043 | todo | M | D-028,R-037 | Restrict LRU eviction to provably stateless tab
 T-044 | todo | M | D-028,R-038 | Reserve a browse floor inside the connection budget |
 T-045 | todo | S | D-028,R-039 | Three-valued session affinity capability |
 T-046 | done | S | R-039 | Spike: verify what mongodb ClientSession delivers for an editor tab | 2026-08-02
-T-047 | todo | L | D-010 | Keyset pagination with declared fallback strategy |
+T-047 | done | L | D-010 | Keyset pagination with declared fallback strategy | 2026-11-06
 T-048 | todo | M | D-010,R-010 | Per-relation keyset declaration accounting for composite key arity |
 T-049 | done | M | D-010,R-006 | Credit-based backpressure protocol for streamed row batches | 2026-11-06
-T-050 | todo | M | D-010,R-007,R-043 | Per-execution row and byte budget shared across the outcome sequence |
-T-051 | todo | M | D-010 | Real query cancellation and per-profile statement timeout |
+T-050 | done | M | D-010,R-007,R-043 | Per-execution row and byte budget shared across the outcome sequence | 2026-11-06
+T-051 | done | M | D-010 | Real query cancellation and per-profile statement timeout | 2026-11-06
 T-052 | todo | M | D-010,R-042 | Decouple socket draining from webview consumption with a spill buffer |
-T-053 | todo | L | D-016 | Native catalog introspection loaded lazily with explicit refresh |
-T-054 | todo | M | D-016 | Server version and flavour detection into the capability descriptor |
+T-053 | done | L | D-016 | Native catalog introspection loaded lazily with explicit refresh | 2026-11-06
+T-054 | done | M | D-016 | Server version and flavour detection into the capability descriptor | 2026-11-06
 T-055 | todo | M | D-016,R-028 | Probe catalog capabilities rather than trusting the version banner |
 T-056 | todo | L | D-027 | Staged edits applied in one transaction behind a unique-key gate |
 T-057 | todo | M | D-027,R-003 | Derive the edit preview from the same artifact that executes |
@@ -64,7 +64,7 @@ T-063 | todo | L | D-018 | Column derivation for schemaless collections |
 T-064 | todo | M | D-018,R-015 | Sample both ends of a collection and show inference coverage |
 T-065 | todo | M | D-018,D-029,R-025 | Declare sortability per relation and per path |
 T-066 | done | L | D-017 | Layered error model with normalized kind, hints, and verbatim payload | 2026-08-03
-T-067 | todo | M | D-021 | Unit tests over pure driver-independent logic |
+T-067 | done | M | D-021 | Unit tests over pure driver-independent logic | 2026-11-06
 T-068 | done | M | D-021,D-006 | Per-engine type-fidelity corpus with hostile edge values | 2026-11-06
 T-069 | done | M | D-021,R-018 | Run the type-fidelity corpus in CI against a service container | 2026-11-06
 T-070 | todo | M | D-021 | React component tests over the grid and filter bar |

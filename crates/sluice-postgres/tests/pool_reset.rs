@@ -22,6 +22,7 @@ fn spec() -> ConnectSpec {
         dbname: "sluice_dev".into(),
         tls: TlsMode::Disabled,
         application_name: "sluice-pool-tests".into(),
+        statement_timeout: None,
     }
 }
 
@@ -154,6 +155,7 @@ async fn browse_runs_through_the_lease() {
             sort: vec![],
             limit: 10,
             cursor: None,
+            offset: None,
         })
         .await
         .expect("browse");
@@ -169,6 +171,7 @@ fn browse_req(table: &str) -> BrowseRequest {
         sort: vec![],
         limit: 10,
         cursor: None,
+        offset: None,
     }
 }
 

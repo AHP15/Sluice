@@ -164,6 +164,145 @@ impl TxContext {
 pub struct ExecutionResult {
     pub outcomes: Vec<Outcome>,
     pub tx: TxContext,
+    /// T-047 / D-010: for a structured browse, how it paged and where the next
+    /// page starts. `None` for raw scripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageInfo>,
+    /// T-050: the execution's result budget and how much of it was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetReport>,
+}
+
+/// T-050 / R-007, R-043: what one execution may retain for display — rows
+/// *and* serialized bytes, whichever binds first — shared across every
+/// outcome of the sequence in order, not granted afresh per statement.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecBudget {
+    pub max_rows: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for ExecBudget {
+    /// D-010's 10k-row cap, now joined by a byte cap (R-007): 10,000 rows
+    /// of 1 MB documents is 10 GB, inside a row-only cap.
+    fn default() -> Self {
+        Self { max_rows: 10_000, max_bytes: 32 * 1024 * 1024 }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLimit {
+    Rows,
+    Bytes,
+}
+
+/// The budget's state after an execution, shown so the user can see which
+/// statement exhausted it (R-043).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetReport {
+    pub max_rows: u64,
+    pub max_bytes: u64,
+    pub used_rows: u64,
+    pub used_bytes: u64,
+    /// Which limit tripped, if one did.
+    pub exhausted_by: Option<BudgetLimit>,
+    /// Index into `outcomes` of the result that hit it.
+    pub exhausted_at: Option<u32>,
+}
+
+/// Meters rows against an [`ExecBudget`] as they arrive, so rows beyond it are
+/// dropped on the way in rather than materialized and then cut.
+#[derive(Debug, Clone)]
+pub struct BudgetMeter {
+    budget: ExecBudget,
+    used_rows: u64,
+    used_bytes: u64,
+    exhausted_by: Option<BudgetLimit>,
+    exhausted_at: Option<u32>,
+}
+
+impl BudgetMeter {
+    pub fn new(budget: ExecBudget) -> Self {
+        Self { budget, used_rows: 0, used_bytes: 0, exhausted_by: None, exhausted_at: None }
+    }
+
+    /// Whether a row costing `bytes` may be kept; `outcome` is the index of
+    /// the result it belongs to, recorded if this row is the one refused.
+    pub fn admit(&mut self, bytes: u64, outcome: u32) -> bool {
+        if self.exhausted_by.is_some() {
+            return false;
+        }
+        let limit = if self.used_rows + 1 > self.budget.max_rows {
+            Some(BudgetLimit::Rows)
+        } else if self.used_bytes + bytes > self.budget.max_bytes {
+            Some(BudgetLimit::Bytes)
+        } else {
+            None
+        };
+        match limit {
+            Some(l) => {
+                self.exhausted_by = Some(l);
+                self.exhausted_at = Some(outcome);
+                false
+            }
+            None => {
+                self.used_rows += 1;
+                self.used_bytes += bytes;
+                true
+            }
+        }
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.exhausted_by.is_some()
+    }
+
+    pub fn report(&self) -> BudgetReport {
+        BudgetReport {
+            max_rows: self.budget.max_rows,
+            max_bytes: self.budget.max_bytes,
+            used_rows: self.used_rows,
+            used_bytes: self.used_bytes,
+            exhausted_by: self.exhausted_by,
+            exhausted_at: self.exhausted_at,
+        }
+    }
+}
+
+/// Approximate serialized size of a row as the webview receives it: each
+/// value's payload plus its `{"t":…,"v":…}` envelope. An estimate is enough —
+/// the budget bounds memory, it does not account it to the byte.
+pub fn row_cost(row: &[WireValue]) -> u64 {
+    row.iter()
+        .map(|v| match v {
+            WireValue::Null | WireValue::Missing => 12,
+            WireValue::Bool(_) | WireValue::Int(_) | WireValue::Float(_) => 32,
+            WireValue::Numeric(s) | WireValue::Text(s) | WireValue::Bytes(s) | WireValue::Timestamp(s)
+            | WireValue::Uuid(s) => 20 + s.len() as u64,
+            WireValue::Opaque { rendered, type_name } | WireValue::Unsupported { rendered, type_name } => {
+                40 + rendered.len() as u64 + type_name.len() as u64
+            }
+            WireValue::Oversized { type_name, .. } => 80 + type_name.len() as u64,
+            WireValue::Document(fields) => {
+                20 + fields.iter().map(|(k, v)| k.len() as u64 + row_cost(std::slice::from_ref(v))).sum::<u64>()
+            }
+            WireValue::Array(items) => 20 + row_cost(items),
+        })
+        .sum()
+}
+
+/// How a browse paginated, declared by the driver (T-047 / D-010).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum PageInfo {
+    /// Keyset on `key` (the requested sort, then the primary key as a
+    /// tiebreaker). Pass `next_cursor` as the next request's `cursor`.
+    Keyset { key: Vec<String>, next_cursor: Option<Vec<WireValue>> },
+    /// LIMIT/OFFSET, and why keyset was not possible. Pass `next_offset` as
+    /// the next request's `offset`. Pages can shift if rows change between
+    /// requests — the reason keyset is preferred.
+    Offset { reason: String, next_offset: Option<u64> },
 }
 
 impl ExecutionResult {
@@ -175,6 +314,8 @@ impl ExecutionResult {
                 body: OutcomeBody::Rows { columns, rows, truncated },
             }],
             tx: TxContext::autocommit(),
+            page: None,
+            budget: None,
         }
     }
 
@@ -195,7 +336,26 @@ impl ExecutionResult {
     /// renderable and should fail loudly in development": a rolled-back
     /// disposition that does not name what it undid trips a debug assertion
     /// rather than rendering an ambiguous line.
+    /// The one-line summary, plus the result budget's state when it bound
+    /// (T-050 / R-043): which statement exhausted it, and on what.
     pub fn summary(&self) -> String {
+        let base = self.summary_core();
+        match self.budget.and_then(|b| b.exhausted_by.map(|l| (b, l))) {
+            Some((b, limit)) => {
+                let which = b.exhausted_at.map(|i| format!(" at result {}", i + 1)).unwrap_or_default();
+                let cap = match limit {
+                    BudgetLimit::Rows => format!("{} rows", b.max_rows),
+                    BudgetLimit::Bytes => format!("{} MiB", b.max_bytes / (1024 * 1024)),
+                };
+                format!(
+                    "{base}; display limit of {cap} reached{which} — later rows not shown (export to file for all of them)"
+                )
+            }
+            None => base,
+        }
+    }
+
+    fn summary_core(&self) -> String {
         let failed: Vec<u32> = self
             .outcomes
             .iter()
@@ -303,6 +463,31 @@ fn fmt_range(a: u32, b: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-050: the budget is shared across the sequence, in order, and
+    /// whichever of rows or bytes binds first trips it.
+    #[test]
+    fn the_budget_binds_on_rows_or_bytes_across_outcomes() {
+        let mut m = BudgetMeter::new(ExecBudget { max_rows: 3, max_bytes: 1_000 });
+        assert!(m.admit(10, 0) && m.admit(10, 0));
+        assert!(m.admit(10, 1), "the budget carries across outcomes");
+        assert!(!m.admit(10, 1), "the fourth row exceeds max_rows");
+        let r = m.report();
+        assert_eq!((r.used_rows, r.exhausted_by, r.exhausted_at), (3, Some(BudgetLimit::Rows), Some(1)));
+        assert!(!m.admit(1, 2), "once spent, nothing more is admitted");
+
+        let mut b = BudgetMeter::new(ExecBudget { max_rows: 100, max_bytes: 25 });
+        assert!(b.admit(20, 0));
+        assert!(!b.admit(20, 0));
+        assert_eq!(b.report().exhausted_by, Some(BudgetLimit::Bytes));
+    }
+
+    #[test]
+    fn row_cost_grows_with_payload() {
+        let small = row_cost(&[WireValue::Text("a".into())]);
+        let big = row_cost(&[WireValue::Text("a".repeat(10_000))]);
+        assert!(big > small + 9_000);
+    }
     use crate::error::ErrorKind;
 
     fn ok_outcome(ordinal: u32) -> Outcome {
@@ -338,6 +523,8 @@ mod tests {
                 mode: TxMode::ImplicitSingle,
                 disposition: TxDisposition::RolledBack { rolled_back: vec![0, 1] },
             },
+            page: None,
+            budget: None,
         };
         let committed = ExecutionResult {
             outcomes,
@@ -345,6 +532,8 @@ mod tests {
                 mode: TxMode::AutocommitPerStatement,
                 disposition: TxDisposition::Committed,
             },
+            page: None,
+            budget: None,
         };
 
         assert_eq!(rolled.summary(), "statement 3 failed; statements 1-2 rolled back");
@@ -370,6 +559,8 @@ mod tests {
                 },
             ],
             tx: TxContext::autocommit(),
+            page: None,
+            budget: None,
         };
         assert!(r.summary().contains("cancelled"));
         assert!(!r.summary().contains("failed"), "summary: {}", r.summary());

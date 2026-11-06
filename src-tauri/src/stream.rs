@@ -110,7 +110,8 @@ impl CreditGate {
 pub enum StreamEvent {
     Columns { columns: Vec<ColumnDesc> },
     Rows { seq: u64, rows: Vec<Vec<WireValue>> },
-    Done { rows: usize, truncated: bool },
+    /// T-047: `page` is the strategy used and where the next page starts.
+    Done { rows: usize, truncated: bool, page: Option<sluice_core::PageInfo> },
     Cancelled,
     TimedOut,
     Error { error: DriverError },
@@ -228,6 +229,7 @@ mod tests {
             dbname: "sluice_dev".into(),
             tls: TlsMode::Disabled,
             application_name: "sluice-stream-test".into(),
+            statement_timeout: None,
         };
         let Ok(d) = PgDriver::connect(spec).await else {
             eprintln!("SKIP: no Postgres reachable");
@@ -252,6 +254,7 @@ mod tests {
                         sort: vec![],
                         limit: 5000,
                         cursor: None,
+                        offset: None,
                     },
                     BATCH_ROWS,
                     move |b| {
@@ -295,6 +298,7 @@ mod tests {
             sort: vec![],
             limit: 3,
             cursor: None,
+            offset: None,
         });
         assert_eq!(again.await.unwrap().first_rows().unwrap().1.len(), 3);
     }

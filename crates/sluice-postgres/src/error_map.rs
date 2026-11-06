@@ -4,6 +4,7 @@
 //! error becomes the three-layer model, including the position conversion.
 
 use sluice_core::error::{position_from_1based_chars, DriverError, EnginePayload, ErrorHints, ErrorKind};
+use sluice_core::redact_shapes;
 use tokio_postgres::error::{DbError, ErrorPosition, SqlState};
 
 /// Map a Postgres error, using the submitted statement text to resolve the
@@ -18,13 +19,42 @@ pub fn map_error(err: &tokio_postgres::Error, statement: Option<&str>) -> Driver
         } else {
             ErrorKind::ConnectionFailed
         };
-        return DriverError::new(kind, redactable(&msg)).with_payload(EnginePayload {
-            message: Some(msg),
+        // T-024: the whole `source()` chain is recorded, so the redaction pass
+        // (and the user) can see every layer — a TLS or DNS error often names
+        // the target only in an inner cause.
+        let mut extra = Vec::new();
+        let mut cause = std::error::Error::source(err);
+        let mut n = 1;
+        while let Some(c) = cause {
+            extra.push((format!("cause.{n}"), redact_shapes(&c.to_string())));
+            cause = c.source();
+            n += 1;
+        }
+        // A TLS-required connection to a server without TLS. Since TLS modes
+        // stopped falling back to plaintext, this is what a local `.env` URL
+        // without `sslmode` meets first — so say what happened and the fix.
+        let msg_display = if extra.iter().any(|(_, v)| v.contains("server does not support TLS")) {
+            "the server does not support TLS, and this connection requires it. For a local \
+             development server, add `sslmode=disable` to the connection URL."
+                .to_string()
+        } else {
+            redact_shapes(&msg)
+        };
+        // Shape redaction here; the driver's `Redactor` adds the session's
+        // known password, in every encoding, on top (T-024 / R-023).
+        return DriverError::new(kind, msg_display).with_payload(EnginePayload {
+            message: Some(redact_shapes(&msg)),
+            extra,
             ..Default::default()
         });
     };
 
-    let kind = kind_for(db.code());
+    let mut kind = kind_for(db.code());
+    // T-051: 57014 is both a user cancel and a statement timeout; only the
+    // message tells them apart, and the UI words them differently.
+    if kind == ErrorKind::Cancelled && db.message().contains("statement timeout") {
+        kind = ErrorKind::Timeout;
+    }
 
     let hints = ErrorHints {
         position: statement.and_then(|sql| position_hint(db, sql)),
@@ -37,13 +67,13 @@ pub fn map_error(err: &tokio_postgres::Error, statement: Option<&str>) -> Driver
 
     let mut extra: Vec<(String, String)> = Vec::new();
     if let Some(d) = db.detail() {
-        extra.push(("detail".into(), d.to_string()));
+        extra.push(("detail".into(), redact_shapes(d)));
     }
     if let Some(h) = db.hint() {
-        extra.push(("hint".into(), h.to_string()));
+        extra.push(("hint".into(), redact_shapes(h)));
     }
     if let Some(w) = db.where_() {
-        extra.push(("where".into(), w.to_string()));
+        extra.push(("where".into(), redact_shapes(w)));
     }
     if let Some(r) = db.routine() {
         extra.push(("routine".into(), r.to_string()));
@@ -51,43 +81,14 @@ pub fn map_error(err: &tokio_postgres::Error, statement: Option<&str>) -> Driver
 
     let payload = EnginePayload {
         code: Some(db.code().code().to_string()),
-        message: Some(db.message().to_string()),
+        message: Some(redact_shapes(db.message())),
         severity: Some(db.severity().to_string()),
         extra,
     };
 
-    DriverError::new(kind, redactable(db.message()))
+    DriverError::new(kind, redact_shapes(db.message()))
         .with_hints(hints)
         .with_payload(payload)
-}
-
-/// D-017 requires credentials redacted before an error leaves the core, because
-/// connection failures routinely embed the whole connection string.
-///
-/// This is a deliberately minimal stopgap: **T-024 owns real structural
-/// redaction**, and R-023 already records that substring matching fails on
-/// URL-encoded or split password forms. Kept here so the driver is not a hole in
-/// the meantime, and marked so T-024 replaces rather than supplements it.
-fn redactable(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    while let Some(at) = rest.find("://") {
-        let (head, tail) = rest.split_at(at + 3);
-        out.push_str(head);
-        match tail.find('@').map(|i| (i, tail.split_at(i))) {
-            Some((_, (creds, after))) if !creds.contains(' ') && creds.contains(':') => {
-                let user = creds.split(':').next().unwrap_or("");
-                out.push_str(user);
-                out.push_str(":***");
-                rest = after;
-            }
-            _ => {
-                rest = tail;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 fn position_hint(db: &DbError, sql: &str) -> Option<sluice_core::QueryPosition> {
@@ -175,15 +176,15 @@ mod tests {
     #[test]
     fn connection_strings_are_redacted_before_leaving_the_driver() {
         let msg = "could not connect to postgres://admin:hunter2@db.internal:5432/prod";
-        let out = redactable(msg);
+        let out = redact_shapes(msg);
         assert!(!out.contains("hunter2"), "{out}");
-        assert!(out.contains("admin:***"), "{out}");
+        assert!(out.contains("admin:[redacted]"), "{out}");
         assert!(out.contains("db.internal"), "host should survive: {out}");
     }
 
     #[test]
     fn redaction_leaves_ordinary_messages_alone() {
         let msg = "syntax error at or near \"slect\"";
-        assert_eq!(redactable(msg), msg);
+        assert_eq!(redact_shapes(msg), msg);
     }
 }

@@ -10,6 +10,7 @@ pub mod error_map;
 pub mod lease;
 pub mod navigator;
 pub mod tls;
+pub mod version;
 
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ use tokio_postgres::SimpleQueryMessage;
 
 use crate::encode::DEFAULT_VALUE_CEILING;
 use crate::lease::{Lease, PoolStats, PoolStatsSnapshot};
+pub use crate::lease::CancelSlot;
 use crate::tls::TlsMode;
 
 /// Everything needed to open a connection.
@@ -49,6 +51,11 @@ pub struct ConnectSpec {
     pub dbname: String,
     pub tls: TlsMode,
     pub application_name: String,
+    /// T-051 / D-010: the profile's statement timeout, enforced **by the
+    /// server** for every statement on every pooled connection. Sent as a
+    /// startup option, so `DISCARD ALL` (which resets to startup values)
+    /// cannot clear it. `None` leaves the server's own setting.
+    pub statement_timeout: Option<std::time::Duration>,
 }
 
 impl Default for ConnectSpec {
@@ -61,6 +68,7 @@ impl Default for ConnectSpec {
             dbname: "postgres".into(),
             tls: TlsMode::default(),
             application_name: "sluice".into(),
+            statement_timeout: None,
         }
     }
 }
@@ -74,24 +82,43 @@ pub enum BrowseBatch {
 }
 
 /// How a streamed browse ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BrowseStreamEnd {
     pub rows: usize,
     /// The request's `limit` was reached (more rows may exist).
     pub truncated: bool,
     /// The consumer stopped it (cancel, timeout, or a closed channel).
     pub stopped: bool,
+    /// T-047: the strategy used and the next page's position (unstopped only).
+    pub page: Option<sluice_core::PageInfo>,
 }
 
 pub struct PgDriver {
     pool: Pool,
     ceiling: i64,
-    server_version: Option<String>,
+    /// T-054 / D-016: flavour and versions parsed from `version()` at connect;
+    /// catalog queries and features gate on it.
+    server: Option<version::ServerInfo>,
     tls: TlsMode,
     /// D-028: how a released connection is made clean. Postgres has
     /// `DISCARD ALL`, so `Native`; overridable for tests of the other paths.
     reset: ResetSupport,
     stats: Arc<PoolStats>,
+    /// T-024 / R-023: this connection's password, kept **only** to redact it
+    /// from every error the driver returns, in every encoding.
+    redactor: sluice_core::Redactor,
+    /// T-015: the database's default collation and whether it is
+    /// deterministic, read at connect. Deterministic means `=` and `LIKE`
+    /// distinguish case — the semantics the filter bar reports.
+    collation: Option<(String, bool)>,
+    /// T-053 / D-016: one level of the navigator tree per parent, filled on
+    /// first expand and kept until DDL the app ran, or an explicit refresh.
+    /// Shared across `with_*` copies, like the pool.
+    nav_cache: Arc<std::sync::Mutex<std::collections::HashMap<Option<NodeId>, Vec<NavNode>>>>,
+    /// T-051: set on a per-call copy (`with_cancel`), never on the shared driver.
+    cancel: Option<CancelSlot>,
+    /// T-050: what one raw execution may retain for display.
+    budget: sluice_core::ExecBudget,
 }
 
 impl PgDriver {
@@ -113,12 +140,25 @@ impl PgDriver {
             .user(&spec.user)
             .dbname(&spec.dbname)
             .application_name(&spec.application_name);
+        if let Some(t) = spec.statement_timeout {
+            cfg.options(&format!("-c statement_timeout={}", t.as_millis().max(1)));
+        }
         if let Some(pw) = &spec.password {
             // The one place the plaintext is legitimately needed: handing it to
             // the wire protocol. `tokio_postgres::Config` keeps it internally
             // and its own `Debug` masks it.
             cfg.password(pw.expose());
         }
+
+        // D-007 / T-021: a TLS mode must be *required*, not preferred.
+        // tokio-postgres defaults to `Prefer`, which silently falls back to
+        // plaintext when the server offers no TLS — so `Verify` used to connect
+        // unencrypted to a TLS-less server, and an on-path attacker could strip
+        // TLS from any connection. Found by T-024's redaction corpus.
+        cfg.ssl_mode(match spec.tls {
+            TlsMode::Disabled => tokio_postgres::config::SslMode::Disable,
+            TlsMode::Verify | TlsMode::AcceptInvalidCerts => tokio_postgres::config::SslMode::Require,
+        });
 
         let mgr_cfg = ManagerConfig { recycling_method: RecyclingMethod::Fast };
 
@@ -141,15 +181,22 @@ impl PgDriver {
         let driver = Self {
             pool,
             ceiling: DEFAULT_VALUE_CEILING,
-            server_version: None,
+            server: None,
             tls: spec.tls,
             reset: ResetSupport::Native,
             stats: Arc::new(PoolStats::default()),
+            redactor: sluice_core::Redactor::new(spec.password.clone()),
+            collation: None,
+            nav_cache: Arc::default(),
+            cancel: None,
+            budget: sluice_core::ExecBudget::default(),
         };
 
         // Prove the credentials work now rather than on first browse, and pick
         // up the version banner while we are here (T-054 refines this).
-        let version = driver
+        // T-054: the banner first — what answers decides which catalog
+        // queries are safe to run at all.
+        let banner = driver
             .with_lease(false, async |client: &tokio_postgres::Client| {
                 let row = client
                     .query_one("select version()", &[])
@@ -158,18 +205,48 @@ impl PgDriver {
                 Ok(row.get::<_, String>(0))
             })
             .await?;
+        let server = version::parse(&banner);
 
-        Ok(Arc::new(Self { server_version: Some(version), ..driver }))
+        // T-015: the default collation and its determinism — gated, because
+        // `collisdeterministic` only exists on PostgreSQL 12+ catalogs.
+        let collation = if server.has_collation_determinism() {
+            let c = driver
+                .with_lease(false, async |client: &tokio_postgres::Client| {
+                    let row = client
+                        .query_one(
+                            "select (select datcollate from pg_database where datname = current_database()), \
+                                    coalesce((select collisdeterministic from pg_collation where collname = 'default'), true)",
+                            &[],
+                        )
+                        .await
+                        .map_err(|e| error_map::map_error(&e, None))?;
+                    Ok((row.get::<_, String>(0), row.get::<_, bool>(1)))
+                })
+                .await?;
+            Some(c)
+        } else {
+            None
+        };
+
+        // D-028: no `DISCARD ALL` means no native reset — reopen instead.
+        let reset = if server.has_discard_all() { ResetSupport::Native } else { ResetSupport::ReopenOnly };
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
         Arc::new(Self {
             pool: self.pool.clone(),
             ceiling,
-            server_version: self.server_version.clone(),
+            server: self.server.clone(),
             tls: self.tls,
             reset: self.reset,
             stats: self.stats.clone(),
+            redactor: self.redactor.clone(),
+            collation: self.collation.clone(),
+            nav_cache: self.nav_cache.clone(),
+            cancel: self.cancel.clone(),
+            budget: self.budget,
         })
     }
 
@@ -180,10 +257,15 @@ impl PgDriver {
         Arc::new(Self {
             pool: self.pool.clone(),
             ceiling: self.ceiling,
-            server_version: self.server_version.clone(),
+            server: self.server.clone(),
             tls: self.tls,
             reset,
             stats: self.stats.clone(),
+            redactor: self.redactor.clone(),
+            collation: self.collation.clone(),
+            nav_cache: self.nav_cache.clone(),
+            cancel: self.cancel.clone(),
+            budget: self.budget,
         })
     }
 
@@ -374,7 +456,28 @@ impl PgDriver {
         // `ctid` exists on physical tables only; T-018 uses it to build
         // re-fetch handles for oversized values.
         let with_ctid = request.relation.kind == "table";
-        browse::compile(&request.relation, &columns, request, self.ceiling, with_ctid)
+        // T-047: what the catalog says about paging this relation. The
+        // primary key in key order and the NOT NULL columns; a view has none.
+        let keys = if with_ctid {
+            const PK: &str = "
+                SELECT a.attname
+                FROM pg_index x
+                JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = ANY(x.indkey)
+                WHERE x.indrelid = to_regclass($1) AND x.indisprimary
+                ORDER BY array_position(x.indkey::int2[], a.attnum)";
+            const NOT_NULL: &str = "
+                SELECT attname FROM pg_attribute
+                WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped AND attnotnull";
+            let pk = client.query(PK, &[&rel]).await.map_err(|e| error_map::map_error(&e, Some(PK)))?;
+            let nn = client.query(NOT_NULL, &[&rel]).await.map_err(|e| error_map::map_error(&e, Some(NOT_NULL)))?;
+            browse::KeyInfo {
+                primary_key: pk.iter().map(|r| r.get(0)).collect(),
+                not_null: nn.iter().map(|r| r.get(0)).collect(),
+            }
+        } else {
+            browse::KeyInfo::default()
+        };
+        browse::compile(&request.relation, &columns, request, self.ceiling, with_ctid, &keys)
     }
 
     fn decode_row(
@@ -426,7 +529,7 @@ impl PgDriver {
         self.with_lease(false, async |client: &tokio_postgres::Client| {
             let compiled = self.compile_browse(client, &request).await?;
             if !emit(BrowseBatch::Columns(compiled.column_descs())).await {
-                return Ok(BrowseStreamEnd { rows: 0, truncated: false, stopped: true });
+                return Ok(BrowseStreamEnd { rows: 0, truncated: false, stopped: true, page: None });
             }
 
             let cancel = client.cancel_token();
@@ -437,18 +540,21 @@ impl PgDriver {
             let mut stream = std::pin::pin!(stream);
 
             let mut sent = 0usize;
+            let mut last: Option<Vec<WireValue>> = None;
             let mut batch: Vec<Vec<WireValue>> = Vec::with_capacity(batch_rows);
             while let Some(row) = stream
                 .try_next()
                 .await
                 .map_err(|e| error_map::map_error(&e, Some(&compiled.sql)))?
             {
-                batch.push(self.decode_row(&compiled, &row, &request.relation)?);
+                let decoded = self.decode_row(&compiled, &row, &request.relation)?;
+                last = Some(decoded.clone());
+                batch.push(decoded);
                 if batch.len() == batch_rows {
                     let n = batch.len();
                     if !emit(BrowseBatch::Rows(std::mem::take(&mut batch))).await {
                         self.send_cancel(&cancel).await;
-                        return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true });
+                        return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true, page: None });
                     }
                     // Counted only once accepted: a batch refused at cancel was
                     // never delivered.
@@ -458,7 +564,7 @@ impl PgDriver {
             if !batch.is_empty() {
                 let n = batch.len();
                 if !emit(BrowseBatch::Rows(batch)).await {
-                    return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true });
+                    return Ok(BrowseStreamEnd { rows: sent, truncated: false, stopped: true, page: None });
                 }
                 sent += n;
             }
@@ -466,6 +572,7 @@ impl PgDriver {
                 rows: sent,
                 truncated: sent as u32 >= request.limit,
                 stopped: false,
+                page: Some(compiled.paging.page_info(&compiled.columns, last.as_deref(), sent, request.limit)),
             })
         })
         .await
@@ -475,14 +582,19 @@ impl PgDriver {
     /// server). Best effort: if it fails, the query still ends when the
     /// abandoned stream is drained, so this only bounds wasted server work.
     async fn send_cancel(&self, token: &tokio_postgres::CancelToken) {
-        let _ = if self.tls == TlsMode::Disabled {
+        let _ = self.send_cancel_checked(token).await;
+    }
+
+    async fn send_cancel_checked(&self, token: &tokio_postgres::CancelToken) -> bool {
+        let r = if self.tls == TlsMode::Disabled {
             token.cancel_query(tokio_postgres::NoTls).await
         } else {
             match tls::client_config(self.tls) {
                 Ok(cfg) => token.cancel_query(tokio_postgres_rustls::MakeRustlsConnect::new(cfg)).await,
-                Err(_) => return,
+                Err(_) => return false,
             }
         };
+        r.is_ok()
     }
 
     /// Run `f` on a leased connection, then release it through the declared
@@ -501,13 +613,98 @@ impl PgDriver {
         dirty: bool,
         f: impl AsyncFnOnce(&tokio_postgres::Client) -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
-        let mut lease = Lease::acquire(&self.pool, self.reset, self.stats.clone()).await?;
-        if dirty {
-            lease.mark_dirty();
+        let out = async {
+            let mut lease = Lease::acquire(&self.pool, self.reset, self.stats.clone()).await?;
+            if dirty {
+                lease.mark_dirty();
+            }
+            // T-051: register this connection's cancel token; a slot already
+            // cancelled refuses to start, closing the cancel-before-start race.
+            if let Some(slot) = &self.cancel {
+                if !slot.arm(lease.client().cancel_token()) {
+                    lease.release().await;
+                    return Err(DriverError::new(ErrorKind::Cancelled, "cancelled before it started"));
+                }
+            }
+            let out = f(lease.client()).await;
+            if let Some(slot) = &self.cancel {
+                slot.disarm();
+                // A cancelled statement can leave an aborted transaction; the
+                // reset path (ROLLBACK, DISCARD ALL) must run on release.
+                if slot.is_cancelled() {
+                    lease.mark_dirty();
+                }
+            }
+            lease.release().await;
+            out
         }
-        let out = f(lease.client()).await;
-        lease.release().await;
-        out
+        .await;
+        // T-024: every error leaving a lease — including a pool-acquire error,
+        // which can carry a reconnect failure's text — is redacted here.
+        out.map_err(|e| self.redactor.error(e))
+    }
+
+    fn redact_outcomes(&self, mut r: ExecutionResult) -> ExecutionResult {
+        for o in r.outcomes.iter_mut() {
+            if let OutcomeBody::Error { error } = &mut o.body {
+                *error = self.redactor.error(error.clone());
+            }
+        }
+        r
+    }
+
+    /// The redactor for this connection's credentials, for callers that hold
+    /// errors the driver did not produce (a caught panic, say).
+    pub fn redactor(&self) -> &sluice_core::Redactor {
+        &self.redactor
+    }
+
+    /// T-050: a copy with a different per-execution result budget.
+    pub fn with_budget(self: Arc<Self>, budget: sluice_core::ExecBudget) -> Arc<Self> {
+        let mut copy = self.clone_inner();
+        copy.budget = budget;
+        Arc::new(copy)
+    }
+
+    /// T-051: a copy of this driver whose calls register with `slot`, so the
+    /// query they run can be cancelled server-side via [`PgDriver::cancel`].
+    pub fn with_cancel(self: Arc<Self>, slot: CancelSlot) -> Arc<Self> {
+        let mut copy = self.clone_inner();
+        copy.cancel = Some(slot);
+        Arc::new(copy)
+    }
+
+    fn clone_inner(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            ceiling: self.ceiling,
+            server: self.server.clone(),
+            tls: self.tls,
+            reset: self.reset,
+            stats: self.stats.clone(),
+            redactor: self.redactor.clone(),
+            collation: self.collation.clone(),
+            nav_cache: self.nav_cache.clone(),
+            cancel: self.cancel.clone(),
+            budget: self.budget,
+        }
+    }
+
+    /// T-051 / D-010: cancel the query registered in `slot` with the protocol
+    /// cancel request, which stops it **on the server**. Returns whether a
+    /// request was sent; `false` means nothing was running (and nothing will
+    /// start on that slot now) or the request could not be delivered.
+    pub async fn cancel(&self, slot: &CancelSlot) -> bool {
+        match slot.trip() {
+            Some(token) => self.send_cancel_checked(&token).await,
+            None => false,
+        }
+    }
+
+    /// T-053 / D-016: drop the navigator cache. External DDL is undetectable
+    /// without polling, so refresh is the contract, not a fallback.
+    pub fn refresh_catalog(&self) {
+        self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Release counters for this driver's pool (T-040).
@@ -521,8 +718,9 @@ impl Driver for PgDriver {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "postgres".into(),
-            server_version: self.server_version.clone(),
-            flavour: None,
+            // T-054: the product's own version and the flavour, parsed.
+            server_version: self.server.as_ref().and_then(|s| s.display_version()),
+            flavour: self.server.as_ref().map(|s| s.flavour.name()),
             // A Postgres socket can be pinned for a tab's lifetime.
             affinity: SessionAffinity::Connection,
             // `DISCARD ALL` is a real primitive — the contrast T-072 measured
@@ -538,9 +736,10 @@ impl Driver for PgDriver {
             }),
             raw_payload: RawPayloadKind::Script,
             node_kinds: navigator::node_kinds(),
-            filter_ops: filter_ops(),
+            filter_ops: filter_ops(self.collation.as_ref().is_none_or(|(_, det)| *det)),
             fixed_schema: true,
             supports_script: true,
+            string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
         }
     }
 
@@ -548,10 +747,26 @@ impl Driver for PgDriver {
         &self,
         parent: Option<NodeId>,
     ) -> Result<Vec<NavNode>, DriverError> {
-        self.with_lease(false, async |client: &tokio_postgres::Client| {
-            navigator::children(&client, parent).await
-        })
-        .await
+        if let Some(hit) = self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).get(&parent) {
+            return Ok(hit.clone());
+        }
+        let key = parent.clone();
+        let hidden: Vec<String> = self
+            .server
+            .as_ref()
+            .map(|s| s.hidden_schemas().iter().map(|h| h.to_string()).collect())
+            .unwrap_or_default();
+        let nodes = self
+            .with_lease(false, async |client: &tokio_postgres::Client| {
+                navigator::children(&client, parent, &hidden).await
+            })
+            .await?;
+        // A notice (permission-denied, a vanished relation) is not catalog
+        // content: never cached, so the next expand tries again.
+        if !nodes.iter().any(navigator::is_notice) {
+            self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, nodes.clone());
+        }
+        Ok(nodes)
     }
 
     async fn browse(&self, request: BrowseRequest) -> Result<ExecutionResult, DriverError> {
@@ -571,8 +786,17 @@ impl Driver for PgDriver {
             }
 
             let truncated = out_rows.len() as u32 >= request.limit;
+            // T-047: declare the strategy used and where the next page starts.
+            let page = compiled.paging.page_info(
+                &compiled.columns,
+                out_rows.last().map(Vec::as_slice),
+                out_rows.len(),
+                request.limit,
+            );
             // D-029: structured browse always yields exactly one `rows` outcome.
-            Ok(ExecutionResult::single_rows(compiled.column_descs(), out_rows, truncated))
+            let mut result = ExecutionResult::single_rows(compiled.column_descs(), out_rows, truncated);
+            result.page = Some(page);
+            Ok(result)
         })
         .await
     }
@@ -597,19 +821,21 @@ impl Driver for PgDriver {
                 ))
             }
         };
+        let script_for_cache = script.clone();
 
-        self.with_lease(true, async |client: &tokio_postgres::Client| {
+        let result = self.with_lease(true, async |client: &tokio_postgres::Client| {
     
             // R-040: the user's text goes to the engine VERBATIM as one batch. No
             // client-side rewriting, so a splitter bug cannot manufacture a syntax
             // error the user did not write.
-            let result = client.simple_query(&script).await;
+            // T-050: streamed, metered against the per-execution budget —
+            // rows past it are dropped on arrival, never materialized.
+            let result = collect_budgeted(client, &script, self.budget).await;
     
             let split = sluice_core::script::split(&script, ScriptDialect::Postgres);
     
             match result {
-                Ok(messages) => {
-                    let bodies = collect_outcomes(messages);
+                Ok((bodies, report)) => {
                     let attributions = sluice_core::script::attribute(&split, bodies.len());
                     let outcomes: Vec<Outcome> = bodies
                         .into_iter()
@@ -628,6 +854,8 @@ impl Driver for PgDriver {
                     Ok(ExecutionResult {
                         outcomes,
                         tx: TxContext { mode, disposition: TxDisposition::Committed },
+                        page: None,
+                        budget: Some(report),
                     })
                 }
                 Err(e) => {
@@ -691,69 +919,77 @@ impl Driver for PgDriver {
                                 TxDisposition::Committed
                             },
                         },
+                        page: None,
+                        budget: None,
                     })
                 }
             }
         })
-        .await
+        .await?;
+        // T-024: a failing statement arrives as an `Error` *outcome* inside an
+        // `Ok` result, so `with_lease`'s error redaction never sees it — and the
+        // engine quotes offending values back verbatim. Redact every one.
+        // T-053 / D-016: DDL this app ran invalidates the navigator cache.
+        // Done whether or not the script succeeded — a partially applied
+        // explicit transaction can still have changed the catalog.
+        if navigator::script_may_change_catalog(&script_for_cache) {
+            self.refresh_catalog();
+        }
+        Ok(self.redact_outcomes(result))
     }
 }
 
-/// Turn the simple-query message stream into D-029 outcome bodies.
-fn collect_outcomes(messages: Vec<SimpleQueryMessage>) -> Vec<OutcomeBody> {
+/// T-050: run a script and turn its message stream into D-029 outcome bodies,
+/// keeping rows only while the execution's budget lasts.
+///
+/// Every statement still runs to completion — the budget limits what is
+/// *retained for display*, never what executes. Stopping a script early
+/// because a SELECT was large would silently skip the writes after it.
+async fn collect_budgeted(
+    client: &tokio_postgres::Client,
+    script: &str,
+    budget: sluice_core::ExecBudget,
+) -> Result<(Vec<OutcomeBody>, sluice_core::BudgetReport), tokio_postgres::Error> {
+    use futures_util::TryStreamExt as _;
+
+    let stream = client.simple_query_raw(script).await?;
+    let mut stream = std::pin::pin!(stream);
+    let mut meter = sluice_core::BudgetMeter::new(budget);
     let mut out: Vec<OutcomeBody> = Vec::new();
     let mut pending_cols: Option<Vec<sluice_core::ColumnDesc>> = None;
     let mut pending_rows: Vec<Vec<WireValue>> = Vec::new();
+    let mut pending_truncated = false;
 
-    for msg in messages {
+    while let Some(msg) = stream.try_next().await? {
         match msg {
             SimpleQueryMessage::RowDescription(cols) => {
-                flush(&mut out, &mut pending_cols, &mut pending_rows);
-                pending_cols = Some(
-                    cols.iter()
-                        .map(|c| sluice_core::ColumnDesc {
-                            name: c.name().to_string(),
-                            // The simple query protocol returns every value in
-                            // TEXT format and does NOT carry type OIDs, so the
-                            // honest descriptor is `unknown` rather than a
-                            // guess. D-017 makes `unknown` first-class exactly
-                            // so a driver never has to lie. Values are still
-                            // lossless — text is Postgres' own rendering.
-                            type_name: "unknown".into(),
-                            type_class: TypeClass::Unknown,
-                            nullable: true,
-                            mixed: false,
-                            derived: true,
-                            // No type OIDs on this protocol, so no claim of
-                            // exactness either way; script results are not
-                            // editable in place.
-                            exact: None,
-                        })
-                        .collect(),
-                );
-                pending_rows.clear();
+                flush_budgeted(&mut out, &mut pending_cols, &mut pending_rows, &mut pending_truncated);
+                pending_cols = Some(cols.iter().map(script_column).collect());
             }
             SimpleQueryMessage::Row(row) => {
-                let n = row.columns().len();
-                let mut cells = Vec::with_capacity(n);
-                for i in 0..n {
-                    cells.push(match row.get(i) {
+                // Once spent, later rows are not even decoded.
+                if meter.exhausted() {
+                    pending_truncated = true;
+                    continue;
+                }
+                let cells: Vec<WireValue> = (0..row.columns().len())
+                    .map(|i| match row.get(i) {
                         Some(s) => WireValue::Text(s.to_string()),
                         None => WireValue::Null,
-                    });
+                    })
+                    .collect();
+                if meter.admit(sluice_core::row_cost(&cells), out.len() as u32) {
+                    pending_rows.push(cells);
+                } else {
+                    pending_truncated = true;
                 }
-                pending_rows.push(cells);
             }
             SimpleQueryMessage::CommandComplete(n) => {
                 if pending_cols.is_some() {
-                    flush(&mut out, &mut pending_cols, &mut pending_rows);
+                    flush_budgeted(&mut out, &mut pending_cols, &mut pending_rows, &mut pending_truncated);
                 } else {
                     out.push(OutcomeBody::Affected {
                         count: n,
-                        // The simple query protocol's command tag is not exposed
-                        // by tokio-postgres, so `UPDATE 0` and `CREATE TABLE`
-                        // are indistinguishable here. `None` is the truthful
-                        // answer; T-053's catalog work can improve on it.
                         statement_kind: None,
                         concurrency_omitted: vec![],
                         document_errors: vec![],
@@ -763,25 +999,37 @@ fn collect_outcomes(messages: Vec<SimpleQueryMessage>) -> Vec<OutcomeBody> {
             _ => {}
         }
     }
-    flush(&mut out, &mut pending_cols, &mut pending_rows);
+    flush_budgeted(&mut out, &mut pending_cols, &mut pending_rows, &mut pending_truncated);
     if out.is_empty() {
         out.push(OutcomeBody::Status { message: "OK".into(), document: None });
     }
-    out
+    Ok((out, meter.report()))
 }
 
-fn flush(
+fn script_column(c: &tokio_postgres::SimpleColumn) -> sluice_core::ColumnDesc {
+    sluice_core::ColumnDesc {
+        name: c.name().to_string(),
+        // The simple query protocol returns every value in TEXT format and
+        // does NOT carry type OIDs, so the honest descriptor is `unknown`.
+        type_name: "unknown".into(),
+        type_class: TypeClass::Unknown,
+        nullable: true,
+        mixed: false,
+        derived: true,
+        exact: None,
+    }
+}
+
+fn flush_budgeted(
     out: &mut Vec<OutcomeBody>,
     cols: &mut Option<Vec<sluice_core::ColumnDesc>>,
     rows: &mut Vec<Vec<WireValue>>,
+    truncated: &mut bool,
 ) {
     if let Some(columns) = cols.take() {
-        out.push(OutcomeBody::Rows {
-            columns,
-            rows: std::mem::take(rows),
-            truncated: false,
-        });
+        out.push(OutcomeBody::Rows { columns, rows: std::mem::take(rows), truncated: *truncated });
     }
+    *truncated = false;
 }
 
 /// Opaque re-fetch token for an oversized value (T-018).
@@ -817,7 +1065,10 @@ pub fn decode_handle(handle: &str) -> Option<(Vec<String>, String, String)> {
 /// R-009: `case_sensitive` is declared, not assumed. Postgres `contains`
 /// compiles to `ILIKE`, which is case-INSENSITIVE — the same behaviour the
 /// Mongo driver was made to match, so the declared value is the same on both.
-fn filter_ops() -> Vec<FilterOpDecl> {
+/// `strings_case_sensitive`: what the database's default collation does —
+/// deterministic collations distinguish case for `=` and `LIKE`. That is
+/// reported, not overridden (R-009); the per-predicate toggle opts out.
+fn filter_ops(strings_case_sensitive: bool) -> Vec<FilterOpDecl> {
     let all = vec![
         TypeClass::Boolean,
         TypeClass::Integer,
@@ -828,16 +1079,19 @@ fn filter_ops() -> Vec<FilterOpDecl> {
         TypeClass::Uuid,
     ];
     vec![
-        FilterOpDecl { id: "eq".into(), label: "equals".into(), type_classes: all.clone(), case_sensitive: Some(true) },
-        FilterOpDecl { id: "ne".into(), label: "not equals".into(), type_classes: all.clone(), case_sensitive: Some(true) },
-        FilterOpDecl { id: "gt".into(), label: "greater than".into(), type_classes: all.clone(), case_sensitive: None },
-        FilterOpDecl { id: "gte".into(), label: "at least".into(), type_classes: all.clone(), case_sensitive: None },
-        FilterOpDecl { id: "lt".into(), label: "less than".into(), type_classes: all.clone(), case_sensitive: None },
-        FilterOpDecl { id: "lte".into(), label: "at most".into(), type_classes: all, case_sensitive: None },
-        FilterOpDecl { id: "contains".into(), label: "contains".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(false) },
-        FilterOpDecl { id: "starts_with".into(), label: "starts with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(false) },
-        FilterOpDecl { id: "is_null".into(), label: "is null".into(), type_classes: vec![], case_sensitive: None },
-        FilterOpDecl { id: "is_not_null".into(), label: "is not null".into(), type_classes: vec![], case_sensitive: None },
+        FilterOpDecl { id: "eq".into(), label: "equals".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "ne".into(), label: "not equals".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "gt".into(), label: "greater than".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "gte".into(), label: "at least".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "lt".into(), label: "less than".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "lte".into(), label: "at most".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "contains".into(), label: "contains".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "starts_with".into(), label: "starts with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "ends_with".into(), label: "ends with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "in".into(), label: "is one of".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "between".into(), label: "between".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "is_null".into(), label: "is null".into(), type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "is_not_null".into(), label: "is not null".into(), type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
     ]
 }
 
@@ -870,10 +1124,23 @@ mod tests {
         assert_eq!(col, "body");
     }
 
+    /// T-013: the Postgres driver declares every core operator (D-005).
+    #[test]
+    fn every_core_filter_operator_is_declared() {
+        let missing = sluice_core::missing_core_ops(&filter_ops(true));
+        assert!(missing.is_empty(), "core operators not declared: {missing:?}");
+    }
+
     #[test]
     fn contains_declares_case_insensitivity_matching_the_mongo_driver() {
-        let ops = filter_ops();
+        // T-015 / R-009: the engine's semantics are reported, not overridden —
+        // under a deterministic collation `LIKE` distinguishes case — and the
+        // toggle is offered on string operators only.
+        let ops = filter_ops(true);
         let c = ops.iter().find(|o| o.id == "contains").unwrap();
-        assert_eq!(c.case_sensitive, Some(false));
+        assert_eq!(c.case_sensitive, Some(true));
+        assert!(c.case_insensitive_toggle);
+        assert!(!ops.iter().find(|o| o.id == "gt").unwrap().case_insensitive_toggle);
+        assert_eq!(filter_ops(false).iter().find(|o| o.id == "eq").unwrap().case_sensitive, Some(false));
     }
 }

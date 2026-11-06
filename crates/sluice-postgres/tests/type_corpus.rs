@@ -254,6 +254,7 @@ fn spec_from_env() -> Option<ConnectSpec> {
         dbname: cfg.get_dbname().unwrap_or("postgres").to_string(),
         tls,
         application_name: "sluice-type-corpus".into(),
+        statement_timeout: None,
     })
 }
 
@@ -279,6 +280,7 @@ async fn browse(d: &PgDriver, table: &str, filter: Option<FilterTree>) -> Result
             sort: vec![SortKey { column: "id".into(), descending: false }],
             limit: 10,
             cursor: None,
+            offset: None,
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -366,7 +368,7 @@ async fn every_type_round_trips_through_the_wire_encoding_unchanged() {
         // 3. Write-back: bind what was read; the server must find the row.
         if c.no_writeback.is_none() {
             checks += 1;
-            let filter = FilterTree::Pred(Predicate { column: "v".into(), op: "eq".into(), value: got.clone() });
+            let filter = FilterTree::Pred(Predicate { case_insensitive: false, column: "v".into(), op: "eq".into(), value: got.clone() });
             match browse(&d, &table, Some(filter)).await {
                 Ok(found) if found.len() == 1 && found[0][0] == WireValue::Int(1) => {}
                 Ok(found) => failures.push(format!(
