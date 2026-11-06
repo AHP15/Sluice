@@ -82,6 +82,49 @@ pub struct SessionInfo {
     /// whatever opened it. The authoritative copy is the core's (see
     /// `SessionRecord`); this is the UI's view of it.
     pub guardrails: Guardrails,
+    /// T-044 / R-038: set when the profile's budget was raised past the
+    /// default — a deliberate choice, made knowing whose connections it uses.
+    pub budget_warning: Option<String>,
+}
+
+/// T-044 / R-038: a budget above the default is allowed, but said plainly:
+/// every connection it allows comes out of the server's `max_connections`,
+/// which every other client shares.
+pub fn budget_warning(budget: usize, max_connections: Option<i64>) -> Option<String> {
+    if budget <= sluice_postgres::DEFAULT_CONNECTION_BUDGET {
+        return None;
+    }
+    let server = match max_connections {
+        Some(m) => format!("the server's max_connections is {m}, shared by every client and application using it"),
+        None => "the server's max_connections is shared by every client and application using it".to_string(),
+    };
+    Some(format!(
+        "This profile may hold up to {budget} connections (the default is {}), and each tab on it shares them; {server}. \
+         Raise it only if this server has room to spare.",
+        sluice_postgres::DEFAULT_CONNECTION_BUDGET
+    ))
+}
+
+/// T-044: the usage indicator's view of one profile's budget.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConnectionUsage {
+    pub budget: usize,
+    /// Always kept for the navigator and grid.
+    pub browse_floor: usize,
+    /// How many pinned editor sessions the budget allows.
+    pub pinned_limit: usize,
+    pub pinned: Vec<PinnedUsageView>,
+    pub max_connections: Option<i64>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct PinnedUsageView {
+    pub editor_id: String,
+    /// The connection tab the editor belongs to, as the user named it.
+    pub tab: String,
+    pub in_transaction: bool,
+    pub holds: Vec<String>,
+    pub busy: bool,
 }
 
 /// What the core remembers about a live session beyond its driver.
@@ -304,6 +347,7 @@ pub async fn connect(
             }
         };
         let capabilities = driver.capabilities();
+        let (driver_budget, driver_max) = (driver.connection_budget(), driver.max_connections());
 
         let session_id = format!("{}::{}", profile.id, short_token());
         state.drivers.lock().await.insert(session_id.clone(), driver);
@@ -327,6 +371,7 @@ pub async fn connect(
             capabilities,
             tls_warning: profile.tls.warning().map(str::to_string),
             guardrails,
+            budget_warning: budget_warning(driver_budget, driver_max),
         })
     })
     .await
@@ -420,6 +465,7 @@ pub async fn connect_launch(
             capabilities,
             tls_warning: t.tls.warning().map(str::to_string),
             guardrails,
+            budget_warning: None,
         })
     })
     .await
@@ -608,6 +654,44 @@ pub async fn save_session_as_profile(
     .await
 }
 
+/// T-044 / R-038: who is using this tab's profile budget — which editor
+/// tabs hold pinned sessions, and which of those hold a transaction or other
+/// session state — so the user can see why a new editor was refused.
+#[tauri::command]
+pub async fn connection_usage(
+    state: tauri::State<'_, AppState>,
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
+    session_id: String,
+) -> Result<ConnectionUsage, DriverError> {
+    guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        let profile_key = state.profile_key(&session_id).await.unwrap_or_else(|| session_id.clone());
+        let budget = d.connection_budget();
+        let labels: HashMap<String, String> =
+            state.sessions.lock().await.iter().map(|(id, r)| (id.clone(), r.target.label.clone())).collect();
+        let pinned = editors
+            .usage(&profile_key)
+            .await
+            .into_iter()
+            .map(|u| PinnedUsageView {
+                tab: labels.get(&u.session_id).cloned().unwrap_or_else(|| u.session_id.clone()),
+                editor_id: u.editor_id,
+                in_transaction: u.in_transaction,
+                holds: u.holds,
+                busy: u.busy,
+            })
+            .collect();
+        Ok(ConnectionUsage {
+            budget,
+            browse_floor: crate::editor::BROWSE_FLOOR,
+            pinned_limit: crate::editor::pinned_limit(budget),
+            pinned,
+            max_connections: d.max_connections(),
+        })
+    })
+    .await
+}
+
 /// T-051 / D-010: cancel a running query by the id the UI gave it. The server
 /// stops it; if it has not finished within the grace period, its connection
 /// is dropped. `false` means it had already finished.
@@ -789,7 +873,9 @@ pub async fn open_editor(
         // T-042 / D-028: within the profile's one budget — release an idle
         // editor (LRU) or refuse, never evict an open transaction.
         let profile_key = state.profile_key(&session_id).await.unwrap_or_else(|| session_id.clone());
-        if let Some(ev) = editors.make_room(&profile_key, d.connection_budget()).await? {
+        // T-044 / R-038: pinned sessions get the budget minus the browse floor.
+        let budget = d.connection_budget();
+        if let Some(ev) = editors.make_room(&profile_key, crate::editor::pinned_limit(budget), budget).await? {
             use tauri::Emitter;
             let _ = app.emit(crate::editor::EDITOR_EVENT, ev);
         }
@@ -1110,6 +1196,15 @@ mod boundary_tests {
 
     /// T-061: confirmation is required only when armed and only for the
     /// statements that need it; the exact phrase runs it.
+    /// T-044: raising the budget is allowed and said plainly; the default is not.
+    #[test]
+    fn a_raised_budget_carries_the_max_connections_warning() {
+        assert_eq!(budget_warning(sluice_postgres::DEFAULT_CONNECTION_BUDGET, Some(100)), None);
+        let w = budget_warning(20, Some(100)).unwrap();
+        assert!(w.contains("20 connections") && w.contains("max_connections is 100"), "{w}");
+        assert!(budget_warning(20, None).unwrap().contains("max_connections"));
+    }
+
     #[test]
     fn production_sessions_require_the_typed_database_name() {
         assert!(check_confirmation(false, "shop", "DROP TABLE t", None).is_ok(), "unarmed: no gate");

@@ -430,6 +430,17 @@ export interface SessionInfo {
   capabilities: Capabilities;
   tls_warning: string | null;
   guardrails: Guardrails;
+  /** T-044: set when the profile's budget was raised past the default. */
+  budget_warning?: string | null;
+}
+
+/** T-044 / R-038: who is using a profile's connection budget. */
+export interface ConnectionUsage {
+  budget: number;
+  browse_floor: number;
+  pinned_limit: number;
+  pinned: { editor_id: string; tab: string; in_transaction: boolean; holds: string[]; busy: boolean }[];
+  max_connections: number | null;
 }
 
 /**

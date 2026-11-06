@@ -73,6 +73,7 @@ import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
 import { SavedQueries } from "./components/SavedQueries";
 import { FilterBar } from "./components/FilterBar";
 import { ConfirmPanel } from "./components/ConfirmPanel";
+import { ConnectionUsageIndicator } from "./components/ConnectionUsage";
 import { invalidateHistory } from "./components/HistoryPanel";
 
 interface RowsView {
@@ -567,6 +568,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 Run
               </Button>
             )}
+            {session && <ConnectionUsageIndicator sessionId={session.session_id} />}
             <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
@@ -579,6 +581,14 @@ function Workspace({ seed }: { seed: TabSeed }) {
           <div className="flex items-center gap-2 border-b bg-destructive px-3 py-1 text-xs text-destructive-foreground">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             <span>{session.tls_warning}</span>
+          </div>
+        )}
+
+        {/* T-044 / R-038: a raised budget is a deliberate choice, said plainly. */}
+        {session?.budget_warning && (
+          <div className="flex items-center gap-2 border-b bg-secondary px-3 py-1 text-xs">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span>{session.budget_warning}</span>
           </div>
         )}
 
@@ -1180,6 +1190,17 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
             setForm({ ...form, connection_budget: /^\d+$/.test(t) ? Number(t) : null });
           }}
         />
+        {/* T-044 / R-038: raising it is allowed, and explicit. */}
+        {(form.connection_budget ?? 5) > 5 && (
+          <span className="mt-0.5 block text-[10px] text-destructive">
+            Above the default of 5. Every connection comes out of the server's max_connections, which all its clients share.
+          </span>
+        )}
+        {(form.connection_budget ?? 5) <= 2 && (
+          <span className="mt-0.5 block text-[10px] text-muted-foreground">
+            2 connections are always kept for browsing, so this budget leaves no room for editor sessions.
+          </span>
+        )}
       </label>
       <label className="block px-2 py-1 text-xs">
         <span className="text-muted-foreground">

@@ -645,9 +645,15 @@ mod tests {
                 } else if p.extension().is_some_and(|x| x == "ts" || x == "tsx") {
                     scanned += 1;
                     let text = std::fs::read_to_string(&p).unwrap();
-                    for banned in ["fetch(", "XMLHttpRequest", "sendBeacon", "new WebSocket", "EventSource("] {
+                    for banned in ["XMLHttpRequest", "sendBeacon", "new WebSocket", "EventSource("] {
                         assert!(!text.contains(banned), "D-011: `{banned}` in {}", p.display());
                     }
+                    // The global `fetch(` — not a method that ends in it,
+                    // like TanStack Query's `refetch()`.
+                    let global_fetch = text.match_indices("fetch(").any(|(i, _)| {
+                        !text[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    });
+                    assert!(!global_fetch, "D-011: a global `fetch(` in {}", p.display());
                 }
             }
         }

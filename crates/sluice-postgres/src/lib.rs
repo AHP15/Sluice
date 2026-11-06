@@ -142,6 +142,9 @@ pub struct PgDriver {
     comparability: encode::Comparability,
     /// T-055 / R-028: which catalog areas probed successfully at connect.
     catalog: sluice_core::CatalogSupport,
+    /// T-044: the server's `max_connections`, shared by every client — what a
+    /// raised budget is a citizen of. `None` if it could not be read.
+    max_connections: Option<i64>,
     /// T-053 / D-016: one level of the navigator tree per parent, filled on
     /// first expand and kept until DDL the app ran, or an explicit refresh.
     /// Shared across `with_*` copies, like the pool.
@@ -162,6 +165,11 @@ impl PgDriver {
     /// session is a lease held from this same pool.
     pub fn connection_budget(&self) -> usize {
         self.pool.status().max_size
+    }
+
+    /// T-044: the server's `max_connections`, if it could be read at connect.
+    pub fn max_connections(&self) -> Option<i64> {
+        self.max_connections
     }
 
     /// As [`connect`](Self::connect), with an explicit pool ceiling. Tests use
@@ -230,6 +238,7 @@ impl PgDriver {
             read_only: sluice_core::ReadOnlyGuarantee::default(),
             comparability: encode::Comparability::fallback(),
             catalog: sluice_core::CatalogSupport::default(),
+            max_connections: None,
             nav_cache: Arc::default(),
             cancel: None,
             budget: sluice_core::ExecBudget::default(),
@@ -300,7 +309,20 @@ impl PgDriver {
             .await
             .unwrap_or_default();
 
-        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, comparability, catalog, ..driver }))
+        // T-044: for the citizenship warning on a raised budget.
+        let max_connections = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| {
+                Ok(client
+                    .query_one("select current_setting('max_connections')::int8", &[])
+                    .await
+                    .ok()
+                    .map(|r| r.get::<_, i64>(0)))
+            })
+            .await
+            .ok()
+            .flatten();
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, comparability, catalog, max_connections, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
@@ -316,6 +338,7 @@ impl PgDriver {
             read_only: self.read_only.clone(),
             comparability: self.comparability.clone(),
             catalog: self.catalog.clone(),
+            max_connections: self.max_connections,
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -345,6 +368,7 @@ impl PgDriver {
             read_only: self.read_only.clone(),
             comparability: self.comparability.clone(),
             catalog: self.catalog.clone(),
+            max_connections: self.max_connections,
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -820,6 +844,7 @@ impl PgDriver {
             read_only: self.read_only.clone(),
             comparability: self.comparability.clone(),
             catalog: self.catalog.clone(),
+            max_connections: self.max_connections,
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,

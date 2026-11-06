@@ -6,6 +6,7 @@ import type {
   EditGate,
   EditPlan,
   EditRequest,
+  ConnectionUsage,
   ExecutionResult,
   HistoryEntry,
   LaunchOutcome,
@@ -74,6 +75,11 @@ export function deleteQuery(queryId: string): Promise<WorkspaceView> {
 }
 
 export const WORKSPACE_KEY = ["workspace"] as const;
+
+/** T-044: the profile budget's usage — pinned editor sessions and their state. */
+export function connectionUsage(sessionId: string): Promise<ConnectionUsage> {
+  return invoke<ConnectionUsage>("connection_usage", { sessionId });
+}
 
 /** T-035: query history, newest first. */
 export function listHistory(profileId: string | null, search: string): Promise<HistoryEntry[]> {

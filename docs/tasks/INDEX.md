@@ -41,7 +41,7 @@ T-040 | done | M | D-028,R-036 | Reset only connections that were actually dirti
 T-041 | done | M | D-028 | Pinned editor sessions with opt-in explicit transactions | 2026-11-06
 T-042 | done | M | D-028 | Single per-profile connection budget covering pooled and pinned | 2026-11-06
 T-043 | done | M | D-028,R-037 | Restrict LRU eviction to provably stateless tabs and never reconnect silently | 2026-11-06
-T-044 | todo | M | D-028,R-038 | Reserve a browse floor inside the connection budget |
+T-044 | done | M | D-028,R-038 | Reserve a browse floor inside the connection budget | 2026-11-06
 T-045 | done | S | D-028,R-039 | Three-valued session affinity capability | 2026-11-06
 T-046 | done | S | R-039 | Spike: verify what mongodb ClientSession delivers for an editor tab | 2026-08-02
 T-047 | done | L | D-010 | Keyset pagination with declared fallback strategy | 2026-11-06

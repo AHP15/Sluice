@@ -275,8 +275,12 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
+        // A counter, not just the clock: parallel tests can read the same
+        // timestamp, share a directory, and overwrite each other's key.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let d = std::env::temp_dir().join(format!("sluice-cred-test-{}", std::process::id()))
-            .join(format!("{:?}", std::time::SystemTime::now()));
+            .join(format!("{n}-{:?}", std::time::SystemTime::now()));
         let _ = fs::create_dir_all(&d);
         d
     }
