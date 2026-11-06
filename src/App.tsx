@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Database, Play, Save, ShieldAlert, Sun, Moon, Plug, Plus, X } from "lucide-react";
+import { AlertTriangle, Bug, Database, Play, Save, ShieldAlert, Sun, Moon, Plug, Plus, X } from "lucide-react";
 import { Navigator } from "./components/Navigator";
 import { QueryEditor } from "./components/QueryEditor";
 import { ResultGrid } from "./components/ResultGrid";
@@ -23,11 +23,14 @@ import {
   connect,
   connectLaunch,
   coreVersion,
+  diagnosticsPreview,
   disconnect,
   runScript,
   saveSessionAsProfile,
+  setVerboseDiagnostics,
   storeCredential,
   takeLaunches,
+  verboseDiagnostics,
 } from "./lib/ipc";
 import { useUiStore } from "./store/ui";
 
@@ -68,6 +71,7 @@ export function App() {
   const [tabs, setTabs] = useState<Tab[]>([{ id: 0, seed: { kind: "blank" }, title: "New connection" }]);
   const [active, setActive] = useState(0);
   const nextId = useRef(1);
+  const [diagOpen, setDiagOpen] = useState(false);
 
   const open = useCallback((outcomes: LaunchOutcome[], replaceInitial: boolean) => {
     const created: Tab[] = outcomes.map((o) => ({
@@ -138,7 +142,16 @@ export function App() {
           <button type="button" aria-label="New tab" className="px-1.5 py-1" onClick={addBlank}>
             <Plus className="h-3.5 w-3.5" />
           </button>
+          <button
+            type="button"
+            className="ml-auto flex items-center gap-1 px-1.5 py-1 text-muted-foreground"
+            onClick={() => setDiagOpen(true)}
+          >
+            <Bug className="h-3.5 w-3.5" />
+            Diagnostics
+          </button>
         </nav>
+        {diagOpen && <DiagnosticsPanel onClose={() => setDiagOpen(false)} />}
         {tabs.map((t) => (
           <div key={t.id} className={t.id === active ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
             <Workspace seed={t.seed} />
@@ -399,6 +412,83 @@ function Workspace({ seed }: { seed: TabSeed }) {
           </main>
         </div>
     </>
+  );
+}
+
+/**
+ * T-023 / D-020: "copy diagnostics". The core builds the text; this shows all
+ * of it, and Copy copies that same string — nothing is sent anywhere, and
+ * nothing is copied that was not on screen.
+ */
+function DiagnosticsPanel({ onClose }: { onClose: () => void }) {
+  const [text, setText] = useState<string | null>(null);
+  const [verbose, setVerbose] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setCopied(false);
+    setVerbose(await verboseDiagnostics().catch(() => false));
+    setText(await diagnosticsPreview().catch((e) => `diagnostics unavailable: ${String(e)}`));
+  }, []);
+  useEffect(() => void refresh(), [refresh]);
+
+  const copy = async () => {
+    if (text === null) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Older webviews: select-and-copy from a hidden textarea.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopied(true);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-label="Diagnostics">
+      <div className="flex max-h-[85vh] w-[46rem] flex-col gap-2 rounded border bg-background p-3 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Diagnostics</span>
+          <button type="button" className="ml-auto" aria-label="Close" onClick={onClose}>
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={verbose}
+            onChange={async (e) => {
+              await setVerboseDiagnostics(e.target.checked);
+              await refresh();
+            }}
+          />
+          <span>
+            <span className="font-medium">Verbose diagnostics</span> — also log full query text, for this run
+            only. Query text can contain sensitive values, including passwords in statements like{" "}
+            <code>CREATE ROLE … PASSWORD</code>.
+          </span>
+        </label>
+        <p className="text-muted-foreground">
+          This is everything that will be copied. It stays on this machine unless you paste it somewhere.
+        </p>
+        <pre className="min-h-0 flex-1 overflow-auto rounded border bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap">
+          {text ?? "loading…"}
+        </pre>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="secondary" onClick={() => void refresh()}>
+            Refresh
+          </Button>
+          <Button size="sm" onClick={() => void copy()} disabled={text === null}>
+            Copy diagnostics
+          </Button>
+          {copied && <span className="text-muted-foreground">Copied.</span>}
+        </div>
+      </div>
+    </div>
   );
 }
 

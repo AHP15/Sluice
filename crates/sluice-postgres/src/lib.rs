@@ -92,6 +92,9 @@ pub struct PgDriver {
     /// `DISCARD ALL`, so `Native`; overridable for tests of the other paths.
     reset: ResetSupport,
     stats: Arc<PoolStats>,
+    /// T-024 / R-023: this connection's password, kept **only** to redact it
+    /// from every error the driver returns, in every encoding.
+    redactor: sluice_core::Redactor,
 }
 
 impl PgDriver {
@@ -120,6 +123,16 @@ impl PgDriver {
             cfg.password(pw.expose());
         }
 
+        // D-007 / T-021: a TLS mode must be *required*, not preferred.
+        // tokio-postgres defaults to `Prefer`, which silently falls back to
+        // plaintext when the server offers no TLS — so `Verify` used to connect
+        // unencrypted to a TLS-less server, and an on-path attacker could strip
+        // TLS from any connection. Found by T-024's redaction corpus.
+        cfg.ssl_mode(match spec.tls {
+            TlsMode::Disabled => tokio_postgres::config::SslMode::Disable,
+            TlsMode::Verify | TlsMode::AcceptInvalidCerts => tokio_postgres::config::SslMode::Require,
+        });
+
         let mgr_cfg = ManagerConfig { recycling_method: RecyclingMethod::Fast };
 
         // `deadpool_postgres::Manager` erases the TLS connector, so both arms
@@ -145,6 +158,7 @@ impl PgDriver {
             tls: spec.tls,
             reset: ResetSupport::Native,
             stats: Arc::new(PoolStats::default()),
+            redactor: sluice_core::Redactor::new(spec.password.clone()),
         };
 
         // Prove the credentials work now rather than on first browse, and pick
@@ -170,6 +184,7 @@ impl PgDriver {
             tls: self.tls,
             reset: self.reset,
             stats: self.stats.clone(),
+            redactor: self.redactor.clone(),
         })
     }
 
@@ -184,6 +199,7 @@ impl PgDriver {
             tls: self.tls,
             reset,
             stats: self.stats.clone(),
+            redactor: self.redactor.clone(),
         })
     }
 
@@ -501,13 +517,34 @@ impl PgDriver {
         dirty: bool,
         f: impl AsyncFnOnce(&tokio_postgres::Client) -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
-        let mut lease = Lease::acquire(&self.pool, self.reset, self.stats.clone()).await?;
-        if dirty {
-            lease.mark_dirty();
+        let out = async {
+            let mut lease = Lease::acquire(&self.pool, self.reset, self.stats.clone()).await?;
+            if dirty {
+                lease.mark_dirty();
+            }
+            let out = f(lease.client()).await;
+            lease.release().await;
+            out
         }
-        let out = f(lease.client()).await;
-        lease.release().await;
-        out
+        .await;
+        // T-024: every error leaving a lease — including a pool-acquire error,
+        // which can carry a reconnect failure's text — is redacted here.
+        out.map_err(|e| self.redactor.error(e))
+    }
+
+    fn redact_outcomes(&self, mut r: ExecutionResult) -> ExecutionResult {
+        for o in r.outcomes.iter_mut() {
+            if let OutcomeBody::Error { error } = &mut o.body {
+                *error = self.redactor.error(error.clone());
+            }
+        }
+        r
+    }
+
+    /// The redactor for this connection's credentials, for callers that hold
+    /// errors the driver did not produce (a caught panic, say).
+    pub fn redactor(&self) -> &sluice_core::Redactor {
+        &self.redactor
     }
 
     /// Release counters for this driver's pool (T-040).
@@ -598,7 +635,7 @@ impl Driver for PgDriver {
             }
         };
 
-        self.with_lease(true, async |client: &tokio_postgres::Client| {
+        let result = self.with_lease(true, async |client: &tokio_postgres::Client| {
     
             // R-040: the user's text goes to the engine VERBATIM as one batch. No
             // client-side rewriting, so a splitter bug cannot manufacture a syntax
@@ -695,7 +732,11 @@ impl Driver for PgDriver {
                 }
             }
         })
-        .await
+        .await?;
+        // T-024: a failing statement arrives as an `Error` *outcome* inside an
+        // `Ok` result, so `with_lease`'s error redaction never sees it — and the
+        // engine quotes offending values back verbatim. Redact every one.
+        Ok(self.redact_outcomes(result))
     }
 }
 

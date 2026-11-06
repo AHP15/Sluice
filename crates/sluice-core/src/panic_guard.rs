@@ -64,7 +64,7 @@ where
             ErrorKind::DriverBug,
             format!("driver bug: panic in session `{session}`"),
         )
-        .with_detail(describe_panic(payload.as_ref()))),
+        .with_detail(crate::redact::redact_shapes(&describe_panic(payload.as_ref())))),
     }
 }
 
@@ -79,7 +79,7 @@ where
             ErrorKind::DriverBug,
             format!("driver bug: panic in session `{session}`"),
         )
-        .with_detail(describe_panic(payload.as_ref()))),
+        .with_detail(crate::redact::redact_shapes(&describe_panic(payload.as_ref())))),
     }
 }
 

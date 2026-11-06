@@ -77,10 +77,15 @@ impl Lease {
         reset: ResetSupport,
         stats: Arc<PoolStats>,
     ) -> Result<Self, DriverError> {
-        let obj = pool
-            .get()
-            .await
-            .map_err(|e| DriverError::new(ErrorKind::ConnectionFailed, e.to_string()))?;
+        let obj = pool.get().await.map_err(|e| match e {
+            // The server's own error (a wrong password, a missing database, a
+            // TLS refusal) is inside the pool's wrapper. Surfacing the wrapper's
+            // text — "Error occurred while creating a new object: db error" —
+            // reported every one of them as a bare connection failure with no
+            // detail; the real error goes through the normal mapping instead.
+            deadpool_postgres::PoolError::Backend(inner) => crate::error_map::map_error(&inner, None),
+            other => DriverError::new(ErrorKind::ConnectionFailed, other.to_string()),
+        })?;
         // T-040: clean until something session-mutating crosses it. Callers
         // mark it; the default is the cheap path, so a structured request
         // never triggers a reset or a reopen.

@@ -38,6 +38,12 @@ tauri-plugin-dialog = "2"
 # invocation instead hands its argv and working directory to the running
 # instance, which opens a tab.
 tauri-plugin-single-instance = "2"
+
+# T-023 / D-020: structured, shape-only logging to size-capped JSON-lines files
+# in the cache dir. Rotation is by size, implemented in diagnostics.rs, because
+# tracing-appender only rotates by time.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 
 # D-001: database crates link HERE, in the Rust process, and nowhere else. The

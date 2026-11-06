@@ -257,7 +257,10 @@ fn discover_in(app: &tauri::AppHandle, launcher: &Launcher, dir: &Path) -> Launc
         Ok(EvalOutcome::Declined { reason }) => LaunchOutcome::Choose { reason: reason.explain().into() },
         // R-032: a config that fails is an error the user sees, never a quiet
         // fallback to some other connection.
-        Err(e) => LaunchOutcome::Error { message: format!("The project's config failed: {e}") },
+        // T-024: the config's stderr can print its own connection string.
+        Err(e) => LaunchOutcome::Error {
+            message: sluice_core::redact_shapes(&format!("The project's config failed: {e}")),
+        },
     }
 }
 

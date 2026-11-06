@@ -26,6 +26,7 @@ pub mod outcome;
 pub mod panic_guard;
 pub mod request;
 pub mod script;
+pub mod redact;
 pub mod secret;
 pub mod value;
 
@@ -47,6 +48,7 @@ pub use request::{
     BrowseRequest, EditRequest, FilterTree, NavNode, NodeId, Original, Predicate, RawRequest,
     SortKey,
 };
+pub use redact::{redact_shapes, Redactor};
 pub use secret::{deserialize_optional_secret, Secret, REDACTED};
 pub use value::{ColumnDesc, ExactDomain, TypeClass, WireValue};
 

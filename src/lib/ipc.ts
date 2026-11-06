@@ -179,3 +179,17 @@ export class RowStream {
     if (this.id !== null) void invoke("cancel_stream", { streamId: this.id }).catch(() => {});
   }
 }
+
+/** T-023: the exact text "copy diagnostics" will copy. */
+export function diagnosticsPreview(): Promise<string> {
+  return invoke<string>("diagnostics_preview");
+}
+
+/** T-023: the run-scoped verbose toggle (off at every launch). */
+export function setVerboseDiagnostics(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_verbose_diagnostics", { enabled });
+}
+
+export function verboseDiagnostics(): Promise<boolean> {
+  return invoke<boolean>("verbose_diagnostics");
+}

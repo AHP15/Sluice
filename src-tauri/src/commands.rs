@@ -22,6 +22,7 @@ use sluice_postgres::{tls::TlsMode, ConnectSpec, PgDriver};
 use tokio::sync::Mutex;
 
 use crate::credentials::{Backend, CredentialStore};
+use crate::diagnostics::logged;
 use crate::guardrails::{Guardrails, Provenance};
 use crate::launcher::{LaunchOrigin, LaunchOutcome, Launcher};
 use crate::stream::{CreditGate, Stop, StreamEvent, Streams, BATCH_ROWS, MAX_IN_FLIGHT, STREAM_DEADLINE};
@@ -75,6 +76,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// T-024: redact an error with the session's own credentials. Applied to
+    /// what comes out of `guard_driver_call`, so a caught driver panic's text
+    /// — which the driver never saw as an error — is checked too.
+    async fn redacted<T>(&self, session_id: &str, r: Result<T, DriverError>) -> Result<T, DriverError> {
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(match self.drivers.lock().await.get(session_id) {
+                Some(d) => d.redactor().error(e),
+                None => sluice_core::Redactor::default().error(e),
+            }),
+        }
+    }
+
     async fn driver(&self, session_id: &str) -> Result<Arc<PgDriver>, DriverError> {
         self.drivers
             .lock()
@@ -131,7 +145,10 @@ pub async fn connect(
             application_name: "sluice".into(),
         };
 
-        let driver = PgDriver::connect(spec).await?;
+        let redactor = sluice_core::Redactor::new(spec.password.clone());
+        let driver = logged("connect", &profile.id, None, |_| None, PgDriver::connect(spec))
+            .await
+            .map_err(|e| redactor.error(e))?;
         let capabilities = driver.capabilities();
 
         let session_id = format!("{}::{}", profile.id, short_token());
@@ -189,7 +206,10 @@ pub async fn connect_launch(
             application_name: "sluice".into(),
         };
 
-        let driver = PgDriver::connect(spec).await?;
+        let redactor = sluice_core::Redactor::new(spec.password.clone());
+        let driver = logged("connect", &launch_id, None, |_| None, PgDriver::connect(spec))
+            .await
+            .map_err(|e| redactor.error(e))?;
         let capabilities = driver.capabilities();
         let session_id = format!("{launch_id}::{}", short_token());
         state.drivers.lock().await.insert(session_id.clone(), driver);
@@ -281,12 +301,21 @@ pub async fn open_browse_stream(
                     }
                 }
             };
+            let started = std::time::Instant::now();
             let result =
                 guard_driver_call(&sid(&id), driver.browse_batches(request, BATCH_ROWS, emit)).await;
+            crate::diagnostics::query_event(
+                "browse_stream",
+                crate::diagnostics::profile_of(&id.trim_start_matches("stream-")),
+                started,
+                result.as_ref().ok().map(|e| e.rows),
+                result.as_ref().err().map(|e| e.kind),
+                None,
+            );
             let stop = *stop.lock().unwrap_or_else(|p| p.into_inner());
 
             let last = match (result, stop) {
-                (Err(error), _) => StreamEvent::Error { error },
+                (Err(error), _) => StreamEvent::Error { error: driver.redactor().error(error) },
                 (Ok(_), Some(Stop::TimedOut)) => StreamEvent::TimedOut,
                 (Ok(_), Some(Stop::Cancelled)) => StreamEvent::Cancelled,
                 // Stopped without a gate stop: the channel closed (tab gone).
@@ -380,6 +409,41 @@ pub async fn save_session_as_profile(
     .await
 }
 
+/// Rows across every `rows` outcome of a result, for the shape log.
+fn rows_in(r: &ExecutionResult) -> Option<usize> {
+    Some(
+        r.outcomes
+            .iter()
+            .map(|o| match &o.body {
+                sluice_core::OutcomeBody::Rows { rows, .. } => rows.len(),
+                _ => 0,
+            })
+            .sum(),
+    )
+}
+
+/// T-023: the exact text "copy diagnostics" will copy. The UI shows all of it
+/// before anything leaves the app; nothing is ever sent anywhere by the core.
+#[tauri::command]
+pub async fn diagnostics_preview() -> Result<String, DriverError> {
+    guard_driver_call(&sid("diagnostics"), async { Ok(crate::diagnostics::preview()) }).await
+}
+
+/// T-023: the run-scoped verbose toggle. Off at every launch (D-020).
+#[tauri::command]
+pub async fn set_verbose_diagnostics(enabled: bool) -> Result<bool, DriverError> {
+    guard_driver_call(&sid("diagnostics"), async {
+        crate::diagnostics::set_verbose(enabled);
+        Ok(crate::diagnostics::verbose())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn verbose_diagnostics() -> Result<bool, DriverError> {
+    guard_driver_call(&sid("diagnostics"), async { Ok(crate::diagnostics::verbose()) }).await
+}
+
 #[tauri::command]
 pub async fn disconnect(
     state: tauri::State<'_, AppState>,
@@ -399,10 +463,12 @@ pub async fn navigator_children(
     session_id: String,
     parent: Option<NodeId>,
 ) -> Result<Vec<NavNode>, DriverError> {
-    guard_driver_call(&sid(&session_id), async {
-        state.driver(&session_id).await?.navigator_children(parent).await
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        logged("navigator", &session_id, None, |v: &Vec<NavNode>| Some(v.len()), d.navigator_children(parent)).await
     })
-    .await
+    .await;
+    state.redacted(&session_id, r).await
 }
 
 #[tauri::command]
@@ -411,10 +477,12 @@ pub async fn browse(
     session_id: String,
     request: BrowseRequest,
 ) -> Result<ExecutionResult, DriverError> {
-    guard_driver_call(&sid(&session_id), async {
-        state.driver(&session_id).await?.browse(request).await
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        logged("browse", &session_id, None, rows_in, d.browse(request)).await
     })
-    .await
+    .await;
+    state.redacted(&session_id, r).await
 }
 
 /// What the editor gets back.
@@ -435,16 +503,18 @@ pub async fn run_script(
     session_id: String,
     script: String,
 ) -> Result<ScriptRun, DriverError> {
-    guard_driver_call(&sid(&session_id), async {
-        let result = state
-            .driver(&session_id)
-            .await?
-            .raw(RawRequest::Script(script))
-            .await?;
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        // The script text is passed for verbose diagnostics only; `logged`
+        // drops it unless the user switched that on for this run (D-020).
+        let text = script.clone();
+        let result =
+            logged("script", &session_id, Some(&text), rows_in, d.raw(RawRequest::Script(script))).await?;
         let summary = result.summary();
         Ok(ScriptRun { result, summary })
     })
-    .await
+    .await;
+    state.redacted(&session_id, r).await
 }
 
 /// T-018: pull one oversized value on demand.
@@ -454,10 +524,12 @@ pub async fn fetch_value(
     session_id: String,
     handle: String,
 ) -> Result<WireValue, DriverError> {
-    guard_driver_call(&sid(&session_id), async {
-        state.driver(&session_id).await?.fetch_value(&handle).await
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        logged("fetch_value", &session_id, None, |_| Some(1), d.fetch_value(&handle)).await
     })
-    .await
+    .await;
+    state.redacted(&session_id, r).await
 }
 
 /// T-018: stream an oversized value to a file without it passing through the
