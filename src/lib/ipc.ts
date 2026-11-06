@@ -40,6 +40,15 @@ export function coreVersion(): Promise<string> {
   return invoke<string>("core_version");
 }
 
+/** T-033: disposable UI state from the cache dir; `null` when there is none. */
+export function loadUiState(): Promise<unknown> {
+  return invoke<unknown>("load_ui_state");
+}
+
+export function saveUiState(state: unknown): Promise<void> {
+  return invoke<void>("save_ui_state", { state });
+}
+
 export function storeCredential(
   profileId: string,
   secret: string,

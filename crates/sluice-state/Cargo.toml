@@ -1,0 +1,18 @@
+[package]
+name = "sluice-state"
+description = "App-state stores: portable config, SQLite history, disposable cache (D-014)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+directories = "6.0.0"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { version = "1.2.1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

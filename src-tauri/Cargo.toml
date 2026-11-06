@@ -45,6 +45,7 @@ tauri-plugin-single-instance = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+sluice-state = { version = "0.1.0", path = "../crates/sluice-state" }
 
 # D-001: database crates link HERE, in the Rust process, and nowhere else. The
 # webview gets data over IPC only. Driver crates arrive with T-007 (Postgres).

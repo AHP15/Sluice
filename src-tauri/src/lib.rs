@@ -11,6 +11,7 @@ mod editor;
 mod execution;
 mod guardrails;
 mod launcher;
+mod state;
 mod stream;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +30,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::default())
+        .manage(state::Stores::default())
         .manage(launcher::Launcher::default())
         .manage(stream::Streams::default())
         .manage(std::sync::Arc::new(editor::Editors::default()))
@@ -61,6 +63,8 @@ pub fn run() {
 fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         commands::core_version,
+        state::load_ui_state,
+        state::save_ui_state,
         commands::store_credential,
         commands::connect,
         commands::take_launches,
@@ -94,6 +98,8 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
 fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         commands::core_version,
+        state::load_ui_state,
+        state::save_ui_state,
         commands::store_credential,
         commands::connect,
         commands::take_launches,

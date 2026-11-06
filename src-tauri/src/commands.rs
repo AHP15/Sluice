@@ -950,7 +950,16 @@ mod boundary_tests {
     #[test]
     fn every_tauri_command_is_panic_guarded() {
         const MARKER: &str = "#[tauri::command]";
-        let src = command_source();
+        // Every module that defines IPC commands, not just this one.
+        let mut src = command_source().to_string();
+        for (name, other) in [("state.rs", include_str!("state.rs"))] {
+            // Cut at the test *module*, not the first `#[cfg(test)]` — a
+            // test-only helper above the commands must not hide them.
+            let other = &other[..other.find("#[cfg(test)]\nmod tests").unwrap_or(other.len())];
+            assert!(other.contains(MARKER), "{name} commands are not being scanned");
+            src.push('\n');
+            src.push_str(other);
+        }
         let segments: Vec<&str> = src.split(MARKER).skip(1).collect();
         assert!(
             !segments.is_empty(),
