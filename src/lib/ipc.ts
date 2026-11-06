@@ -155,8 +155,9 @@ export interface ScriptRun {
   summary: string;
 }
 
-export function runScript(sessionId: string, script: string, queryId?: string): Promise<ScriptRun> {
-  return invoke<ScriptRun>("run_script", { sessionId, script, queryId: queryId ?? null });
+/** `confirm`: the typed phrase for a production session's confirmation (T-061). */
+export function runScript(sessionId: string, script: string, queryId?: string, confirm?: string): Promise<ScriptRun> {
+  return invoke<ScriptRun>("run_script", { sessionId, script, queryId: queryId ?? null, confirm: confirm ?? null });
 }
 
 /**
@@ -218,8 +219,8 @@ export function openEditor(sessionId: string): Promise<EditorOpened> {
   return invoke<EditorOpened>("open_editor", { sessionId });
 }
 
-export function runInEditor(editorId: string, script: string, queryId?: string): Promise<EditorRun> {
-  return invoke<EditorRun>("run_in_editor", { editorId, script, queryId: queryId ?? null });
+export function runInEditor(editorId: string, script: string, queryId?: string, confirm?: string): Promise<EditorRun> {
+  return invoke<EditorRun>("run_in_editor", { editorId, script, queryId: queryId ?? null, confirm: confirm ?? null });
 }
 
 /** T-041: the opt-in transaction controls. */

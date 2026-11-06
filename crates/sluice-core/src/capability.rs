@@ -165,6 +165,34 @@ pub struct TransactionSupport {
     pub max_idle_seconds: Option<u32>,
 }
 
+/// T-061 / D-027: whether the **database** refuses writes from this session.
+///
+/// Safety mode is only a guarantee if the server enforces it — a read-only
+/// role, login or user, or a standby. The driver probes what the session can
+/// actually do and says so; the UI never infers it from a profile flag.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ReadOnlyGuarantee {
+    /// Not probed, or the probe failed: nothing is known.
+    Unknown { reason: String },
+    /// The server will refuse writes from this session, and why.
+    Enforced { basis: String },
+    /// The session can write; each reason is one way it can.
+    NotEnforced { reasons: Vec<String> },
+}
+
+impl Default for ReadOnlyGuarantee {
+    fn default() -> Self {
+        ReadOnlyGuarantee::Unknown { reason: "not probed".into() }
+    }
+}
+
+impl ReadOnlyGuarantee {
+    pub fn is_enforced(&self) -> bool {
+        matches!(self, ReadOnlyGuarantee::Enforced { .. })
+    }
+}
+
 /// The full descriptor a driver publishes about itself.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Capabilities {
@@ -198,4 +226,7 @@ pub struct Capabilities {
     /// tool's. `None` where the engine has no such notion.
     #[serde(default)]
     pub string_collation: Option<String>,
+    /// T-061 / D-027: what the server enforces about writes from this session.
+    #[serde(default)]
+    pub read_only: ReadOnlyGuarantee,
 }

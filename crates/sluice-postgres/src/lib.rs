@@ -11,6 +11,7 @@ pub mod error_map;
 pub mod lease;
 pub mod navigator;
 pub mod pinned;
+pub mod read_only;
 pub mod tls;
 pub mod version;
 
@@ -132,6 +133,9 @@ pub struct PgDriver {
     /// deterministic, read at connect. Deterministic means `=` and `LIKE`
     /// distinguish case — the semantics the filter bar reports.
     collation: Option<(String, bool)>,
+    /// T-061 / D-027: whether the server refuses writes from this role,
+    /// probed at connect.
+    read_only: sluice_core::ReadOnlyGuarantee,
     /// T-053 / D-016: one level of the navigator tree per parent, filled on
     /// first expand and kept until DDL the app ran, or an explicit refresh.
     /// Shared across `with_*` copies, like the pool.
@@ -217,6 +221,7 @@ impl PgDriver {
             stats: Arc::new(PoolStats::default()),
             redactor: sluice_core::Redactor::new(spec.password.clone()),
             collation: None,
+            read_only: sluice_core::ReadOnlyGuarantee::default(),
             nav_cache: Arc::default(),
             cancel: None,
             budget: sluice_core::ExecBudget::default(),
@@ -261,7 +266,13 @@ impl PgDriver {
         // D-028: no `DISCARD ALL` means no native reset — reopen instead.
         let reset = if server.has_discard_all() { ResetSupport::Native } else { ResetSupport::ReopenOnly };
 
-        Ok(Arc::new(Self { server: Some(server), collation, reset, ..driver }))
+        // T-061: what the database enforces about writes. Never fails connect.
+        let read_only = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| Ok(read_only::probe(client).await))
+            .await
+            .unwrap_or_default();
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
@@ -274,6 +285,7 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            read_only: self.read_only.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -293,6 +305,7 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            read_only: self.read_only.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -764,6 +777,7 @@ impl PgDriver {
             stats: self.stats.clone(),
             redactor: self.redactor.clone(),
             collation: self.collation.clone(),
+            read_only: self.read_only.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -853,6 +867,7 @@ impl Driver for PgDriver {
             fixed_schema: true,
             supports_script: true,
             string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
+            read_only: self.read_only.clone(),
         }
     }
 

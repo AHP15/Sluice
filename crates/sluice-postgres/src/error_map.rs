@@ -64,6 +64,7 @@ pub fn map_error(err: &tokio_postgres::Error, statement: Option<&str>) -> Driver
         schema: db.schema().map(str::to_string),
         retryable: Some(is_retryable(db.code())),
         credential_reentry: None,
+        confirmation: None,
     };
 
     let mut extra: Vec<(String, String)> = Vec::new();

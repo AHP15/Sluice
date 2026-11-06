@@ -120,6 +120,8 @@ export interface Capabilities {
   supports_script: boolean;
   /** T-015: the server's default string collation (what `case_sensitive` reflects). */
   string_collation: string | null;
+  /** T-061: what the server enforces about writes from this session. */
+  read_only?: ReadOnlyGuarantee;
 }
 
 export type Predicate = {
@@ -222,6 +224,8 @@ export interface DriverError {
     retryable?: boolean | null;
     /** T-071: the stored credential could not be used; ask for it again. */
     credential_reentry?: boolean | null;
+    /** T-061: nothing ran; this production session needs typed confirmation. */
+    confirmation?: ConfirmationRequest | null;
   };
   payload?: {
     code?: string | null;
@@ -318,6 +322,8 @@ export interface ProfileMeta {
    * a production-flagged profile, on otherwise.
    */
   history?: "on" | "off" | null;
+  /** T-061: meant to be read-only; whether the database enforces it is probed. */
+  read_only?: boolean;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */
@@ -347,7 +353,20 @@ export interface Guardrails {
   saved: boolean;
   production: { armed: boolean; reasons: string[] };
   history: "on" | "off";
-  safety_mode: "unknown";
+  /** T-061: the profile's read-only intent beside what the database enforces. */
+  safety_mode: { requested: boolean; database: ReadOnlyGuarantee };
+}
+
+/** T-061 / D-027: whether the server itself refuses writes from this session. */
+export type ReadOnlyGuarantee =
+  | { state: "unknown"; reason: string }
+  | { state: "enforced"; basis: string }
+  | { state: "not_enforced"; reasons: string[] };
+
+/** T-061: a statement held back until the user types `phrase`. */
+export interface ConfirmationRequest {
+  phrase: string;
+  statements: { statement: string; reason: string }[];
 }
 
 /**

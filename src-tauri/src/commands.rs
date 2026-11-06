@@ -63,6 +63,11 @@ pub struct ProfileMeta {
     /// default — off for a production-flagged profile, on otherwise.
     #[serde(default)]
     pub history: Option<crate::guardrails::HistoryPolicy>,
+    /// T-061 / D-027: this profile is meant to be read-only. A statement of
+    /// intent only — whether the database enforces it is probed at connect
+    /// and reported beside it (`Guardrails.safety_mode`).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// What the UI learns after connecting.
@@ -303,7 +308,9 @@ pub async fn connect(
         let session_id = format!("{}::{}", profile.id, short_token());
         state.drivers.lock().await.insert(session_id.clone(), driver);
 
-        let guardrails = Guardrails::manual(&profile.host, &profile.dbname).with_history(profile.history);
+        let guardrails = Guardrails::manual(&profile.host, &profile.dbname)
+            .with_history(profile.history)
+            .with_safety(profile.read_only, capabilities.read_only.clone());
         state.sessions.lock().await.insert(
             session_id.clone(),
             SessionRecord {
@@ -380,7 +387,8 @@ pub async fn connect_launch(
             LaunchOrigin::Evaluated { .. } => Provenance::Evaluated,
             LaunchOrigin::Url => Provenance::CommandLine,
         };
-        let guardrails = Guardrails::ephemeral(provenance, &t.host, &t.database);
+        let guardrails =
+            Guardrails::ephemeral(provenance, &t.host, &t.database).with_safety(false, capabilities.read_only.clone());
         state.sessions.lock().await.insert(
             session_id.clone(),
             SessionRecord {
@@ -399,6 +407,7 @@ pub async fn connect_launch(
                     transport: Transport::default(),
                     auth: CredentialProvider::default(),
                     history: None,
+                    read_only: false,
                 },
                 statement_timeout: timeout,
                 // R-002: a launch is its own ephemeral profile, and its budget.
@@ -816,6 +825,7 @@ pub async fn run_in_editor(
     editor_id: String,
     script: String,
     query_id: Option<String>,
+    confirm: Option<String>,
 ) -> Result<EditorRun, DriverError> {
     let started = std::time::Instant::now();
     let for_history = script.clone();
@@ -827,6 +837,7 @@ pub async fn run_in_editor(
         .session_of(&editor_id)
         .await
         .ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
+    production_gate(&state, &session_id, &script, confirm.as_deref()).await?;
     let r = guard_driver_call(&sid(&session_id), async {
         let pinned = editors.get(&editor_id).await.ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
         let d = state.driver(&session_id).await?;
@@ -912,7 +923,9 @@ pub async fn run_script(
     session_id: String,
     script: String,
     query_id: Option<String>,
+    confirm: Option<String>,
 ) -> Result<ScriptRun, DriverError> {
+    production_gate(&state, &session_id, &script, confirm.as_deref()).await?;
     let started = std::time::Instant::now();
     let target = state.history_target(&session_id).await;
     let for_history = script.clone();
@@ -934,6 +947,40 @@ pub async fn run_script(
     let r = state.redacted(&session_id, r).await;
     record_history(&stores, target, &for_history, started, r.as_ref().map(|run| &run.result));
     r
+}
+
+/// T-061 / D-027: on a production-armed session, DDL and unqualified
+/// DELETE/UPDATE run only after the user types the database name. Enforced
+/// here, in the core, from the session's own guardrails (T-027) — not from a
+/// UI flag the webview could skip. A refusal carries what needs confirming,
+/// and nothing has run.
+pub(crate) async fn production_gate(
+    state: &AppState,
+    session_id: &str,
+    script: &str,
+    confirm: Option<&str>,
+) -> Result<(), DriverError> {
+    let (armed, phrase) = match state.sessions.lock().await.get(session_id) {
+        Some(r) => (r.guardrails.production.armed, r.target.dbname.clone()),
+        None => return Ok(()),
+    };
+    check_confirmation(armed, &phrase, script, confirm)
+}
+
+fn check_confirmation(armed: bool, phrase: &str, script: &str, confirm: Option<&str>) -> Result<(), DriverError> {
+    if !armed {
+        return Ok(());
+    }
+    let statements = sluice_core::dangerous_statements(script);
+    if statements.is_empty() || confirm.map(str::trim) == Some(phrase) {
+        return Ok(());
+    }
+    let mut e = DriverError::new(
+        ErrorKind::Conflict,
+        format!("this is a production connection — type `{phrase}` to confirm"),
+    );
+    e.hints.confirmation = Some(sluice_core::ConfirmationRequest { phrase: phrase.to_string(), statements });
+    Err(e)
 }
 
 /// T-035 / T-025: append one execution to query history, if the session's
@@ -1061,6 +1108,24 @@ mod boundary_tests {
         }
     }
 
+    /// T-061: confirmation is required only when armed and only for the
+    /// statements that need it; the exact phrase runs it.
+    #[test]
+    fn production_sessions_require_the_typed_database_name() {
+        assert!(check_confirmation(false, "shop", "DROP TABLE t", None).is_ok(), "unarmed: no gate");
+        assert!(check_confirmation(true, "shop", "SELECT 1", None).is_ok(), "harmless: no gate");
+
+        let e = check_confirmation(true, "shop", "SELECT 1; DELETE FROM orders", None).unwrap_err();
+        let c = e.hints.confirmation.expect("says what to confirm");
+        assert_eq!(c.phrase, "shop");
+        assert_eq!(c.statements.len(), 1);
+        assert!(c.statements[0].statement.starts_with("DELETE FROM orders"));
+
+        assert!(check_confirmation(true, "shop", "DELETE FROM orders", Some("Shop")).is_err(), "exact, case and all");
+        assert!(check_confirmation(true, "shop", "DELETE FROM orders", Some("yes")).is_err());
+        assert!(check_confirmation(true, "shop", "DELETE FROM orders", Some(" shop ")).is_ok());
+    }
+
     #[test]
     fn only_direct_transports_connect() {
         assert!(require_direct(&Transport::default()).is_ok());
@@ -1181,6 +1246,7 @@ mod boundary_tests {
             transport: Transport::default(),
             auth: CredentialProvider::Env { var: "APP_DB_PASS".into() },
             history: Some(crate::guardrails::HistoryPolicy::Off),
+            read_only: true,
         };
         let json = serde_json::to_string(&p).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {
@@ -1206,6 +1272,7 @@ mod boundary_tests {
                 transport: Transport::default(),
                 auth: CredentialProvider::default(),
                 history: None,
+                read_only: false,
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
             notice: None,

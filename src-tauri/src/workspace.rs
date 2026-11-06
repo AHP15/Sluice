@@ -108,6 +108,10 @@ pub struct ProfileEntry {
     /// production-flagged profile, on otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryPolicy>,
+    /// T-061: this profile is meant to be read-only; whether the database
+    /// enforces it is probed at connect. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 /// One `[[query]]` table.
@@ -147,6 +151,7 @@ impl ProfileEntry {
             transport: m.transport.clone(),
             auth: m.auth.clone(),
             history: m.history,
+            read_only: m.read_only,
         }
     }
 
@@ -164,6 +169,7 @@ impl ProfileEntry {
             transport: self.transport.clone(),
             auth: self.auth.clone(),
             history: self.history,
+            read_only: self.read_only,
         }
     }
 }
@@ -347,6 +353,7 @@ pub fn decompose_url(url: &sluice_core::Secret<String>, id: &str, label: &str) -
         transport: Transport::default(),
         auth: CredentialProvider::default(),
         history: None,
+        read_only: false,
     };
     Ok(ImportedUrl { entry, password: parsed.password })
 }
@@ -443,6 +450,7 @@ mod tests {
             transport: Transport::default(),
             auth: CredentialProvider::default(),
             history: None,
+            read_only: false,
         }
     }
 

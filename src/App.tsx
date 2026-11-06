@@ -20,6 +20,7 @@ import {
 import { Button } from "./components/ui/button";
 import type {
   ColumnDesc,
+  ConfirmationRequest,
   DriverError,
   EditGate,
   EditPlan,
@@ -70,6 +71,7 @@ import { cn } from "./lib/utils";
 import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
 import { SavedQueries } from "./components/SavedQueries";
 import { FilterBar } from "./components/FilterBar";
+import { ConfirmPanel } from "./components/ConfirmPanel";
 import { invalidateHistory } from "./components/HistoryPanel";
 
 interface RowsView {
@@ -410,11 +412,15 @@ function Workspace({ seed }: { seed: TabSeed }) {
   // T-051: the running script's id, so Stop can cancel it.
   const runningQuery = useRef<string | null>(null);
 
-  const onRun = useCallback(async () => {
+  // T-061: statements a production session held back, awaiting typed confirmation.
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
+
+  const onRun = useCallback(async (confirm?: string) => {
     if (!session) return;
     if (holdForPending()) return;
     setBusy(true);
     setError(null);
+    setConfirmation(null);
     const queryId = crypto.randomUUID();
     runningQuery.current = queryId;
     try {
@@ -428,7 +434,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
           return;
         }
         try {
-          const r = await runInEditor(id, draftQuery, queryId);
+          const r = await runInEditor(id, draftQuery, queryId, confirm);
           setEditor((e) => (e ? { ...e, status: r.status } : e));
           run = r.run;
         } catch (e) {
@@ -439,7 +445,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
           throw e;
         }
       } else {
-        run = await runScript(session.session_id, draftQuery, queryId);
+        run = await runScript(session.session_id, draftQuery, queryId, confirm);
       }
       setOutcomes(run.result.outcomes);
       setSummary(run.summary);
@@ -453,7 +459,9 @@ function Workspace({ seed }: { seed: TabSeed }) {
         });
       }
     } catch (e) {
-      setError(String((e as { message?: string })?.message ?? e));
+      const held = (e as DriverError)?.hints?.confirmation;
+      if (held) setConfirmation(held);
+      else setError(String((e as { message?: string })?.message ?? e));
     } finally {
       runningQuery.current = null;
       setBusy(false);
@@ -553,7 +561,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 Stop
               </Button>
             ) : (
-              <Button size="sm" variant="secondary" onClick={onRun} disabled={!session || busy}>
+              <Button size="sm" variant="secondary" onClick={() => void onRun()} disabled={!session || busy}>
                 <Play className="h-3.5 w-3.5" />
                 Run
               </Button>
@@ -628,8 +636,15 @@ function Workspace({ seed }: { seed: TabSeed }) {
               profileId={session ? session.session_id.split("::")[0] : null}
               onLoad={setDraftQuery}
             />
+            {confirmation && (
+              <ConfirmPanel
+                request={confirmation}
+                onConfirm={(phrase) => void onRun(phrase)}
+                onCancel={() => setConfirmation(null)}
+              />
+            )}
             <section className="h-40 shrink-0 border-b">
-              <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={onRun} />
+              <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={() => void onRun()} />
             </section>
 
             {(summary || error) && (
@@ -826,9 +841,7 @@ function GuardrailBar({
         </span>
       )}
       <span className="rounded bg-secondary px-1.5 py-0.5">history {g.history}</span>
-      <span className="rounded bg-secondary px-1.5 py-0.5" title="Whether the database itself enforces read-only access is not known yet.">
-        safety mode: {g.safety_mode}
-      </span>
+      <SafetyBadge mode={g.safety_mode} />
       {g.production.armed && (
         <span
           className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
@@ -867,6 +880,43 @@ function GuardrailBar({
       )}
       {err && <span className="text-destructive">{err}</span>}
     </div>
+  );
+}
+
+/**
+ * T-061 / D-027: read-only is shown as what the *database* enforces, beside
+ * what the profile asked for. Asked-for but not enforced is the case that
+ * must be loud — the app does not close that gap, the database role does.
+ */
+function SafetyBadge({ mode }: { mode: Guardrails["safety_mode"] }) {
+  const db = mode.database;
+  if (db.state === "enforced") {
+    return (
+      <span className="rounded bg-secondary px-1.5 py-0.5" title={db.basis}>
+        read-only · enforced by the database
+      </span>
+    );
+  }
+  if (mode.requested) {
+    const why = db.state === "not_enforced" ? db.reasons.join("\n") : db.reason;
+    return (
+      <span
+        className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
+        title={why}
+      >
+        <ShieldAlert className="h-3 w-3" />
+        read-only requested but NOT enforced by the database
+        {db.state === "not_enforced" ? `: ${db.reasons[0]}` : " (could not verify)"}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="rounded bg-secondary px-1.5 py-0.5"
+      title={db.state === "not_enforced" ? db.reasons.join("\n") : db.reason}
+    >
+      {db.state === "not_enforced" ? "writable" : "write access unknown"}
+    </span>
   );
 }
 
@@ -1130,6 +1180,19 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
           <option value="accept_invalid_certs">Accept invalid certificates</option>
           <option value="disabled">Disabled</option>
         </select>
+      </label>
+      <label className="flex items-center gap-1.5 px-2 py-1 text-xs">
+        <input
+          type="checkbox"
+          checked={form.read_only ?? false}
+          onChange={(e) => setForm({ ...form, read_only: e.target.checked })}
+        />
+        <span>
+          Read-only profile
+          <span className="block text-[10px] text-muted-foreground">
+            Use a read-only database role; Sluice checks whether the server enforces it.
+          </span>
+        </span>
       </label>
       <label className="block px-2 py-1 text-xs">
         <span className="text-muted-foreground">Query history</span>

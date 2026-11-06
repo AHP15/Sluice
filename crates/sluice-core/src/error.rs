@@ -87,6 +87,19 @@ pub struct ErrorHints {
     /// re-store it rather than show a dead end. `None` means no opinion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_reentry: Option<bool>,
+    /// T-061 / D-027: the statement was not run because this production
+    /// session requires typed confirmation for it. Resubmitting with the
+    /// phrase typed exactly runs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationRequest>,
+}
+
+/// What the user must confirm, and the phrase that confirms it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmationRequest {
+    /// Typed exactly — the database name, so the user is made to say *where*.
+    pub phrase: String,
+    pub statements: Vec<crate::danger::Dangerous>,
 }
 
 impl ErrorHints {

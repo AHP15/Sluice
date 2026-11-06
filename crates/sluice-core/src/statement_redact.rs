@@ -162,7 +162,7 @@ fn quoted(k: Kind) -> String {
 // --------------------------------------------------------------- tokenizer
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Code,
     /// `'…'`, including `E'…'` and `N'…'` (the prefix stays in `Code`).
     Single,
@@ -187,15 +187,15 @@ impl Kind {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Seg {
-    kind: Kind,
-    start: usize,
-    end: usize,
+pub(crate) struct Seg {
+    pub(crate) kind: Kind,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// Split into code, literals and comments. `None` on an unterminated
 /// literal or block comment — the caller decides how conservative to be.
-fn tokenize(sql: &str, js: bool) -> Option<Vec<Seg>> {
+pub(crate) fn tokenize(sql: &str, js: bool) -> Option<Vec<Seg>> {
     let b = sql.as_bytes();
     let mut segs = Vec::new();
     let mut i = 0;
