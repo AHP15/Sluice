@@ -38,11 +38,11 @@ T-037 | todo | S | D-011,R-019 | Correct the safe-to-commit claim on the profile
 T-038 | todo | S | D-008 | Model transport variants and credential providers in the profile schema |
 T-039 | done | M | D-028 | Per-profile pool with capability-declared connection reset | 2026-11-06
 T-040 | done | M | D-028,R-036 | Reset only connections that were actually dirtied | 2026-11-06
-T-041 | todo | M | D-028 | Pinned editor sessions with opt-in explicit transactions |
-T-042 | todo | M | D-028 | Single per-profile connection budget covering pooled and pinned |
-T-043 | todo | M | D-028,R-037 | Restrict LRU eviction to provably stateless tabs and never reconnect silently |
+T-041 | done | M | D-028 | Pinned editor sessions with opt-in explicit transactions | 2026-11-06
+T-042 | done | M | D-028 | Single per-profile connection budget covering pooled and pinned | 2026-11-06
+T-043 | done | M | D-028,R-037 | Restrict LRU eviction to provably stateless tabs and never reconnect silently | 2026-11-06
 T-044 | todo | M | D-028,R-038 | Reserve a browse floor inside the connection budget |
-T-045 | todo | S | D-028,R-039 | Three-valued session affinity capability |
+T-045 | done | S | D-028,R-039 | Three-valued session affinity capability | 2026-11-06
 T-046 | done | S | R-039 | Spike: verify what mongodb ClientSession delivers for an editor tab | 2026-08-02
 T-047 | done | L | D-010 | Keyset pagination with declared fallback strategy | 2026-11-06
 T-048 | todo | M | D-010,R-010 | Per-relation keyset declaration accounting for composite key arity |
@@ -53,10 +53,10 @@ T-052 | todo | M | D-010,R-042 | Decouple socket draining from webview consumpti
 T-053 | done | L | D-016 | Native catalog introspection loaded lazily with explicit refresh | 2026-11-06
 T-054 | done | M | D-016 | Server version and flavour detection into the capability descriptor | 2026-11-06
 T-055 | todo | M | D-016,R-028 | Probe catalog capabilities rather than trusting the version banner |
-T-056 | todo | L | D-027 | Staged edits applied in one transaction behind a unique-key gate |
-T-057 | todo | M | D-027,R-003 | Derive the edit preview from the same artifact that executes |
-T-058 | todo | M | D-027 | Null-safe optimistic concurrency with declared column comparability |
-T-059 | todo | M | D-027,R-034 | Bind concurrency originals with an explicit per-type cast |
+T-056 | done | L | D-027 | Staged edits applied in one transaction behind a unique-key gate | 2026-11-06
+T-057 | done | M | D-027,R-003 | Derive the edit preview from the same artifact that executes | 2026-11-06
+T-058 | done | M | D-027 | Null-safe optimistic concurrency with declared column comparability | 2026-11-06
+T-059 | done | M | D-027,R-034 | Bind concurrency originals with an explicit per-type cast | 2026-11-06
 T-060 | todo | M | D-027,R-035 | Determine concurrency comparability by probing the catalog |
 T-061 | todo | M | D-027 | Database-enforced safety mode and production confirmation |
 T-062 | todo | M | D-027,D-018,R-026 | Classify Mongo document paths as editable or read-only |

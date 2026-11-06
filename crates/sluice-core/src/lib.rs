@@ -45,7 +45,7 @@ pub use panic_guard::{
     NonPoisonMutex, SessionId,
 };
 pub use request::{
-    BrowseRequest, EditRequest, FilterTree, NavNode, NodeId, Original, Predicate, RawRequest,
+    BoundParam, BrowseRequest, EditGate, EditPlan, EditRequest, PlannedStatement, FilterTree, NavNode, NodeId, Original, Predicate, RawRequest,
     SortKey,
 };
 pub use redact::{redact_shapes, Redactor};
@@ -146,6 +146,38 @@ mod contract_tests {
         assert_eq!(back.engine, "postgres");
         assert_eq!(back.affinity, SessionAffinity::Connection);
         assert_eq!(back.reset, ResetSupport::Native);
+    }
+
+    /// T-045 / R-039: affinity is never defaulted. A descriptor that omits it
+    /// must fail to load rather than quietly becoming `none` — that default is
+    /// the exact foreclosure R-039 was raised against.
+    #[test]
+    fn affinity_has_no_default() {
+        let mut v: serde_json::Value = serde_json::json!({
+            "engine": "x", "server_version": null, "flavour": null,
+            "affinity": "session", "reset": "not_applicable", "cancel": "none",
+            "transactions": null, "raw_payload": "command_document",
+            "node_kinds": [], "filter_ops": [], "fixed_schema": false,
+            "supports_script": false
+        });
+        let ok: Capabilities = serde_json::from_value(v.clone()).expect("complete descriptor loads");
+        assert_eq!(ok.affinity, SessionAffinity::Session);
+
+        v.as_object_mut().unwrap().remove("affinity");
+        let err = serde_json::from_value::<Capabilities>(v).unwrap_err().to_string();
+        assert!(err.contains("affinity"), "{err}");
+    }
+
+    /// The three wire spellings the webview's `editorSessionPolicy` switches on.
+    #[test]
+    fn affinity_wire_spellings() {
+        for (a, s) in [
+            (SessionAffinity::Connection, "\"connection\""),
+            (SessionAffinity::Session, "\"session\""),
+            (SessionAffinity::None, "\"none\""),
+        ] {
+            assert_eq!(serde_json::to_string(&a).unwrap(), s);
+        }
     }
 
     /// T-073 F-1: absent and null are different values, and must stay different

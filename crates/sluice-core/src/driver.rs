@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use crate::capability::Capabilities;
 use crate::error::DriverError;
 use crate::outcome::ExecutionResult;
-use crate::request::{BrowseRequest, EditRequest, NavNode, NodeId, RawRequest};
+use crate::request::{BrowseRequest, EditPlan, EditRequest, NavNode, NodeId, RawRequest};
 
 #[async_trait]
 pub trait Driver: Send + Sync + 'static {
@@ -28,11 +28,20 @@ pub trait Driver: Send + Sync + 'static {
     /// Compile and run a structured browse (T-009).
     async fn browse(&self, request: BrowseRequest) -> Result<ExecutionResult, DriverError>;
 
+    /// The exact statements `apply_edits` would run for `edits`, without
+    /// running them (T-057 / R-003). Built by the same code path as apply.
+    async fn preview_edits(&self, edits: Vec<EditRequest>) -> Result<EditPlan, DriverError>;
+
     /// Apply staged edits. D-027 requires all of them in ONE transaction, so
     /// they arrive together rather than one call per row (T-056).
+    ///
+    /// `expected_digest` is the `EditPlan::digest` the user previewed; when
+    /// given, the driver refuses — before opening a transaction — if the edits
+    /// no longer compile to exactly that plan (T-057).
     async fn apply_edits(
         &self,
         edits: Vec<EditRequest>,
+        expected_digest: Option<String>,
     ) -> Result<ExecutionResult, DriverError>;
 
     /// The raw editor passthrough. Callers must send the variant this driver

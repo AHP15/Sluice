@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sluice_core::{
-    guard_driver_call, BrowseRequest, Capabilities, Driver, DriverError, ErrorKind,
+    guard_driver_call, BrowseRequest, Capabilities, Driver, DriverError, EditPlan, EditRequest, ErrorKind,
     ExecutionResult, NavNode, NodeId, RawRequest, Secret, SessionId, WireValue,
 };
 use sluice_postgres::{tls::TlsMode, ConnectSpec, PgDriver};
@@ -47,6 +47,10 @@ pub struct ProfileMeta {
     /// the default (`execution::DEFAULT_STATEMENT_TIMEOUT`); `0` means none.
     #[serde(default)]
     pub statement_timeout_secs: Option<u32>,
+    /// T-042 / D-028: this profile's connection budget — pooled and pinned
+    /// together. Unset means `DEFAULT_CONNECTION_BUDGET`.
+    #[serde(default)]
+    pub connection_budget: Option<u32>,
 }
 
 /// What the UI learns after connecting.
@@ -73,11 +77,17 @@ struct SessionRecord {
     /// T-051: the session's statement timeout, for the client-side watchdog
     /// that backs up the server's.
     statement_timeout: Option<std::time::Duration>,
+    /// T-042: the profile whose driver (and so budget) this session shares.
+    profile_key: String,
 }
 
 #[derive(Default)]
 pub struct AppState {
     drivers: Mutex<HashMap<String, Arc<PgDriver>>>,
+    /// T-042 / D-028: one driver — one pool, one connection budget — per
+    /// profile, shared by every tab connected to it. Weak, so the driver goes
+    /// when its last session does.
+    profiles: Mutex<HashMap<String, std::sync::Weak<PgDriver>>>,
     sessions: Mutex<HashMap<String, SessionRecord>>,
     creds: CredentialStore,
     queries: crate::execution::Queries,
@@ -95,6 +105,10 @@ impl AppState {
                 None => sluice_core::Redactor::default().error(e),
             }),
         }
+    }
+
+    async fn profile_key(&self, session_id: &str) -> Option<String> {
+        self.sessions.lock().await.get(session_id).map(|r| r.profile_key.clone())
     }
 
     async fn timeout(&self, session_id: &str) -> Option<std::time::Duration> {
@@ -159,10 +173,26 @@ pub async fn connect(
         };
         let timeout = spec.statement_timeout;
 
-        let redactor = sluice_core::Redactor::new(spec.password.clone());
-        let driver = logged("connect", &profile.id, None, |_| None, PgDriver::connect(spec))
-            .await
-            .map_err(|e| redactor.error(e))?;
+        // T-042: a second tab on the same profile shares its driver, so the
+        // profile's budget covers both. Keyed by id *and* settings, so an
+        // edited profile does not inherit a pool built for the old ones.
+        let profile_key = format!("{}::{}", profile.id, serde_json::to_string(&profile).unwrap_or_default());
+        let existing = state.profiles.lock().await.get(&profile_key).and_then(std::sync::Weak::upgrade);
+        let driver = match existing {
+            Some(d) => d,
+            None => {
+                let budget = profile
+                    .connection_budget
+                    .map(|b| b.max(1) as usize)
+                    .unwrap_or(sluice_postgres::DEFAULT_CONNECTION_BUDGET);
+                let redactor = sluice_core::Redactor::new(spec.password.clone());
+                let d = logged("connect", &profile.id, None, |_| None, PgDriver::connect_with_pool_size(spec, budget))
+                    .await
+                    .map_err(|e| redactor.error(e))?;
+                state.profiles.lock().await.insert(profile_key.clone(), Arc::downgrade(&d));
+                d
+            }
+        };
         let capabilities = driver.capabilities();
 
         let session_id = format!("{}::{}", profile.id, short_token());
@@ -176,6 +206,7 @@ pub async fn connect(
                 ephemeral_url: None,
                 target: profile.clone(),
                 statement_timeout: timeout,
+                profile_key,
             },
         );
 
@@ -259,8 +290,11 @@ pub async fn connect_launch(
                     dbname: t.database.clone(),
                     tls: t.tls,
                     statement_timeout_secs: None,
+                    connection_budget: None,
                 },
                 statement_timeout: timeout,
+                // R-002: a launch is its own ephemeral profile, and its budget.
+                profile_key: launch_id.clone(),
             },
         );
 
@@ -315,8 +349,8 @@ pub async fn open_browse_stream(
                     let (gate, on_event, seq, stop) = (gate.clone(), on_event.clone(), seq.clone(), stop.clone());
                     async move {
                         match batch {
-                            sluice_postgres::BrowseBatch::Columns(columns) => {
-                                on_event.send(StreamEvent::Columns { columns }).is_ok()
+                            sluice_postgres::BrowseBatch::Columns(columns, edit) => {
+                                on_event.send(StreamEvent::Columns { columns, edit }).is_ok()
                             }
                             sluice_postgres::BrowseBatch::Rows(rows) => match gate.acquire(deadline).await {
                                 Ok(()) => {
@@ -500,9 +534,12 @@ pub async fn verbose_diagnostics() -> Result<bool, DriverError> {
 #[tauri::command]
 pub async fn disconnect(
     state: tauri::State<'_, AppState>,
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
     session_id: String,
 ) -> Result<(), DriverError> {
     guard_driver_call(&sid(&session_id), async {
+        // T-041: the session's editors roll back and release first.
+        editors.close_for_session(&session_id).await;
         state.drivers.lock().await.remove(&session_id);
         state.sessions.lock().await.remove(&session_id);
         Ok(())
@@ -541,6 +578,188 @@ pub async fn browse(
     })
     .await;
     state.redacted(&session_id, r).await
+}
+
+/// T-057 / R-003: the exact statements staged edits compile to, for review.
+///
+/// Built by the same driver code path as `apply_edits`; the returned
+/// `digest` is what apply must present.
+#[tauri::command]
+pub async fn preview_edits(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    edits: Vec<EditRequest>,
+) -> Result<EditPlan, DriverError> {
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        logged("preview_edits", &session_id, None, |p: &EditPlan| Some(p.statements.len()), d.preview_edits(edits)).await
+    })
+    .await;
+    state.redacted(&session_id, r).await
+}
+
+/// T-056 / D-027: apply the grid's staged edits, all in one transaction.
+///
+/// The webview sends structured edits, never SQL (D-029). The driver
+/// re-derives each relation's unique-key gate before writing, so a webview
+/// that offered an edit it should not have cannot make it land.
+///
+/// T-057: `expected_digest` is required here. The webview can only apply what
+/// it previewed: the driver recompiles the edits and refuses unless they
+/// produce exactly the previewed statements and parameters.
+#[tauri::command]
+pub async fn apply_edits(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    edits: Vec<EditRequest>,
+    expected_digest: String,
+    query_id: Option<String>,
+) -> Result<ScriptRun, DriverError> {
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        let limit = state.timeout(&session_id).await;
+        let call = crate::execution::run(&state.queries, query_id, d, limit, |d| async move {
+            d.apply_edits(edits, Some(expected_digest)).await
+        });
+        let result = logged("apply_edits", &session_id, None, |r: &ExecutionResult| Some(r.outcomes.len()), call).await?;
+        let summary = result.summary();
+        Ok(ScriptRun { result, summary })
+    })
+    .await;
+    state.redacted(&session_id, r).await
+}
+
+/// T-041 / D-028: what opening an editor session returns.
+#[derive(Serialize, Clone, Debug)]
+pub struct EditorOpened {
+    pub editor_id: String,
+    pub status: sluice_postgres::pinned::SessionStatus,
+}
+
+/// T-041: pin a connection for one editor tab, for its lifetime.
+///
+/// Refused on an engine whose declared affinity is not `connection`: the UI
+/// decides from `editorSessionPolicy`, but the core does not trust it to.
+#[tauri::command]
+pub async fn open_editor(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
+    session_id: String,
+) -> Result<EditorOpened, DriverError> {
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        if d.capabilities().affinity != sluice_core::SessionAffinity::Connection {
+            return Err(DriverError::new(ErrorKind::Unknown, "this engine cannot pin a connection for an editor"));
+        }
+        // T-042 / D-028: within the profile's one budget — release an idle
+        // editor (LRU) or refuse, never evict an open transaction.
+        let profile_key = state.profile_key(&session_id).await.unwrap_or_else(|| session_id.clone());
+        if let Some(ev) = editors.make_room(&profile_key, d.connection_budget()).await? {
+            use tauri::Emitter;
+            let _ = app.emit(crate::editor::EDITOR_EVENT, ev);
+        }
+        let pinned = d.open_pinned().await?;
+        let status = pinned.status();
+        let editor_id = format!("editor-{}-{}", session_id, short_token());
+        editors
+            .insert(
+                editor_id.clone(),
+                crate::editor::Editor { session_id: session_id.clone(), profile_key, pinned: Arc::new(Mutex::new(pinned)) },
+            )
+            .await;
+        Ok(EditorOpened { editor_id, status })
+    })
+    .await;
+    state.redacted(&session_id, r).await
+}
+
+/// T-041: what one editor run returns — the run, and the session afterwards.
+#[derive(Serialize, Clone, Debug)]
+pub struct EditorRun {
+    pub run: ScriptRun,
+    pub status: sluice_postgres::pinned::SessionStatus,
+}
+
+/// T-041: run a script on the editor's pinned session. Cancellable by
+/// `query_id` and bounded by the profile timeout, like `run_script` (T-051).
+#[tauri::command]
+pub async fn run_in_editor(
+    state: tauri::State<'_, AppState>,
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
+    editor_id: String,
+    script: String,
+    query_id: Option<String>,
+) -> Result<EditorRun, DriverError> {
+    // T-042: a released editor is refused until it reconnects explicitly.
+    if let Some(why) = editors.released(&editor_id).await {
+        return Err(DriverError::new(ErrorKind::ConnectionFailed, why));
+    }
+    let session_id = editors
+        .session_of(&editor_id)
+        .await
+        .ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
+    let r = guard_driver_call(&sid(&session_id), async {
+        let pinned = editors.get(&editor_id).await.ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
+        let d = state.driver(&session_id).await?;
+        let limit = state.timeout(&session_id).await;
+        let text = script.clone();
+        let p = pinned.clone();
+        let call = crate::execution::run(&state.queries, query_id, d, limit, |d| async move {
+            let mut s = p.lock().await;
+            d.run_pinned(&mut s, &script).await
+        });
+        let result = logged("editor_script", &session_id, Some(&text), rows_in, call).await;
+        let status = pinned.lock().await.status();
+        let result = result?;
+        let summary = result.summary();
+        Ok(EditorRun { run: ScriptRun { result, summary }, status })
+    })
+    .await;
+    state.redacted(&session_id, r).await
+}
+
+/// T-041: the opt-in transaction controls.
+#[tauri::command]
+pub async fn editor_transaction(
+    state: tauri::State<'_, AppState>,
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
+    editor_id: String,
+    action: String,
+) -> Result<sluice_postgres::pinned::SessionStatus, DriverError> {
+    // T-042: a released editor is refused until it reconnects explicitly.
+    if let Some(why) = editors.released(&editor_id).await {
+        return Err(DriverError::new(ErrorKind::ConnectionFailed, why));
+    }
+    let session_id = editors
+        .session_of(&editor_id)
+        .await
+        .ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
+    let r = guard_driver_call(&sid(&session_id), async {
+        let pinned = editors.get(&editor_id).await.ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such editor session"))?;
+        let mut s = pinned.lock().await;
+        match action.as_str() {
+            "begin" => s.begin().await,
+            "commit" => s.commit().await,
+            "rollback" => s.rollback().await,
+            other => Err(DriverError::new(ErrorKind::Unknown, format!("unknown transaction action {other}"))),
+        }
+    })
+    .await;
+    state.redacted(&session_id, r).await
+}
+
+/// T-041: the tab is closing. Rolls back anything open — never commits.
+#[tauri::command]
+pub async fn close_editor(
+    editors: tauri::State<'_, Arc<crate::editor::Editors>>,
+    editor_id: String,
+) -> Result<(), DriverError> {
+    guard_driver_call(&sid(&editor_id), async {
+        editors.close(&editor_id).await;
+        Ok(())
+    })
+    .await
 }
 
 /// What the editor gets back.
@@ -740,6 +959,7 @@ mod boundary_tests {
             dbname: "main".into(),
             tls: TlsMode::Verify,
             statement_timeout_secs: None,
+            connection_budget: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {
@@ -761,6 +981,7 @@ mod boundary_tests {
                 dbname: "shop".into(),
                 tls: TlsMode::Verify,
                 statement_timeout_secs: None,
+                connection_budget: None,
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
         };

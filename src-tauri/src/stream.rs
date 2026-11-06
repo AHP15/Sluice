@@ -108,7 +108,8 @@ impl CreditGate {
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Columns { columns: Vec<ColumnDesc> },
+    /// T-056: `edit` says whether these rows may be edited, and if not, why.
+    Columns { columns: Vec<ColumnDesc>, edit: sluice_core::EditGate },
     Rows { seq: u64, rows: Vec<Vec<WireValue>> },
     /// T-047: `page` is the strategy used and where the next page starts.
     Done { rows: usize, truncated: bool, page: Option<sluice_core::PageInfo> },
@@ -261,7 +262,7 @@ mod tests {
                         let (gate, sent) = (gate.clone(), sent.clone());
                         async move {
                             match b {
-                                BrowseBatch::Columns(_) => true,
+                                BrowseBatch::Columns(..) => true,
                                 BrowseBatch::Rows(_) => {
                                     let ok = gate.acquire(deadline).await.is_ok();
                                     if ok {

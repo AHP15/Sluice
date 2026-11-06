@@ -67,6 +67,24 @@ pub struct BrowseRequest {
     pub offset: Option<u64>,
 }
 
+/// Whether a browsed relation's rows may be edited (T-056 / D-027).
+///
+/// D-027 requires a unique key to edit: without one, an `UPDATE ... WHERE`
+/// cannot be guaranteed to touch exactly the row the user is looking at. A
+/// relation without one is read-only and the UI says why, rather than offering
+/// an edit that would hit zero rows or several.
+///
+/// The driver re-derives this on every `apply_edits` call; the copy the UI
+/// holds decides what it *offers*, never what is *allowed*.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EditGate {
+    /// Rows are identified by `key`, a unique key whose columns are all
+    /// NOT NULL, in key order.
+    Editable { key: Vec<String> },
+    ReadOnly { reason: String },
+}
+
 /// One optimistic-concurrency original (T-058).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Original {
@@ -86,6 +104,62 @@ pub struct EditRequest {
     /// enter the predicate and MUST report the ones it dropped — see
     /// `Outcome::Affected::concurrency_omitted` (T-073 F-4).
     pub originals: Vec<Original>,
+}
+
+/// One bound parameter of a planned statement, as it is sent (T-057).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BoundParam {
+    /// The placeholder as it appears in `statement` (`$3` on Postgres).
+    pub placeholder: String,
+    /// The type the statement casts it to.
+    pub type_name: String,
+    /// The value exactly as bound; `None` is NULL.
+    pub value: Option<String>,
+}
+
+/// One statement the edit path will run, as a single artifact (T-057 / R-003).
+///
+/// `statement` and `params` are what executes. `inline` is a display-only
+/// rendering *of that same artifact*, never a second build from the edit set,
+/// and is `None` when some value cannot be faithfully shown inline — the UI then
+/// shows `statement` with the `params` table instead of inventing a literal.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PlannedStatement {
+    pub statement: String,
+    pub params: Vec<BoundParam>,
+    pub inline: Option<String>,
+    /// Written columns not checked for concurrent changes (T-058).
+    pub concurrency_omitted: Vec<String>,
+}
+
+/// The statements a set of staged edits compiles to, previewed before apply.
+///
+/// `digest` identifies exactly these statements and parameters. Apply passes
+/// it back, and the driver refuses to run anything that does not recompile to
+/// the same digest — so what executes is what was shown, even if the catalog
+/// changed in between.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EditPlan {
+    pub statements: Vec<PlannedStatement>,
+    pub digest: String,
+}
+
+impl EditPlan {
+    pub fn new(statements: Vec<PlannedStatement>) -> Self {
+        use std::hash::{Hash, Hasher};
+        // Fixed-key SipHash: stable across calls in one process, which is the
+        // lifetime a preview and its apply share. This is an equality check
+        // between two builds, not a security boundary.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for st in &statements {
+            st.statement.hash(&mut h);
+            for p in &st.params {
+                p.type_name.hash(&mut h);
+                p.value.hash(&mut h);
+            }
+        }
+        Self { digest: format!("{:016x}", h.finish()), statements }
+    }
 }
 
 /// The raw editor payload. Which variant is legal is declared by

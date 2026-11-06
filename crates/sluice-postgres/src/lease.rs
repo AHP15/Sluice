@@ -84,6 +84,15 @@ impl Lease {
             // reported every one of them as a bare connection failure with no
             // detail; the real error goes through the normal mapping instead.
             deadpool_postgres::PoolError::Backend(inner) => crate::error_map::map_error(&inner, None),
+            // T-042: the budget is spent and nothing came back in time.
+            deadpool_postgres::PoolError::Timeout(_) => DriverError::new(
+                ErrorKind::Timeout,
+                format!(
+                    "all {} connections in this profile's budget are in use (open editor sessions count towards it); \
+                     close an editor tab or wait for a running query to finish",
+                    pool.status().max_size
+                ),
+            ),
             other => DriverError::new(ErrorKind::ConnectionFailed, other.to_string()),
         })?;
         // T-040: clean until something session-mutating crosses it. Callers

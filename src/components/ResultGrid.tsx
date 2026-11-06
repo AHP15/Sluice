@@ -6,13 +6,29 @@ import {
   type ColumnDef,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Download, Eye, Loader2 } from "lucide-react";
-import type { ColumnDesc, WireValue } from "../lib/contract";
+import { Download, Eye, Loader2, Lock, Undo2 } from "lucide-react";
+import type { ColumnDesc, EditGate, WireValue } from "../lib/contract";
 import { formatBytes, isAbsent, renderValue } from "../lib/contract";
 import { fetchValue, saveValueToFile } from "../lib/ipc";
+import { cellReadOnlyReason, pendingCount, staged, unprotectedColumns, type Pending } from "../lib/pendingEdits";
 import { cn } from "../lib/utils";
+import { CellEditor } from "./CellEditor";
 
 type Row = WireValue[];
+
+/**
+ * T-056 / D-027: staged editing. Present only for a structured browse of one
+ * relation; raw query results are never editable.
+ */
+export interface GridEditing {
+  gate: EditGate;
+  pending: Pending;
+  onStage: (row: number, col: number, value: WireValue) => void;
+  onUnstage: (row: number, col: number) => void;
+  onApply: () => void;
+  onDiscard: () => void;
+  applying: boolean;
+}
 
 /**
  * The result grid (T-002 / D-023): TanStack Table for the table model, TanStack
@@ -34,11 +50,13 @@ export function ResultGrid({
   columns,
   rows,
   truncated,
+  editing,
 }: {
   sessionId: string;
   columns: ColumnDesc[];
   rows: WireValue[][];
   truncated: boolean;
+  editing?: GridEditing;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const rowHeight = 28;
@@ -65,7 +83,27 @@ export function ResultGrid({
             </div>
           </>
         ),
-        cell: (ctx) => <Cell sessionId={sessionId} value={ctx.getValue()} column={c} />,
+        cell: (ctx) => {
+          // Read through table meta so staging does not rebuild the columns.
+          const ed = (ctx.table.options.meta as { editing?: GridEditing } | undefined)?.editing;
+          const read = ctx.getValue();
+          const row = ctx.row.index;
+          const pending = ed ? staged(ed.pending, row, i) : undefined;
+          if (!ed || ed.gate.state !== "editable") {
+            return <Cell sessionId={sessionId} value={read} column={c} />;
+          }
+          return (
+            <EditableCell
+              sessionId={sessionId}
+              column={c}
+              read={read}
+              pending={pending}
+              disabled={ed.applying}
+              onStage={(v) => ed.onStage(row, i, v)}
+              onUnstage={() => ed.onUnstage(row, i)}
+            />
+          );
+        },
       })),
     [columns, sessionId],
   );
@@ -75,7 +113,10 @@ export function ResultGrid({
     columns: columnDefs,
     getCoreRowModel: getCoreRowModel(),
     columnResizeMode: "onChange",
+    meta: { editing },
   });
+  const changed = editing ? pendingCount(editing.pending) : 0;
+  const unprotected = editing && changed > 0 ? unprotectedColumns(editing.pending, columns) : [];
   const model = table.getRowModel().rows;
 
   const virtualizer = useVirtualizer({
@@ -150,6 +191,44 @@ export function ResultGrid({
         )}
       </div>
       <div className="flex items-center gap-2 border-t px-2 py-1 text-xs text-muted-foreground">
+        {editing?.gate.state === "read_only" && (
+          <span className="flex items-center gap-1" title={editing.gate.reason}>
+            <Lock className="h-3 w-3" />
+            read-only: {editing.gate.reason}
+          </span>
+        )}
+        {editing?.gate.state === "editable" && changed > 0 && (
+          <span className="flex items-center gap-2 text-foreground">
+            <span>
+              {changed} pending change{changed === 1 ? "" : "s"}
+            </span>
+            {/* D-027: applied together, in one transaction, after review of
+                the exact statements (T-057). Discard is the only undo; there
+                is none once applied. */}
+            <button
+              type="button"
+              disabled={editing.applying}
+              className="rounded bg-primary px-2 py-0.5 text-primary-foreground disabled:opacity-50"
+              onClick={editing.onApply}
+            >
+              {editing.applying ? "Working…" : "Review & apply…"}
+            </button>
+            <button
+              type="button"
+              disabled={editing.applying}
+              className="rounded px-2 py-0.5 hover:bg-secondary disabled:opacity-50"
+              onClick={editing.onDiscard}
+            >
+              Discard
+            </button>
+            <span className="text-muted-foreground">applied in one transaction · no undo after</span>
+            {unprotected.length > 0 && (
+              <span className="text-destructive" title="These types cannot be compared, so a concurrent change to them would be overwritten.">
+                not checked for concurrent changes (protected by unique key only): {unprotected.join(", ")}
+              </span>
+            )}
+          </span>
+        )}
         <span>
           {rows.length} rows · {items.length} rendered
         </span>
@@ -242,5 +321,64 @@ function Cell({
     >
       {text}
     </span>
+  );
+}
+
+/**
+ * T-056: a cell in an editable relation. Double-click to edit; a staged value
+ * is shown in place of the value as read, marked, with a per-cell revert.
+ */
+function EditableCell({
+  sessionId,
+  column,
+  read,
+  pending,
+  disabled,
+  onStage,
+  onUnstage,
+}: {
+  sessionId: string;
+  column: ColumnDesc;
+  read: WireValue;
+  pending: WireValue | undefined;
+  disabled: boolean;
+  onStage: (v: WireValue) => void;
+  onUnstage: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const shown = pending ?? read;
+  const reason = cellReadOnlyReason(column, read);
+
+  if (open) {
+    return (
+      <CellEditor
+        column={column}
+        value={shown}
+        onCommit={(v) => {
+          setOpen(false);
+          onStage(v);
+        }}
+        onCancel={() => setOpen(false)}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={cn("flex items-center gap-1", pending !== undefined && "-mx-2 bg-primary/15 px-2")}
+      title={reason ?? (pending !== undefined ? `was: ${renderValue(read)}` : "Double-click to edit")}
+      onDoubleClick={() => {
+        if (!reason && !disabled) setOpen(true);
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <Cell sessionId={sessionId} value={shown} column={column} />
+      </div>
+      {pending !== undefined && !disabled && (
+        <button type="button" title="Revert this cell" className="shrink-0 rounded hover:bg-secondary" onClick={onUnstage}>
+          <Undo2 className="h-3 w-3" />
+        </button>
+      )}
+    </div>
   );
 }

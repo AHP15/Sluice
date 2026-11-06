@@ -18,6 +18,10 @@ const EDIT_PATH = [
   "src/lib/exactNumeric.ts",
   "src/components/ExactNumericEditor.tsx",
   "src/components/ResultGrid.tsx",
+  // T-056: staging and the generic cell editor sit between the cell and the
+  // bound value too.
+  "src/lib/pendingEdits.ts",
+  "src/components/CellEditor.tsx",
 ];
 
 const FORBIDDEN = [
