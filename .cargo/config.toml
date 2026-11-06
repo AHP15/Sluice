@@ -1,0 +1,9 @@
+# T-071 / R-016: on macOS every built binary is re-signed with one stable
+# development identity before it runs, so the keychain sees the same app across
+# rebuilds. See scripts/macos-dev-run.sh. Release bundles are unaffected: Tauri
+# signs those itself (unsigned until D-019's Developer ID step).
+[target.aarch64-apple-darwin]
+runner = "scripts/macos-dev-run.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/macos-dev-run.sh"

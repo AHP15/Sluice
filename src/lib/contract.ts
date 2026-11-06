@@ -220,6 +220,8 @@ export interface DriverError {
     table?: string | null;
     schema?: string | null;
     retryable?: boolean | null;
+    /** T-071: the stored credential could not be used; ask for it again. */
+    credential_reentry?: boolean | null;
   };
   payload?: {
     code?: string | null;

@@ -81,6 +81,12 @@ pub struct ErrorHints {
     /// Whether retrying the same statement unchanged could plausibly succeed.
     /// `None` means the driver has no opinion — distinct from `Some(false)`.
     pub retryable: Option<bool>,
+    /// T-071 / R-016: the stored credential could not be used — unreadable
+    /// from the keychain (typically after a signing-identity change) or
+    /// rejected by the server — and the UI should ask for it again and
+    /// re-store it rather than show a dead end. `None` means no opinion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reentry: Option<bool>,
 }
 
 impl ErrorHints {

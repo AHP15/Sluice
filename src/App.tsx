@@ -20,6 +20,7 @@ import {
 import { Button } from "./components/ui/button";
 import type {
   ColumnDesc,
+  DriverError,
   EditGate,
   EditPlan,
   EditRequest,
@@ -58,6 +59,7 @@ import {
   verboseDiagnostics,
 } from "./lib/ipc";
 import { useUiStore } from "./store/ui";
+import { cn } from "./lib/utils";
 
 interface RowsView {
   columns: ColumnDesc[];
@@ -924,6 +926,11 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
   const [secret, setSecret] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // T-071 / R-016: the core says the stored password could not be used (an
+  // unreadable keychain item after a signing change, or a server refusal).
+  // Not a dead end: ask for it again; storing it re-creates the keychain item
+  // under this build's identity.
+  const [reentry, setReentry] = useState(false);
 
   const field = (k: keyof ProfileMeta, label: string, type = "text") => (
     <label className="block px-2 py-1 text-xs">
@@ -949,9 +956,12 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
         try {
           if (secret) await storeCredential(form.id, secret);
           setSecret("");
+          setReentry(false);
           onConnected(await connect(form));
         } catch (e2) {
-          setErr(String((e2 as { message?: string })?.message ?? e2));
+          const de = e2 as DriverError;
+          setReentry(de?.hints?.credential_reentry === true);
+          setErr(String(de?.message ?? e2));
         } finally {
           setBusy(false);
         }
@@ -977,11 +987,18 @@ function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }
         />
       </label>
       <label className="block px-2 py-1 text-xs">
-        <span className="text-muted-foreground">Password</span>
+        <span className="text-muted-foreground">
+          {reentry ? "Re-enter password — it will be stored again in the keychain" : "Password"}
+        </span>
         <input
           type="password"
-          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
+          className={cn(
+            "mt-0.5 w-full rounded border bg-transparent px-1.5 py-1 text-sm",
+            reentry ? "border-destructive" : "border-input",
+          )}
           value={secret}
+          autoFocus={reentry}
+          required={reentry}
           onChange={(e) => setSecret(e.target.value)}
           placeholder="stored in the OS keychain"
         />

@@ -125,6 +125,23 @@ impl AppState {
     }
 }
 
+/// T-071 / R-016: an authentication failure is recoverable by re-entering the
+/// password, so say so in the error rather than leaving a dead end. When the
+/// keychain item was unreadable, the message names that as the likely cause.
+fn credential_reentry(mut e: DriverError, unreadable: Option<&str>) -> DriverError {
+    if e.kind == ErrorKind::AuthFailed {
+        e.hints.credential_reentry = Some(true);
+        if let Some(why) = unreadable {
+            e.message = format!(
+                "{} — the stored password could not be read from the keychain ({why}); \
+                 it may have been saved by a differently-signed build. Enter it again to re-store it.",
+                e.message
+            );
+        }
+    }
+    e
+}
+
 fn sid(s: &str) -> SessionId {
     SessionId(s.to_string())
 }
@@ -159,7 +176,17 @@ pub async fn connect(
 ) -> Result<SessionInfo, DriverError> {
     guard_driver_call(&sid(&profile.id), async {
         // D-007: the id becomes a credential HERE, in the core, at connect time.
-        let password = state.creds.resolve(&profile.id).ok();
+        //
+        // T-071 / R-016: a keychain item that will not open is not fatal. The
+        // connect is attempted without it (trust auth, `.pgpass` and service
+        // files may still succeed); if the server then refuses, the error asks
+        // the UI to collect the password again, which re-stores it under this
+        // build's identity.
+        let (password, unreadable) = match state.creds.resolve(&profile.id) {
+            Ok(p) => (Some(p), None),
+            Err(crate::credentials::CredentialError::Unreadable(why)) => (None, Some(why)),
+            Err(_) => (None, None),
+        };
 
         let spec = ConnectSpec {
             host: profile.host.clone(),
@@ -188,7 +215,7 @@ pub async fn connect(
                 let redactor = sluice_core::Redactor::new(spec.password.clone());
                 let d = logged("connect", &profile.id, None, |_| None, PgDriver::connect_with_pool_size(spec, budget))
                     .await
-                    .map_err(|e| redactor.error(e))?;
+                    .map_err(|e| credential_reentry(redactor.error(e), unreadable.as_deref()))?;
                 state.profiles.lock().await.insert(profile_key.clone(), Arc::downgrade(&d));
                 d
             }
@@ -898,6 +925,24 @@ mod boundary_tests {
             Some(i) => &SRC[..i],
             None => SRC,
         }
+    }
+
+    /// T-071 / R-016: an auth failure asks for re-entry instead of dead-ending,
+    /// and names the unreadable keychain item when that was the cause.
+    #[test]
+    fn auth_failures_ask_for_credential_reentry() {
+        let e = credential_reentry(DriverError::new(ErrorKind::AuthFailed, "password authentication failed"), None);
+        assert_eq!(e.hints.credential_reentry, Some(true));
+
+        let e = credential_reentry(
+            DriverError::new(ErrorKind::AuthFailed, "password authentication failed"),
+            Some("keychain platform error"),
+        );
+        assert!(e.message.contains("could not be read from the keychain"), "{}", e.message);
+
+        let other = credential_reentry(DriverError::new(ErrorKind::ConnectionFailed, "refused"), Some("x"));
+        assert_eq!(other.hints.credential_reentry, None);
+        assert_eq!(other.message, "refused");
     }
 
     /// T-006: the acceptance says *every* IPC command boundary is wrapped.
