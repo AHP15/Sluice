@@ -3,10 +3,6 @@
 A database studio for Postgres, SQL Server and MongoDB. Tauri v2 shell, Rust
 core, React webview.
 
-> Formerly scaffolded in a directory named `drizzle-studio`. That name belongs to
-> Drizzle's own product; per D-025 this project ships as **Sluice**. See
-> "Directory rename" below — one manual step remains.
-
 ## Layout
 
 ```
@@ -48,15 +44,6 @@ These are decisions, not preferences — changing one means superseding its reco
 - **Engine differences are declared capability data** (D-003), never engine
   checks in the React layer.
 - **WebKitGTK 4.1 is the CSS floor** (D-019/D-023).
-
-## Directory rename
-
-The working directory is still `drizzle-studio`. Renaming it is the one step
-left, and it has to be done outside a running session:
-
-```sh
-cd .. && mv drizzle-studio sluice
-```
 
 ## License
 

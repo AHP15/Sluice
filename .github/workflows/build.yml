@@ -122,6 +122,44 @@ jobs:
       - name: Exact-numeric validator unit tests
         run: bun run test:unit
 
+  # T-069 / R-018: the type-fidelity corpus (T-068) guards D-006, the one
+  # decision that fails silently — so it must not be allowed to skip silently
+  # either. A Postgres service container is started, TEST_PG_URL is set, and
+  # the gate script fails on a skip, a missing summary, or zero checks. The
+  # live driver suites (incl. T-039/T-040 pool reset) run against the same
+  # server; they skip locally without one, but here a skip fails the job.
+  # Locally the corpus still skips by default (D-021's no-ceremony property).
+  type-fidelity-corpus:
+    name: type fidelity corpus (postgres)
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: sluice_dev
+          POSTGRES_DB: sluice_dev
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TEST_PG_URL: postgres://postgres:sluice_dev@localhost:55432/sluice_dev?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: type-fidelity-corpus
+
+      - name: Corpus and live driver suites must run, not skip
+        run: scripts/check-type-corpus.sh
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.platform }}
