@@ -19,6 +19,7 @@ import {
 } from "./lib/pendingEdits";
 import { Button } from "./components/ui/button";
 import type {
+  CatalogSupport,
   ColumnDesc,
   ConfirmationRequest,
   DriverError,
@@ -598,6 +599,7 @@ function Workspace({ seed }: { seed: TabSeed }) {
           <aside className="flex w-64 shrink-0 flex-col border-r">
             {session ? (
               <div className="min-h-0 flex-1 overflow-auto p-1">
+                <CatalogNote catalog={session.capabilities.catalog} />
                 <Navigator
                   sessionId={session.session_id}
                   capabilities={session.capabilities}
@@ -891,6 +893,22 @@ function GuardrailBar({
       )}
       {err && <span className="text-destructive">{err}</span>}
     </div>
+  );
+}
+
+/**
+ * T-055 / R-028: say at connect, not mid-navigation, when introspection on
+ * this server will be partial or its flavour is unverified.
+ */
+function CatalogNote({ catalog }: { catalog: CatalogSupport | undefined }) {
+  if (!catalog) return null;
+  const missing = catalog.features.filter((f) => !f.available).map((f) => f.label);
+  if (catalog.flavour_verified && missing.length === 0) return null;
+  return (
+    <p className="mb-1 rounded bg-secondary px-2 py-1 text-[11px] text-muted-foreground" role="note">
+      {!catalog.flavour_verified && "Unrecognized server: treated as vanilla Postgres, unverified. "}
+      {missing.length > 0 ? `Not available on this server: ${missing.join(", ")}.` : "Every catalog probe succeeded."}
+    </p>
   );
 }
 

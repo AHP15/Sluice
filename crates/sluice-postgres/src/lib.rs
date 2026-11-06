@@ -5,6 +5,7 @@
 //! D-006's tagged encoding is built on.
 
 pub mod browse;
+pub mod catalog_probe;
 pub mod edit;
 pub mod encode;
 pub mod error_map;
@@ -139,6 +140,8 @@ pub struct PgDriver {
     /// T-060 / R-035: which types have a usable equality on *this* server,
     /// probed from the catalog at connect.
     comparability: encode::Comparability,
+    /// T-055 / R-028: which catalog areas probed successfully at connect.
+    catalog: sluice_core::CatalogSupport,
     /// T-053 / D-016: one level of the navigator tree per parent, filled on
     /// first expand and kept until DDL the app ran, or an explicit refresh.
     /// Shared across `with_*` copies, like the pool.
@@ -226,6 +229,7 @@ impl PgDriver {
             collation: None,
             read_only: sluice_core::ReadOnlyGuarantee::default(),
             comparability: encode::Comparability::fallback(),
+            catalog: sluice_core::CatalogSupport::default(),
             nav_cache: Arc::default(),
             cancel: None,
             budget: sluice_core::ExecBudget::default(),
@@ -288,7 +292,15 @@ impl PgDriver {
             .await
             .unwrap_or_default();
 
-        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, comparability, ..driver }))
+        // T-055 / R-028: what the catalog demonstrably supports, so behaviour
+        // follows what this server does rather than what its banner claims.
+        let flavour_verified = !matches!(server.flavour, version::Flavour::Unknown(_));
+        let catalog = driver
+            .with_lease(false, async |client: &tokio_postgres::Client| Ok(catalog_probe::probe(client, flavour_verified).await))
+            .await
+            .unwrap_or_default();
+
+        Ok(Arc::new(Self { server: Some(server), collation, reset, read_only, comparability, catalog, ..driver }))
     }
 
     pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
@@ -303,10 +315,18 @@ impl PgDriver {
             collation: self.collation.clone(),
             read_only: self.read_only.clone(),
             comparability: self.comparability.clone(),
+            catalog: self.catalog.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
         })
+    }
+
+    /// Override the probed catalog support. For exercising T-055's degraded
+    /// navigation against a real server, which genuinely supports everything.
+    pub fn with_catalog(self: Arc<Self>, catalog: sluice_core::CatalogSupport) -> Arc<Self> {
+        self.nav_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        Arc::new(Self { catalog, ..self.clone_inner() })
     }
 
     /// Override the declared reset path. For exercising D-028's `reopen` and
@@ -324,6 +344,7 @@ impl PgDriver {
             collation: self.collation.clone(),
             read_only: self.read_only.clone(),
             comparability: self.comparability.clone(),
+            catalog: self.catalog.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -798,6 +819,7 @@ impl PgDriver {
             collation: self.collation.clone(),
             read_only: self.read_only.clone(),
             comparability: self.comparability.clone(),
+            catalog: self.catalog.clone(),
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             budget: self.budget,
@@ -888,6 +910,7 @@ impl Driver for PgDriver {
             supports_script: true,
             string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
             read_only: self.read_only.clone(),
+            catalog: self.catalog.clone(),
         }
     }
 
@@ -906,7 +929,7 @@ impl Driver for PgDriver {
             .unwrap_or_default();
         let nodes = self
             .with_lease(false, async |client: &tokio_postgres::Client| {
-                navigator::children(&client, parent, &hidden).await
+                navigator::children(&client, parent, &hidden, &self.catalog).await
             })
             .await?;
         // A notice (permission-denied, a vanished relation) is not catalog

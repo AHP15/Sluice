@@ -122,6 +122,14 @@ export interface Capabilities {
   string_collation: string | null;
   /** T-061: what the server enforces about writes from this session. */
   read_only?: ReadOnlyGuarantee;
+  /** T-055 / R-028: which catalog areas probed successfully at connect. */
+  catalog?: CatalogSupport;
+}
+
+export interface CatalogSupport {
+  /** False when the banner matched no known flavour ("vanilla, unverified"). */
+  flavour_verified: boolean;
+  features: { id: string; label: string; available: boolean }[];
 }
 
 export type Predicate = {

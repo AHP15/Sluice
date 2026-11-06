@@ -52,7 +52,7 @@ T-051 | done | M | D-010 | Real query cancellation and per-profile statement tim
 T-052 | todo | M | D-010,R-042 | Decouple socket draining from webview consumption with a spill buffer |
 T-053 | done | L | D-016 | Native catalog introspection loaded lazily with explicit refresh | 2026-11-06
 T-054 | done | M | D-016 | Server version and flavour detection into the capability descriptor | 2026-11-06
-T-055 | todo | M | D-016,R-028 | Probe catalog capabilities rather than trusting the version banner |
+T-055 | done | M | D-016,R-028 | Probe catalog capabilities rather than trusting the version banner | 2026-11-06
 T-056 | done | L | D-027 | Staged edits applied in one transaction behind a unique-key gate | 2026-11-06
 T-057 | done | M | D-027,R-003 | Derive the edit preview from the same artifact that executes | 2026-11-06
 T-058 | done | M | D-027 | Null-safe optimistic concurrency with declared column comparability | 2026-11-06

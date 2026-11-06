@@ -17,7 +17,7 @@
 //! connection failures: they come back as a `notice` node the tree renders in
 //! place, and the rest of the tree keeps working.
 
-use sluice_core::{DriverError, ErrorKind, NavNode, NodeId, NodeKind};
+use sluice_core::{CatalogSupport, DriverError, ErrorKind, NavNode, NodeId, NodeKind};
 use tokio_postgres::Client;
 
 use crate::error_map::map_error;
@@ -46,19 +46,33 @@ pub fn node_kinds() -> Vec<NodeKind> {
 
 /// `hidden_schemas`: flavour-internal schemas to leave out (T-054), beside the
 /// `pg_*` and `information_schema` filter every flavour gets.
+///
+/// `catalog` (T-055): the areas that probed successfully at connect. An area
+/// that did not is left out with a note in its place, so a server whose
+/// catalog differs renders partially instead of failing mid-navigation.
 pub async fn children(
     client: &Client,
     parent: Option<NodeId>,
     hidden_schemas: &[String],
+    catalog: &CatalogSupport,
 ) -> Result<Vec<NavNode>, DriverError> {
+    let skipped = |id: &str, what: &str| {
+        (!catalog.available(id)).then(|| vec![notice(parent.as_ref(), &format!("{what} are not available on this server (catalog probe failed)"))])
+    };
     let result = match &parent {
-        None => schemas(client, hidden_schemas).await,
-        Some(node) if node.kind == "schema" => {
-            let schema = node.path.first().cloned().unwrap_or_default();
-            relations(client, &schema).await
-        }
+        None => match skipped("schemas", "schemas") {
+            Some(note) => Ok(note),
+            None => schemas(client, hidden_schemas).await,
+        },
+        Some(node) if node.kind == "schema" => match skipped("relations", "tables and views") {
+            Some(note) => Ok(note),
+            None => {
+                let schema = node.path.first().cloned().unwrap_or_default();
+                relations(client, &schema).await
+            }
+        },
         Some(node) if RELATION_KINDS.contains(&node.kind.as_str()) => match node.path.as_slice() {
-            [schema, rel] => columns_and_indexes(client, schema, rel).await,
+            [schema, rel] => columns_and_indexes(client, schema, rel, catalog).await,
             other => Err(DriverError::new(ErrorKind::NotFound, format!("malformed relation path {other:?}"))),
         },
         Some(node) => {
@@ -72,7 +86,10 @@ pub async fn children(
 }
 
 /// D-016: a catalog the role may not read is a note in the tree, not a failed
-/// navigation. Anything else — a dropped connection — is still an error.
+/// navigation. T-055 / R-028: so is a catalog that differs from the one these
+/// queries were written for — an undefined table, column, function or object
+/// in our own fixed SQL can only mean divergence. Anything else — a dropped
+/// connection — is still an error.
 pub fn render_around(
     result: Result<Vec<NavNode>, DriverError>,
     parent: Option<&NodeId>,
@@ -81,8 +98,18 @@ pub fn render_around(
         Err(e) if e.kind == ErrorKind::PermissionDenied => {
             Ok(vec![notice(parent, "not permitted to read this part of the catalog")])
         }
+        Err(e) if is_catalog_divergence(&e) => {
+            Ok(vec![notice(parent, "this server's catalog differs here, so this part cannot be shown")])
+        }
         other => other,
     }
+}
+
+/// SQLSTATEs that, from a fixed catalog query, mean the catalog itself differs.
+const DIVERGENCE: &[&str] = &["42P01", "42703", "42883", "42704"];
+
+fn is_catalog_divergence(e: &DriverError) -> bool {
+    e.payload.code.as_deref().is_some_and(|c| DIVERGENCE.contains(&c))
 }
 
 /// Whether a node is a placeholder rather than catalog content — never cached,
@@ -155,7 +182,12 @@ async fn relations(client: &Client, schema: &str) -> Result<Vec<NavNode>, Driver
 
 /// Columns in ordinal order, then indexes. Resolved by (schema, name) as bound
 /// parameters — never by interpolating either into SQL.
-async fn columns_and_indexes(client: &Client, schema: &str, rel: &str) -> Result<Vec<NavNode>, DriverError> {
+async fn columns_and_indexes(
+    client: &Client,
+    schema: &str,
+    rel: &str,
+    catalog: &CatalogSupport,
+) -> Result<Vec<NavNode>, DriverError> {
     const RELID: &str = "
         SELECT c.oid
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -186,7 +218,25 @@ async fn columns_and_indexes(client: &Client, schema: &str, rel: &str) -> Result
     let relid: tokio_postgres::types::Oid = relid.get(0);
 
     let mut out = Vec::new();
-    for r in client.query(COLUMNS, &[&relid]).await.map_err(|e| map_error(&e, Some(COLUMNS)))? {
+    // T-055: each part is read only if it probed, and a part that fails here
+    // anyway degrades to a note beside the parts that worked.
+    let columns = if catalog.available("columns") {
+        client.query(COLUMNS, &[&relid]).await.map_err(|e| map_error(&e, Some(COLUMNS)))
+    } else {
+        Ok(Vec::new())
+    };
+    let columns = match columns {
+        Ok(rows) => rows,
+        Err(e) if is_catalog_divergence(&e) => {
+            out.push(notice(Some(&parent), "columns cannot be listed on this server"));
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    if !catalog.available("columns") {
+        out.push(notice(Some(&parent), "columns are not available on this server (catalog probe failed)"));
+    }
+    for r in columns {
         let name: String = r.get(0);
         let ty: String = r.get(1);
         let not_null: bool = r.get(2);
@@ -196,7 +246,23 @@ async fn columns_and_indexes(client: &Client, schema: &str, rel: &str) -> Result
             has_children: false,
         });
     }
-    for r in client.query(INDEXES, &[&relid]).await.map_err(|e| map_error(&e, Some(INDEXES)))? {
+    let indexes = if catalog.available("indexes") {
+        client.query(INDEXES, &[&relid]).await.map_err(|e| map_error(&e, Some(INDEXES)))
+    } else {
+        Ok(Vec::new())
+    };
+    let indexes = match indexes {
+        Ok(rows) => rows,
+        Err(e) if is_catalog_divergence(&e) => {
+            out.push(notice(Some(&parent), "indexes cannot be listed on this server"));
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    if !catalog.available("indexes") {
+        out.push(notice(Some(&parent), "indexes are not available on this server (catalog probe failed)"));
+    }
+    for r in indexes {
         let name: String = r.get(0);
         let method: String = r.get(1);
         let unique: bool = r.get(2);
@@ -258,6 +324,21 @@ fn first_keyword(mut s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-055 / R-028: an undefined catalog object in our own fixed SQL is a
+    /// differing catalog — a note in the tree, not a failed expand.
+    #[test]
+    fn catalog_divergence_renders_as_a_note() {
+        let mut e = DriverError::new(ErrorKind::SyntaxError, "relation \"pg_partitioned_table\" does not exist");
+        e.payload.code = Some("42P01".into());
+        let nodes = render_around(Err(e), None).unwrap();
+        assert!(is_notice(&nodes[0]) && nodes[0].label.contains("catalog differs"), "{nodes:?}");
+
+        // A real syntax error in something else is still an error.
+        let mut other = DriverError::new(ErrorKind::SyntaxError, "syntax error");
+        other.payload.code = Some("42601".into());
+        assert!(render_around(Err(other), None).is_err());
+    }
 
     /// D-016 puts columns under relations, so a relation is now both
     /// browsable and expandable; leaf kinds are neither, and the remaining

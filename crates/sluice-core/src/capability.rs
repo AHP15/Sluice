@@ -193,6 +193,36 @@ impl ReadOnlyGuarantee {
     }
 }
 
+/// T-055 / R-028: one area of catalog introspection and whether this server
+/// demonstrably supports it — probed at connect, not inferred from the banner.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CatalogFeature {
+    pub id: String,
+    pub label: String,
+    pub available: bool,
+}
+
+/// T-055 / R-028: what the catalog probes found. `flavour_verified` is false
+/// when the banner matched no known flavour — the server is then treated as
+/// vanilla, and the UI says so (`vanilla, unverified`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct CatalogSupport {
+    pub flavour_verified: bool,
+    pub features: Vec<CatalogFeature>,
+}
+
+impl CatalogSupport {
+    /// Whether a feature probed successfully. An id that was never probed is
+    /// treated as available, so an older probe list never hides anything.
+    pub fn available(&self, id: &str) -> bool {
+        self.features.iter().find(|f| f.id == id).is_none_or(|f| f.available)
+    }
+
+    pub fn unavailable(&self) -> impl Iterator<Item = &CatalogFeature> {
+        self.features.iter().filter(|f| !f.available)
+    }
+}
+
 /// The full descriptor a driver publishes about itself.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Capabilities {
@@ -229,4 +259,7 @@ pub struct Capabilities {
     /// T-061 / D-027: what the server enforces about writes from this session.
     #[serde(default)]
     pub read_only: ReadOnlyGuarantee,
+    /// T-055 / R-028: what the catalog demonstrably supports.
+    #[serde(default)]
+    pub catalog: CatalogSupport,
 }
