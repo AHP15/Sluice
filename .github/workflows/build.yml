@@ -7,8 +7,11 @@ name: build
 # cheap to learn now and exponentially expensive to learn later.
 
 on:
+  # Pushes to main, and pull requests (opened, plus each new push to an open
+  # PR, so the PR's checks reflect its latest commit). Pushing a feature branch
+  # without a PR runs nothing; open a PR, or use workflow_dispatch, to build it.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
