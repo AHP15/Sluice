@@ -22,6 +22,7 @@
 pub mod cache;
 pub mod config;
 pub mod history;
+pub mod profile;
 
 use std::fs;
 use std::io::Write;

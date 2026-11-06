@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use sluice_core::{guard_driver_call, DriverError, ErrorKind, SessionId};
 use sluice_postgres::tls::TlsMode;
 use sluice_state::config::{self, DocumentSpec, Migration};
+use sluice_state::profile::{CredentialProvider, Transport};
 
 use crate::commands::ProfileMeta;
 use crate::state::{state_error, Stores};
@@ -77,6 +78,13 @@ pub struct ProfileEntry {
     pub statement_timeout_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_budget: Option<u32>,
+    /// T-038 / D-008. Omitted at the default (`direct`).
+    #[serde(default, skip_serializing_if = "Transport::is_direct")]
+    pub transport: Transport,
+    /// T-038 / D-008: a provider, never a password. Omitted at the default
+    /// (`keychain`).
+    #[serde(default, skip_serializing_if = "CredentialProvider::is_keychain")]
+    pub auth: CredentialProvider,
 }
 
 /// One `[[query]]` table.
@@ -113,6 +121,8 @@ impl ProfileEntry {
             tls: m.tls,
             statement_timeout_secs: m.statement_timeout_secs,
             connection_budget: m.connection_budget,
+            transport: m.transport.clone(),
+            auth: m.auth.clone(),
         }
     }
 
@@ -127,6 +137,8 @@ impl ProfileEntry {
             tls: self.tls,
             statement_timeout_secs: self.statement_timeout_secs,
             connection_budget: self.connection_budget,
+            transport: self.transport.clone(),
+            auth: self.auth.clone(),
         }
     }
 }
@@ -298,9 +310,28 @@ mod tests {
             tls: TlsMode::Disabled,
             statement_timeout_secs: None,
             connection_budget: Some(4),
+            transport: Transport::default(),
+            auth: CredentialProvider::default(),
         }
     }
 
+    /// T-038: non-default transports and providers round-trip through the
+    /// file; defaults stay out of it.
+    #[test]
+    fn transport_and_auth_round_trip_and_defaults_are_omitted() {
+        let plain = config::render(&Workspace { profiles: vec![ProfileEntry::from_meta(&meta("a"))], queries: vec![] }, &SPEC).unwrap();
+        assert!(!plain.contains("transport") && !plain.contains("auth"), "{plain}");
+
+        let mut m = meta("b");
+        m.transport = Transport::SshTunnel { host: "bastion".into(), port: Some(22), user: None };
+        m.auth = CredentialProvider::Env { var: "STAGING_PW".into() };
+        let ws = Workspace { profiles: vec![ProfileEntry::from_meta(&m)], queries: vec![] };
+        let text = config::render(&ws, &SPEC).unwrap();
+        let back = config::parse::<Workspace>(&text, &SPEC).unwrap().value;
+        assert_eq!(back, ws, "{text}");
+        assert!(text.contains("kind = \"ssh-tunnel\""), "{text}");
+        assert!(text.contains("provider = \"env\""), "{text}");
+    }
 
     #[test]
     fn profiles_and_queries_round_trip_through_the_file() {

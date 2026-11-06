@@ -32,6 +32,10 @@ database = "app_dev"
 tls = "disabled"            # optional: "verify" (default) | "accept_invalid_certs" | "disabled"
 statement_timeout_secs = 30 # optional; 0 = none; unset = the app default
 connection_budget = 5       # optional; pooled + pinned connections for this profile
+# transport and auth are optional; shown here at their defaults, which are
+# omitted when Sluice writes the file.
+transport = { kind = "direct" }
+auth = { provider = "keychain" }
 
 [[query]]
 id = "query-7c1b2e0d"
@@ -63,6 +67,29 @@ Rules:
 - When Sluice writes the file, it puts a short comment header at the top
   and drops optional keys that are at their defaults. Other comments you add
   by hand are not preserved when the app saves.
+
+## Transport and auth (D-008)
+
+Each profile records **how** it connects (`transport`) and **where its
+password comes from** (`auth`). Neither one ever holds the password itself.
+Adding `password = "..."` to either is an error.
+
+| `transport.kind` | status |
+|---|---|
+| `direct` (default) | supported |
+| `ssh-tunnel` (`host`, optional `port`, `user`) | in the schema, not built yet. Use `ssh -L` with a `direct` profile |
+| `proxy` (`address`) | in the schema, not built yet. Start the proxy yourself and use a `direct` profile |
+
+| `auth.provider` | status |
+|---|---|
+| `keychain` (default) | the OS keychain, under the profile's `id` |
+| `env` (`var`) | read from the named environment variable at connect time. Only the variable's *name* is stored |
+| `static` | in the schema, not built yet |
+| `iam-token` | in the schema, not built yet (short-lived cloud IAM tokens) |
+
+A profile that names a variant that isn't built yet still loads and saves.
+Connecting with it is refused with a message saying what to do instead.
+Sluice never quietly falls back to a direct connection.
 
 ## Not in this file
 

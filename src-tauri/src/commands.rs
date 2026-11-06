@@ -27,6 +27,7 @@ use crate::guardrails::{Guardrails, Provenance};
 use crate::launcher::{LaunchOrigin, LaunchOutcome, Launcher};
 use crate::stream::{CreditGate, Stop, StreamEvent, Streams, BATCH_ROWS, MAX_IN_FLIGHT, STREAM_DEADLINE};
 use sluice_config::connection_url::ConnectionUrl;
+use sluice_state::profile::{CredentialProvider, Transport};
 
 /// Non-secret connection metadata. This is the ONLY connection shape the
 /// webview ever sees or sends.
@@ -51,6 +52,13 @@ pub struct ProfileMeta {
     /// together. Unset means `DEFAULT_CONNECTION_BUDGET`.
     #[serde(default)]
     pub connection_budget: Option<u32>,
+    /// T-038 / D-008: how the connection travels. Only `direct` connects.
+    #[serde(default)]
+    pub transport: Transport,
+    /// T-038 / D-008: where the password comes from — a provider, never the
+    /// password itself.
+    #[serde(default)]
+    pub auth: CredentialProvider,
 }
 
 /// What the UI learns after connecting.
@@ -130,6 +138,57 @@ impl AppState {
     }
 }
 
+/// T-038 / D-008: only `direct` is built. The others are in the schema so the
+/// file format need not change when they arrive; until then a profile that
+/// names one is refused with what to do instead, never connected directly
+/// behind the user's back.
+fn require_direct(t: &Transport) -> Result<(), DriverError> {
+    match t {
+        Transport::Direct {} => Ok(()),
+        Transport::SshTunnel { .. } => Err(DriverError::new(
+            ErrorKind::ConnectionFailed,
+            "built-in SSH tunnels are not available yet — run `ssh -L <local-port>:<db-host>:<db-port> <bastion>` \
+             and point a direct profile at localhost:<local-port>",
+        )),
+        Transport::Proxy { .. } => Err(DriverError::new(
+            ErrorKind::ConnectionFailed,
+            "proxy transports are not available yet — start the proxy yourself and point a direct profile at its local address",
+        )),
+    }
+}
+
+/// T-038 / D-008: resolve the profile's credential *provider* to a password.
+/// Returns the password (if any) and, for the keychain, why an existing item
+/// could not be read (T-071).
+///
+/// R-017: the environment is a credential parse boundary, so an `env` value
+/// is wrapped in `Secret` the moment it is read.
+fn resolve_auth(
+    creds: &CredentialStore,
+    profile_id: &str,
+    auth: &CredentialProvider,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(Option<Secret<String>>, Option<String>), DriverError> {
+    match auth {
+        CredentialProvider::Keychain {} => Ok(match creds.resolve(profile_id) {
+            Ok(p) => (Some(p), None),
+            Err(crate::credentials::CredentialError::Unreadable(why)) => (None, Some(why)),
+            Err(_) => (None, None),
+        }),
+        CredentialProvider::Env { var } => match env(var) {
+            Some(v) => Ok((Some(Secret::new(v)), None)),
+            None => Err(DriverError::new(
+                ErrorKind::AuthFailed,
+                format!("this profile reads its password from the environment variable `{var}`, which is not set"),
+            )),
+        },
+        other => Err(DriverError::new(
+            ErrorKind::AuthFailed,
+            format!("the `{}` credential provider is not available yet", other.label()),
+        )),
+    }
+}
+
 /// T-071 / R-016: an authentication failure is recoverable by re-entering the
 /// password, so say so in the error rather than leaving a dead end. When the
 /// keychain item was unreadable, the message names that as the likely cause.
@@ -187,11 +246,8 @@ pub async fn connect(
         // files may still succeed); if the server then refuses, the error asks
         // the UI to collect the password again, which re-stores it under this
         // build's identity.
-        let (password, unreadable) = match state.creds.resolve(&profile.id) {
-            Ok(p) => (Some(p), None),
-            Err(crate::credentials::CredentialError::Unreadable(why)) => (None, Some(why)),
-            Err(_) => (None, None),
-        };
+        require_direct(&profile.transport)?;
+        let (password, unreadable) = resolve_auth(&state.creds, &profile.id, &profile.auth, |v| std::env::var(v).ok())?;
 
         let spec = ConnectSpec {
             host: profile.host.clone(),
@@ -323,6 +379,8 @@ pub async fn connect_launch(
                     tls: t.tls,
                     statement_timeout_secs: None,
                     connection_budget: None,
+                    transport: Transport::default(),
+                    auth: CredentialProvider::default(),
                 },
                 statement_timeout: timeout,
                 // R-002: a launch is its own ephemeral profile, and its budget.
@@ -946,6 +1004,36 @@ mod boundary_tests {
         }
     }
 
+    #[test]
+    fn only_direct_transports_connect() {
+        assert!(require_direct(&Transport::default()).is_ok());
+        let e = require_direct(&Transport::SshTunnel { host: "bastion".into(), port: None, user: None }).unwrap_err();
+        assert!(e.message.contains("ssh -L"), "{}", e.message);
+        assert!(require_direct(&Transport::Proxy { address: "127.0.0.1:5433".into() }).is_err());
+    }
+
+    #[test]
+    fn credential_providers_resolve_or_say_why_not() {
+        let dir = std::env::temp_dir().join(format!("sluice-auth-{}", short_token()));
+        let creds = CredentialStore::with_fallback_dir(dir);
+        let env = |v: &str| (v == "SET").then(|| "from-env".to_string());
+
+        let (pw, _) = resolve_auth(&creds, "p", &CredentialProvider::Env { var: "SET".into() }, env).unwrap();
+        assert_eq!(pw.unwrap().expose(), "from-env");
+
+        let e = resolve_auth(&creds, "p", &CredentialProvider::Env { var: "UNSET".into() }, env).unwrap_err();
+        assert!(e.message.contains("UNSET"), "{}", e.message);
+        assert!(!e.message.contains("from-env"));
+
+        // No stored password is not an error: trust auth and .pgpass may apply.
+        let (pw, why) = resolve_auth(&creds, "p", &CredentialProvider::Keychain {}, env).unwrap();
+        assert!(pw.is_none() && why.is_none());
+
+        for p in [CredentialProvider::Static {}, CredentialProvider::IamToken {}] {
+            assert!(resolve_auth(&creds, "p", &p, env).is_err(), "{p:?}");
+        }
+    }
+
     /// T-071 / R-016: an auth failure asks for re-entry instead of dead-ending,
     /// and names the unreadable keychain item when that was the cause.
     #[test]
@@ -1033,6 +1121,8 @@ mod boundary_tests {
             tls: TlsMode::Verify,
             statement_timeout_secs: None,
             connection_budget: None,
+            transport: Transport::default(),
+            auth: CredentialProvider::Env { var: "APP_DB_PASS".into() },
         };
         let json = serde_json::to_string(&p).unwrap();
         for banned in ["password", "secret", "credential", "passwd", "pwd"] {
@@ -1055,6 +1145,8 @@ mod boundary_tests {
                 tls: TlsMode::Verify,
                 statement_timeout_secs: None,
                 connection_budget: None,
+                transport: Transport::default(),
+                auth: CredentialProvider::default(),
             },
             guardrails: Guardrails::ephemeral(Provenance::Discovered, "db.prod.internal", "shop").saved(),
         };

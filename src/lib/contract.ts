@@ -283,6 +283,17 @@ export interface ExecutionResult {
   };
 }
 
+export type Transport =
+  | { kind: "direct" }
+  | { kind: "ssh-tunnel"; host: string; port?: number | null; user?: string | null }
+  | { kind: "proxy"; address: string };
+
+export type CredentialProvider =
+  | { provider: "static" }
+  | { provider: "keychain" }
+  | { provider: "env"; var: string }
+  | { provider: "iam-token" };
+
 export interface ProfileMeta {
   id: string;
   label: string;
@@ -298,6 +309,10 @@ export interface ProfileMeta {
    * sessions together. Absent = the core's default (5).
    */
   connection_budget?: number | null;
+  /** T-038 / D-008: how the connection travels. Only `direct` connects today. */
+  transport?: Transport;
+  /** T-038 / D-008: where the password comes from — never the password. */
+  auth?: CredentialProvider;
 }
 
 /** T-026: where a launched connection came from (drives T-027's guardrails). */
