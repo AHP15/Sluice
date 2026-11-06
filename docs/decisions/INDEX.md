@@ -27,3 +27,4 @@ D-026 | accepted | TypeScript config evaluated only under explicit per-directory
 D-027 | accepted | Staged edits with null-safe, type-aware optimistic concurrency
 D-028 | accepted | Capability-declared session model under one per-profile connection budget
 D-029 | accepted | Three-part contract with a statement-outcome sequence result model
+D-030 | accepted | SQL Server cancellation: close-and-declare baseline, KILL only when verified
