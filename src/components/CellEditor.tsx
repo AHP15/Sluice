@@ -12,6 +12,7 @@ import { useState } from "react";
 import type { ColumnDesc, WireValue } from "../lib/contract";
 import { editorText, parseCellInput } from "../lib/pendingEdits";
 import { ExactNumericEditor } from "./ExactNumericEditor";
+import { Select } from "./ui/select";
 
 export function CellEditor({
   column,
@@ -60,21 +61,21 @@ export function CellEditor({
 
   if (column.type_class === "boolean") {
     return (
-      <select
+      <Select
         autoFocus
-        className="focus-glow h-6 w-full rounded border border-input bg-background text-sm"
-        defaultValue={value.t === "bool" ? String(value.v) : "null"}
-        onChange={(e) => {
-          const v = e.target.value;
-          onCommit(v === "null" ? { t: "null" } : { t: "bool", v: v === "true" });
-        }}
-        onKeyDown={(e) => e.key === "Escape" && onCancel()}
-        onBlur={onCancel}
-      >
-        <option value="true">true</option>
-        <option value="false">false</option>
-        {column.nullable && <option value="null">NULL</option>}
-      </select>
+        defaultOpen
+        size="sm"
+        className="w-full"
+        aria-label={column.name}
+        value={value.t === "bool" ? String(value.v) : "null"}
+        options={[
+          { value: "true", label: "true" },
+          { value: "false", label: "false" },
+          ...(column.nullable ? [{ value: "null", label: "NULL" }] : []),
+        ]}
+        onChange={(v) => onCommit(v === "null" ? { t: "null" } : { t: "bool", v: v === "true" })}
+        onDismiss={onCancel}
+      />
     );
   }
 

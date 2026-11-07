@@ -8,7 +8,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 
 import { FilterBar } from "../../src/components/FilterBar";
 import type { FilterTree } from "../../src/lib/contract";
-import { OPS, col } from "./fixtures";
+import { OPS, col, pickOption, selectOptions, selectValue } from "./fixtures";
 
 const COLS = [col("name", "text"), col("amount", "exact_numeric"), col("doc", "structural")];
 
@@ -27,7 +27,7 @@ describe("FilterBar", () => {
     expect(rows()).toHaveLength(0);
     fireEvent.click(screen.getByText("Filter"));
     expect(rows()).toHaveLength(1);
-    expect((inRow(0).getByLabelText("Operator") as HTMLSelectElement).value).toBe("eq");
+    expect(selectValue(inRow(0).getByLabelText("Operator"))).toBe("eq");
   });
 
   test("applying emits the AND tree of what was typed", () => {
@@ -35,8 +35,8 @@ describe("FilterBar", () => {
     fireEvent.click(screen.getByText("Filter"));
     fireEvent.change(inRow(0).getByLabelText("Value"), { target: { value: "o'brien" } });
     fireEvent.click(screen.getByText("And"));
-    fireEvent.change(inRow(1).getByLabelText("Column"), { target: { value: "1" } });
-    fireEvent.change(inRow(1).getByLabelText("Operator"), { target: { value: "between" } });
+    pickOption(inRow(1).getByLabelText("Column"), "1");
+    pickOption(inRow(1).getByLabelText("Operator"), "between");
     fireEvent.change(inRow(1).getByLabelText("Value"), { target: { value: "10" } });
     fireEvent.change(inRow(1).getByLabelText("Upper value"), { target: { value: "20.5" } });
     fireEvent.click(screen.getByText("Apply"));
@@ -57,19 +57,19 @@ describe("FilterBar", () => {
   test("the operator list follows the column's type class", () => {
     setup();
     fireEvent.click(screen.getByText("Filter"));
-    const ops = () => Array.from((inRow(0).getByLabelText("Operator") as HTMLSelectElement).options).map((o) => o.value);
+    const ops = () => selectOptions(inRow(0).getByLabelText("Operator")).map(([v]) => v);
     expect(ops()).toContain("contains");
-    fireEvent.change(inRow(0).getByLabelText("Column"), { target: { value: "2" } });
+    pickOption(inRow(0).getByLabelText("Column"), "2");
     expect(ops()).toEqual(["is_null"]);
     // The incompatible operator was replaced, not kept.
-    expect((inRow(0).getByLabelText("Operator") as HTMLSelectElement).value).toBe("is_null");
+    expect(selectValue(inRow(0).getByLabelText("Operator"))).toBe("is_null");
   });
 
   test("a nullary operator has no value input; the case toggle shows only where declared", () => {
     setup();
     fireEvent.click(screen.getByText("Filter"));
     expect(inRow(0).queryByLabelText("Ignore case")).not.toBeNull();
-    fireEvent.change(inRow(0).getByLabelText("Operator"), { target: { value: "is_null" } });
+    pickOption(inRow(0).getByLabelText("Operator"), "is_null");
     expect(inRow(0).queryByLabelText("Value")).toBeNull();
     expect(inRow(0).queryByLabelText("Ignore case")).toBeNull();
   });
@@ -117,13 +117,13 @@ describe("FilterBar", () => {
     const applied: (FilterTree | null)[] = [];
     render(<FilterBar columns={COLS} ops={ext} onApply={(f) => applied.push(f)} />);
     fireEvent.click(screen.getByText("Filter"));
-    const op = inRow(0).getByLabelText("Operator") as HTMLSelectElement;
-    expect([...op.options].map((o) => o.text)).toContain("within radius of");
+    const op = () => inRow(0).getByLabelText("Operator");
+    expect(selectOptions(op()).map(([, label]) => label)).toContain("within radius of");
 
-    fireEvent.change(op, { target: { value: "is_blank" } });
+    pickOption(op(), "is_blank");
     expect(inRow(0).queryByLabelText("Value")).toBeNull();
 
-    fireEvent.change(op, { target: { value: "near" } });
+    pickOption(op(), "near");
     fireEvent.change(inRow(0).getByLabelText("Value"), { target: { value: "a" } });
     fireEvent.change(inRow(0).getByLabelText("Upper value"), { target: { value: "b" } });
     fireEvent.click(screen.getByText("Apply"));
@@ -133,9 +133,7 @@ describe("FilterBar", () => {
     });
 
     // Not offered on a column outside its declared type classes.
-    fireEvent.change(inRow(0).getByLabelText("Column"), { target: { value: "1" } });
-    expect([...(inRow(0).getByLabelText("Operator") as HTMLSelectElement).options].map((o) => o.text)).not.toContain(
-      "within radius of",
-    );
+    pickOption(inRow(0).getByLabelText("Column"), "1");
+    expect(selectOptions(op()).map(([, label]) => label)).not.toContain("within radius of");
   });
 });

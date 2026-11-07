@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Clock, Save, Trash2 } from "lucide-react";
 import { HistoryPanel } from "./HistoryPanel";
 import { WORKSPACE_KEY, deleteQuery, loadWorkspace, queryClient, saveQuery } from "../lib/ipc";
+import { Select } from "./ui/select";
 
 /**
  * T-036: saved queries live beside profiles in the portable profile file.
@@ -36,23 +37,21 @@ export function SavedQueries({
 
   return (
     <div className="relative flex h-9 shrink-0 items-center gap-1.5 border-b px-3 text-xs">
-      <select
+      <Select
         aria-label="Saved queries"
-        className="max-w-48 focus-glow h-6 rounded border border-input bg-background px-1.5"
+        size="sm"
+        className="max-w-48"
         value={selected}
-        onChange={(e) => {
-          setSelected(e.target.value);
-          const q = queries.find((x) => x.id === e.target.value);
+        options={[
+          { value: "", label: queries.length ? "Saved queries…" : "No saved queries" },
+          ...queries.map((q) => ({ value: q.id, label: q.label })),
+        ]}
+        onChange={(v) => {
+          setSelected(v);
+          const q = queries.find((x) => x.id === v);
           if (q) onLoad(q.sql);
         }}
-      >
-        <option value="">{queries.length ? "Saved queries…" : "No saved queries"}</option>
-        {queries.map((q) => (
-          <option key={q.id} value={q.id}>
-            {q.label}
-          </option>
-        ))}
-      </select>
+      />
       {selected && (
         <button
           type="button"

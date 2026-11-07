@@ -3,6 +3,7 @@ import { ListFilter, Plus, X } from "lucide-react";
 import type { ColumnDesc, FilterOpDecl, FilterTree } from "../lib/contract";
 import { arity, buildFilter, newRow, opsFor, type FilterRow } from "../lib/filter";
 import { Button } from "./ui/button";
+import { Select } from "./ui/select";
 
 /**
  * The browse filter bar (D-005): a flat AND list of `column · operator ·
@@ -50,36 +51,28 @@ export function FilterBar({
         const n = arity(decl);
         return (
           <div key={i} className="flex items-center gap-1" data-testid="filter-row">
-            <select
+            <Select
               aria-label="Column"
-              className="focus-glow h-6 rounded border border-input bg-background px-1.5 font-mono text-data transition-[border-color,box-shadow] duration-interact"
-              value={row.column}
-              onChange={(e) => {
-                const column = Number(e.target.value);
+              size="sm"
+              mono
+              value={String(row.column)}
+              options={columns.map((c, ci) => ({ value: String(ci), label: c.name }))}
+              onChange={(v) => {
+                const column = Number(v);
                 const nextOps = opsFor(columns[column], ops);
                 // Keep the operator if the new column still supports it.
                 const op = nextOps.some((o) => o.id === row.op) ? row.op : (nextOps[0]?.id ?? row.op);
                 update(i, { column, op });
               }}
-            >
-              {columns.map((c, ci) => (
-                <option key={ci} value={ci}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-            <select
+            />
+            <Select
               aria-label="Operator"
-              className="focus-glow h-6 rounded border border-input bg-background px-1.5 font-mono text-data transition-[border-color,box-shadow] duration-interact"
+              size="sm"
+              mono
               value={row.op}
-              onChange={(e) => update(i, { op: e.target.value })}
-            >
-              {available.map((o) => (
-                <option key={o.id} value={o.id}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+              options={available.map((o) => ({ value: o.id, label: o.label }))}
+              onChange={(v) => update(i, { op: v })}
+            />
             {n !== 0 && (
               <input
                 aria-label="Value"

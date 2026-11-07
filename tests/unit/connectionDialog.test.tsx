@@ -62,4 +62,16 @@ describe("connection dialog", () => {
     await waitFor(() => expect(calls.map((c) => c.cmd)).toEqual(["save_profile"]));
     unmount();
   });
+
+  test("the eye toggle reveals and re-masks the password", () => {
+    fakeCore();
+    const { unmount } = render(<ConnectionDialog mode={{ kind: "new" }} onClose={() => {}} onSaved={() => {}} />);
+    const input = screen.getByLabelText("Password") as HTMLInputElement;
+    expect(input.type).toBe("password");
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(input.type).toBe("text");
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }));
+    expect(input.type).toBe("password");
+    unmount();
+  });
 });

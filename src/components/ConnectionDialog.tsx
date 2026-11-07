@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
-import { Plug, Save, Trash2, X } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
+import { Eye, EyeOff, Plug, Save, Trash2, X } from "lucide-react";
 import { ENGINES, type Engine, type ProfileMeta } from "../lib/contract";
 import { withEngine } from "../lib/engine";
 import { deleteProfile, importConnectionUrl, queryClient, saveProfile, storeCredential, WORKSPACE_KEY } from "../lib/ipc";
 import { cn } from "../lib/utils";
 import { Button } from "./ui/button";
+import { Select } from "./ui/select";
 import { newProfileId } from "./SavedProfiles";
 
 export type DialogMode =
@@ -51,6 +52,8 @@ export function ConnectionDialog({
   const editing = mode.kind === "edit";
   const [form, setForm] = useState<ProfileMeta>(editing ? mode.profile : blankProfile());
   const [secret, setSecret] = useState("");
+  const [showSecret, setShowSecret] = useState(false);
+  const secretId = useId();
   const [importUrl, setImportUrl] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -214,18 +217,13 @@ export function ConnectionDialog({
           <div className="grid grid-cols-3 gap-3">
             <label className="block">
               <span className="text-2xs uppercase tracking-label text-muted-foreground">Engine</span>
-              <select
+              <Select
                 aria-label="Engine"
-                className={cn(inputCls, "mt-1")}
+                className="mt-1 w-full"
                 value={form.engine ?? "postgres"}
-                onChange={(e) => setForm((f) => withEngine(f, e.target.value as Engine))}
-              >
-                {ENGINES.map((en) => (
-                  <option key={en.id} value={en.id}>
-                    {en.label}
-                  </option>
-                ))}
-              </select>
+                options={ENGINES.map((en) => ({ value: en.id, label: en.label }))}
+                onChange={(v) => setForm((f) => withEngine(f, v as Engine))}
+              />
             </label>
             <div className="col-span-2 grid grid-cols-[1fr_6rem] gap-3">
               {field("host", "Host")}
@@ -246,46 +244,65 @@ export function ConnectionDialog({
             {field("dbname", "Database")}
           </div>
 
-          <label className="block">
-            <span className="text-2xs uppercase tracking-label text-muted-foreground">
+          <div>
+            <label htmlFor={secretId} className="text-2xs uppercase tracking-label text-muted-foreground">
               {reentry ? "Password — required" : editing ? "Password — leave empty to keep the stored one" : "Password"}
-            </span>
-            <input
-              type="password"
-              aria-label="Password"
-              autoFocus={reentry}
-              className={cn(inputCls, "mt-1", reentry && "border-caution")}
-              placeholder="stored in the OS keychain, never in the profile file"
-              value={secret}
-              onChange={(e) => setSecret(e.target.value)}
-            />
-          </label>
+            </label>
+            {/* The show/hide toggle sits outside the <label> so it is not part of the field's accessible name. */}
+            <div className="relative mt-1">
+              <input
+                id={secretId}
+                type={showSecret ? "text" : "password"}
+                aria-label="Password"
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus={reentry}
+                className={cn(inputCls, "pr-8", reentry && "border-caution")}
+                placeholder="stored in the OS keychain, never in the profile file"
+                value={secret}
+                onChange={(e) => setSecret(e.target.value)}
+              />
+              <button
+                type="button"
+                aria-label={showSecret ? "Hide password" : "Show password"}
+                aria-pressed={showSecret}
+                title={showSecret ? "Hide password" : "Show password"}
+                className="absolute inset-y-0 right-0 flex w-8 items-center justify-center rounded-r text-muted-foreground transition-colors duration-interact hover:text-foreground focus-visible:text-foreground focus-visible:outline-none"
+                onClick={() => setShowSecret((v) => !v)}
+              >
+                {showSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+          </div>
 
           <div className="grid grid-cols-2 gap-3">
             <label className="block">
               <span className="text-2xs uppercase tracking-label text-muted-foreground">TLS</span>
-              <select
+              <Select<ProfileMeta["tls"]>
                 aria-label="TLS"
-                className={cn(inputCls, "mt-1")}
+                className="mt-1 w-full"
                 value={form.tls}
-                onChange={(e) => set("tls", e.target.value as ProfileMeta["tls"])}
-              >
-                <option value="verify">Verify certificates (default)</option>
-                <option value="accept_invalid_certs">Accept invalid certificates</option>
-                <option value="disabled">Disabled</option>
-              </select>
+                options={[
+                  { value: "verify", label: "Verify certificates (default)" },
+                  { value: "accept_invalid_certs", label: "Accept invalid certificates" },
+                  { value: "disabled", label: "Disabled" },
+                ]}
+                onChange={(v) => set("tls", v)}
+              />
             </label>
             <label className="block">
               <span className="text-2xs uppercase tracking-label text-muted-foreground">Query history</span>
-              <select
-                className={cn(inputCls, "mt-1")}
+              <Select<"" | "on" | "off">
+                aria-label="Query history"
+                className="mt-1 w-full"
                 value={form.history ?? ""}
-                onChange={(e) => set("history", e.target.value === "" ? null : (e.target.value as "on" | "off"))}
-              >
-                <option value="">Default — off for production</option>
-                <option value="on">Keep history</option>
-                <option value="off">Never keep history</option>
-              </select>
+                options={[
+                  { value: "", label: "Default — off for production" },
+                  { value: "on", label: "Keep history" },
+                  { value: "off", label: "Never keep history" },
+                ]}
+                onChange={(v) => set("history", v === "" ? null : v)}
+              />
             </label>
           </div>
           {form.tls !== "verify" && (
