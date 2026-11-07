@@ -1,4 +1,5 @@
-//! Staged edits: the unique-key gate and the per-row `UPDATE` (T-056 / D-027).
+//! Staged edits: the unique-key gate, the per-row `UPDATE` (T-056 / D-027),
+//! and the per-row `INSERT` for rows added in the grid.
 //!
 //! D-027's posture, as this module enforces it:
 //!
@@ -19,9 +20,13 @@
 //!   to a NULL cell (R-004). Every other written column is protected by the
 //!   unique key only, is reported in `concurrency_omitted`, and is named in
 //!   the conflict message.
+//! - **Inserts ride the same path.** A new row is one `INSERT` with only the
+//!   columns the user gave a value; the rest take their defaults. It is offered
+//!   under the same gate as editing, compiled into the same previewed artifact,
+//!   and must add exactly one row inside the same single transaction.
 
 use sluice_core::{
-    BoundParam, DriverError, EditGate, EditRequest, ErrorKind, Original, PlannedStatement, WireValue,
+    BoundParam, DriverError, EditGate, EditOp, EditRequest, ErrorKind, Original, PlannedStatement, WireValue,
 };
 use tokio_postgres::types::Type;
 
@@ -95,6 +100,7 @@ pub fn edit_gate(kind: &str, candidates: &[KeyCandidate], not_null: &[String]) -
 /// it; nothing rebuilds the statement from the edit.
 #[derive(Clone, Debug)]
 pub struct CompiledEdit {
+    pub op: EditOp,
     pub segs: Vec<Seg>,
     /// The executed statement: `segs` with `$n` placeholders.
     pub sql: String,
@@ -157,6 +163,15 @@ impl CompiledEdit {
 
     /// The conflict for a zero-row update, given whether the row still exists.
     pub fn conflict(&self, index: usize, row_exists: bool) -> DriverError {
+        if self.op == EditOp::Insert {
+            return DriverError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "edit {}: the insert added no row (a trigger or rule on the table suppressed it); no edits were applied",
+                    index + 1
+                ),
+            );
+        }
         let what = if row_exists {
             "the row changed since it was read"
         } else {
@@ -192,6 +207,80 @@ fn writable(v: &WireValue) -> Result<(), &'static str> {
         WireValue::Document(_) | WireValue::Array(_) => Err("structural values are not editable here"),
         _ => Ok(()),
     }
+}
+
+/// Compile one staged edit, whichever operation it is.
+pub fn compile_with(
+    index: usize,
+    edit: &EditRequest,
+    columns: &[(String, Type)],
+    gate: &EditGate,
+    cmp: &Comparability,
+) -> Result<CompiledEdit, DriverError> {
+    match edit.op {
+        EditOp::Update => compile_update_with(index, edit, columns, gate, cmp),
+        EditOp::Insert => compile_insert(index, edit, columns, gate),
+    }
+}
+
+/// Compile one new row into `INSERT INTO rel (…) VALUES (…)`, or
+/// `INSERT INTO rel DEFAULT VALUES` when no column was given a value.
+///
+/// Inserts are offered under the editing gate: a relation the gate holds
+/// read-only (a view, a keyless table) takes no inserts here either, so a row
+/// added in the grid can always be edited afterwards by its key.
+pub fn compile_insert(
+    index: usize,
+    edit: &EditRequest,
+    columns: &[(String, Type)],
+    gate: &EditGate,
+) -> Result<CompiledEdit, DriverError> {
+    if let EditGate::ReadOnly { reason } = gate {
+        return Err(DriverError::new(ErrorKind::PermissionDenied, reason.clone()));
+    }
+    if !edit.key.is_empty() || !edit.originals.is_empty() {
+        return Err(refuse(index, "a new row has no key or original values to compare"));
+    }
+    let ty = |col: &str| columns.iter().find(|(n, _)| n == col).map(|(_, t)| t);
+    let mut seen: Vec<&str> = Vec::new();
+    for o in &edit.set {
+        if seen.contains(&o.column.as_str()) {
+            return Err(refuse(index, format!("column {} is set twice", o.column)));
+        }
+        seen.push(&o.column);
+        if ty(&o.column).is_none() {
+            return Err(refuse(index, format!("no column {} on this relation", o.column)));
+        }
+        writable(&o.value).map_err(|m| refuse(index, format!("{}: {m}", o.column)))?;
+    }
+
+    let rel = qualified(&edit.relation)?;
+    let mut b = Builder::default();
+    if edit.set.is_empty() {
+        b.sql(format!("INSERT INTO {rel} DEFAULT VALUES"));
+    } else {
+        let names: Vec<String> = edit.set.iter().map(|o| quote_ident(&o.column)).collect();
+        b.sql(format!("INSERT INTO {rel} ({}) VALUES (", names.join(", ")));
+        for (n, o) in edit.set.iter().enumerate() {
+            if n > 0 {
+                b.sql(", ");
+            }
+            b.param(o, ty(&o.column).expect("checked above"));
+        }
+        b.sql(")");
+    }
+    let sql = render_segs(&b.segs, |i| format!("${}", i + 1));
+    Ok(CompiledEdit {
+        op: EditOp::Insert,
+        sql,
+        segs: b.segs,
+        params: b.params,
+        param_types: b.types,
+        concurrency_omitted: vec![],
+        concurrency_rendered: vec![],
+        probe_sql: String::new(),
+        probe_params: vec![],
+    })
 }
 
 /// Compile one staged edit into `UPDATE rel SET … WHERE <key> = …`.
@@ -329,6 +418,7 @@ pub fn compile_update_with(
 
     let sql = render_segs(&b.segs, |i| format!("${}", i + 1));
     Ok(CompiledEdit {
+        op: EditOp::Update,
         sql,
         segs: b.segs,
         params: b.params,
@@ -402,7 +492,7 @@ mod tests {
         EditGate::Editable { key: vec!["id".into()] }
     }
     fn edit(key: Vec<Original>, set: Vec<Original>) -> EditRequest {
-        EditRequest { relation: rel(), key, set, originals: vec![], compare_rendered: false }
+        EditRequest { op: sluice_core::EditOp::Update, relation: rel(), key, set, originals: vec![], compare_rendered: false }
     }
 
     // ---- T-057 / R-003: preview and execution are one artifact -------------
@@ -462,7 +552,7 @@ mod tests {
             }
         }
         let key = vec![o("id", WireValue::Int((r.next() % 100) as i64))];
-        (cols, EditRequest { relation: rel(), key, set, originals, compare_rendered: false })
+        (cols, EditRequest { op: sluice_core::EditOp::Update, relation: rel(), key, set, originals, compare_rendered: false })
     }
 
     /// Undo `inline_literal` — what the server reads the literal as, under
@@ -769,6 +859,7 @@ mod tests {
         let cols = vec![("id".to_string(), Type::INT4), ("doc".to_string(), Type::JSON)];
         let doc = |v: &str| Original { column: "doc".into(), value: WireValue::Text(v.into()) };
         let mut e = EditRequest {
+            op: sluice_core::EditOp::Update,
             relation: rel(),
             key: vec![o("id", WireValue::Int(1))],
             set: vec![doc(r#"{"b":2}"#)],
@@ -788,5 +879,70 @@ mod tests {
         assert!(on.sql.contains(r#"("doc")::text IS NOT DISTINCT FROM ($3)::text::text"#), "{}", on.sql);
         assert_eq!(on.params[2].as_deref(), Some(r#"{"a": 1}"#), "compared against the text as read");
         assert_eq!(on.planned().concurrency_rendered, vec!["doc"]);
+    }
+
+    // ---- Inserts: a row added in the grid ---------------------------------
+
+    fn insert(set: Vec<Original>) -> EditRequest {
+        EditRequest { op: EditOp::Insert, relation: rel(), key: vec![], set, originals: vec![], compare_rendered: false }
+    }
+
+    #[test]
+    fn an_insert_binds_only_the_columns_given_a_value() {
+        let c = compile_insert(0, &insert(vec![o("name", WireValue::Text("o'brien".into())), o("price", WireValue::Numeric("1.50".into()))]), &cols(), &editable())
+            .unwrap();
+        assert_eq!(c.sql, r#"INSERT INTO "public"."items" ("name", "price") VALUES (($1)::text::text, ($2)::text::numeric)"#);
+        assert!(!c.sql.contains("\"id\""), "untouched columns take their defaults: {}", c.sql);
+        assert_eq!(c.params, vec![Some("o'brien".into()), Some("1.50".into())]);
+        assert_eq!(c.op, EditOp::Insert);
+        let p = c.planned();
+        assert!(p.inline.unwrap().contains("'o''brien'"));
+        assert!(p.concurrency_omitted.is_empty());
+    }
+
+    #[test]
+    fn an_insert_with_no_values_uses_every_default() {
+        let c = compile_insert(0, &insert(vec![]), &cols(), &editable()).unwrap();
+        assert_eq!(c.sql, r#"INSERT INTO "public"."items" DEFAULT VALUES"#);
+        assert!(c.params.is_empty());
+    }
+
+    #[test]
+    fn an_insert_binds_null_and_decodes_bytea() {
+        let c = compile_insert(0, &insert(vec![o("name", WireValue::Null), o("blob", WireValue::Bytes("aGVsbG8=".into()))]), &cols(), &editable())
+            .unwrap();
+        assert_eq!(c.params[0], None);
+        assert!(c.sql.contains("decode("), "{}", c.sql);
+    }
+
+    #[test]
+    fn inserts_are_refused_where_editing_is() {
+        let gate = EditGate::ReadOnly { reason: "no key".into() };
+        let e = compile_insert(0, &insert(vec![]), &cols(), &gate).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn an_insert_refuses_unknown_duplicate_and_unwritable_values_and_stray_keys() {
+        let bad = [
+            insert(vec![o("nope", WireValue::Int(1))]),
+            insert(vec![o("name", WireValue::Null), o("name", WireValue::Null)]),
+            insert(vec![o("name", WireValue::Missing)]),
+            EditRequest { key: vec![o("id", WireValue::Int(1))], ..insert(vec![]) },
+        ];
+        for e in &bad {
+            assert!(compile_insert(0, e, &cols(), &editable()).is_err(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn the_dispatcher_routes_by_operation_and_a_suppressed_insert_says_so() {
+        let c = compile_with(2, &insert(vec![]), &cols(), &editable(), &Comparability::fallback()).unwrap();
+        assert_eq!(c.op, EditOp::Insert);
+        let msg = c.conflict(2, false).message;
+        assert!(msg.starts_with("edit 3: the insert added no row"), "{msg}");
+        let u = compile_with(0, &edit(vec![o("id", WireValue::Int(1))], vec![o("name", WireValue::Null)]), &cols(), &editable(), &Comparability::fallback())
+            .unwrap();
+        assert_eq!(u.op, EditOp::Update);
     }
 }

@@ -9,7 +9,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 
 import { ResultGrid, type GridEditing } from "../../src/components/ResultGrid";
 import type { ColumnDesc, WireValue } from "../../src/lib/contract";
-import { EMPTY, stage, type Pending } from "../../src/lib/pendingEdits";
+import { EMPTY, NO_NEW_ROWS, stage, type NewRows, type Pending } from "../../src/lib/pendingEdits";
 import { col } from "./fixtures";
 
 // happy-dom does no layout; the virtualizer sizes its window from these.
@@ -79,7 +79,12 @@ describe("ResultGrid in a DOM", () => {
 });
 
 describe("ResultGrid editing", () => {
-  function editing(pending: Pending, calls: string[], staged: [number, number, WireValue][] = []): GridEditing {
+  function editing(
+    pending: Pending,
+    calls: string[],
+    staged: [number, number, WireValue][] = [],
+    newRows: NewRows = NO_NEW_ROWS,
+  ): GridEditing {
     return {
       gate: { state: "editable", key: ["id"] },
       pending,
@@ -88,6 +93,11 @@ describe("ResultGrid editing", () => {
       onUnstage: (r, c) => calls.push(`unstage ${r},${c}`),
       onApply: () => calls.push("apply"),
       onDiscard: () => calls.push("discard"),
+      newRows,
+      onAddRow: () => calls.push("add"),
+      onStageNew: (r, c, v) => calls.push(`new ${r},${c}=${JSON.stringify(v)}`),
+      onUnstageNew: (r, c) => calls.push(`default ${r},${c}`),
+      onRemoveNew: (r) => calls.push(`remove ${r}`),
     };
   }
 
@@ -123,6 +133,55 @@ describe("ResultGrid editing", () => {
     render(<ResultGrid sessionId="s" columns={cols} rows={rows} truncated={false} editing={editing(pending, [])} />);
     expect(screen.getByText("1 pending change")).toBeTruthy();
     expect(screen.queryByText(/not checked for concurrent changes/)).toBeNull();
+  });
+
+  test("Add row is offered on an editable relation", () => {
+    const calls: string[] = [];
+    render(<ResultGrid sessionId="s" columns={COLS} rows={ROWS} truncated={false} editing={editing(EMPTY, calls)} />);
+    fireEvent.click(screen.getByText("Add row"));
+    expect(calls).toEqual(["add"]);
+  });
+
+  test("a new row renders after the rows as read, untouched cells say DEFAULT", () => {
+    const calls: string[] = [];
+    const newRows: NewRows = [new Map([[1, { t: "text", v: "carol" } as WireValue]])];
+    render(<ResultGrid sessionId="s" columns={COLS} rows={ROWS} truncated={false} editing={editing(EMPTY, calls, [], newRows)} />);
+    const rows = bodyRows();
+    expect(rows.length).toBe(ROWS.length + 1);
+    const last = rows[rows.length - 1];
+    expect(last.getAttribute("data-new-row")).toBe("true");
+    expect(last.textContent).toContain("carol");
+    expect([...last.querySelectorAll("td")].filter((td) => td.textContent === "DEFAULT").length).toBe(2);
+    expect(screen.getByText("1 new row")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("Use the column default"));
+    fireEvent.click(screen.getByLabelText("Remove new row"));
+    expect(calls).toEqual(["default 0,1", "remove 0"]);
+  });
+
+  test("a new row's cell is given a value by double-click", () => {
+    const calls: string[] = [];
+    render(<ResultGrid sessionId="s" columns={COLS} rows={ROWS} truncated={false} editing={editing(EMPTY, calls, [], [new Map()])} />);
+    const name = [...bodyRows()[ROWS.length].querySelectorAll("td")][1];
+    fireEvent.doubleClick(name.querySelector("div[title]")!);
+    const input = name.querySelector("input[type=text]") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "dave" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(calls).toEqual([`new 0,1=${JSON.stringify({ t: "text", v: "dave" })}`]);
+  });
+
+  test("a read-only gate offers no Add row and shows no new rows", () => {
+    render(
+      <ResultGrid
+        sessionId="s"
+        columns={COLS}
+        rows={ROWS}
+        truncated={false}
+        editing={{ ...editing(EMPTY, [], [], [new Map()]), gate: { state: "read_only", reason: "no unique key" } }}
+      />,
+    );
+    expect(screen.queryByText("Add row")).toBeNull();
+    expect(bodyRows().length).toBe(ROWS.length);
   });
 
   test("a read-only gate leaves cells uneditable", () => {

@@ -420,6 +420,7 @@ async fn every_type_round_trips_through_the_wire_encoding_unchanged() {
             failures.push(format!("[{}] declared concurrency-comparable but has no equality", c.name));
         }
         let edit = |id: i32, original: WireValue| EditRequest {
+            op: sluice_core::EditOp::Update,
             relation: rel(&table),
             key: vec![Original { column: "id".into(), value: WireValue::Int(id.into()) }],
             set: vec![Original { column: "v".into(), value: original.clone() }],

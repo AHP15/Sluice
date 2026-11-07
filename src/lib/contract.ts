@@ -210,6 +210,12 @@ export interface Original {
 
 /** T-056: one staged row edit, as the core receives it — never SQL (D-029). */
 export interface EditRequest {
+  /**
+   * `update` changes an existing row by its key; `insert` adds a new row whose
+   * `set` lists only the columns given a value (the rest take their defaults),
+   * with `key` and `originals` empty. Absent means `update`.
+   */
+  op?: "update" | "insert";
   relation: NodeId;
   /** Unique-key columns and their values as read. */
   key: Original[];

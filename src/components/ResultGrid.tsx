@@ -18,6 +18,7 @@ import {
   PinOff,
   Plus,
   RefreshCw,
+  Trash2,
   Undo2,
   X,
 } from "lucide-react";
@@ -26,7 +27,14 @@ import * as columnLayout from "../lib/columnLayout";
 import type { CachedLayout, ColumnLayout, LayoutColumn } from "../lib/columnLayout";
 import { formatBytes, isAbsent, renderValue } from "../lib/contract";
 import { fetchValue, saveValueToFile } from "../lib/ipc";
-import { cellReadOnlyReason, pendingCount, staged, type Pending } from "../lib/pendingEdits";
+import {
+  cellReadOnlyReason,
+  newCellReadOnlyReason,
+  pendingCount,
+  staged,
+  type NewRows,
+  type Pending,
+} from "../lib/pendingEdits";
 import { cn } from "../lib/utils";
 import { useUiStore } from "../store/ui";
 import { CellEditor } from "./CellEditor";
@@ -46,6 +54,13 @@ export interface GridEditing {
   onApply: () => void;
   onDiscard: () => void;
   applying: boolean;
+  /** Rows added in the grid, shown after the rows as read until applied. */
+  newRows: NewRows;
+  onAddRow: () => void;
+  onStageNew: (row: number, col: number, value: WireValue) => void;
+  /** Put a new row's cell back to the column default. */
+  onUnstageNew: (row: number, col: number) => void;
+  onRemoveNew: (row: number) => void;
 }
 
 /**
@@ -199,7 +214,7 @@ export function ResultGrid({
 
   const columnDefs = useMemo<ColumnDef<Row, WireValue>[]>(
     () =>
-      specs.map(({ id, desc: c, get, edit: i, layout: lc }) => ({
+      specs.map(({ id, desc: c, get, edit: i, layout: lc }, specIndex) => ({
         id,
         accessorFn: get,
         size: 180,
@@ -240,6 +255,22 @@ export function ResultGrid({
           const ed = (ctx.table.options.meta as { editing?: GridEditing } | undefined)?.editing;
           const read = ctx.getValue();
           const row = ctx.row.index;
+          // A row added in the grid: it sits after the rows as read.
+          const added = ed && ed.gate.state === "editable" ? row - (ctx.table.options.meta as { readCount: number }).readCount : -1;
+          if (ed && added >= 0) {
+            return (
+              <NewCell
+                sessionId={sessionId}
+                column={c}
+                value={i === null ? undefined : ed.newRows[added]?.get(i)}
+                editable={i !== null}
+                disabled={ed.applying}
+                onStage={(v) => i !== null && ed.onStageNew(added, i, v)}
+                onUnstage={() => i !== null && ed.onUnstageNew(added, i)}
+                onRemove={specIndex === 0 ? () => ed.onRemoveNew(added) : undefined}
+              />
+            );
+          }
           // T-063: a nested or hand-added path is not a page column, so it has
           // no positional edit identity; it renders read-only (T-062 decides
           // which paths become editable).
@@ -264,12 +295,21 @@ export function ResultGrid({
     [specs, sessionId, sampled],
   );
 
+  // New rows join the table model after the rows as read, so they scroll,
+  // size and virtualize like any other row. Their cells read the staged value
+  // through table meta; this placeholder only gives each one a row shape.
+  const insertable = editing?.gate.state === "editable";
+  const newCount = insertable ? editing.newRows.length : 0;
+  const data = useMemo(
+    () => (newCount ? rows.concat(Array.from({ length: newCount }, () => columns.map((): WireValue => ({ t: "null" })))) : rows),
+    [rows, columns, newCount],
+  );
   const table = useReactTable({
-    data: rows,
+    data,
     columns: columnDefs,
     getCoreRowModel: getCoreRowModel(),
     columnResizeMode: "onChange",
-    meta: { editing },
+    meta: { editing, readCount: rows.length },
   });
   const changed = editing ? pendingCount(editing.pending) : 0;
   const model = table.getRowModel().rows;
@@ -283,6 +323,13 @@ export function ResultGrid({
   // A density switch changes every row's height at once.
   useEffect(() => virtualizer.measure(), [rowHeight, virtualizer]);
   const items = virtualizer.getVirtualItems();
+
+  // Bring a just-added row into view.
+  const lastNew = useRef(newCount);
+  useEffect(() => {
+    if (newCount > lastNew.current) virtualizer.scrollToIndex(model.length - 1, { align: "end" });
+    lastNew.current = newCount;
+  }, [newCount, model.length, virtualizer]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -331,8 +378,18 @@ export function ResultGrid({
             {items.length > 0 && <tr style={{ height: items[0].start }} aria-hidden="true" />}
             {items.map((vi) => {
               const row = model[vi.index];
+              const isNew = vi.index >= rows.length;
               return (
-                <tr key={row.id} style={{ height: rowHeight }} className="transition-colors duration-interact hover:bg-accent/50">
+                <tr
+                  key={row.id}
+                  style={{ height: rowHeight }}
+                  data-new-row={isNew || undefined}
+                  className={cn(
+                    "transition-colors duration-interact hover:bg-accent/50",
+                    // D-032: a staged, unapplied row is a caution until applied.
+                    isNew && "bg-caution/5",
+                  )}
+                >
                   {row.getVisibleCells().map((cell) => (
                     <td
                       key={cell.id}
@@ -357,7 +414,7 @@ export function ResultGrid({
             )}
           </tbody>
         </table>
-        {rows.length === 0 && (
+        {rows.length === 0 && newCount === 0 && (
           <div className="p-6 text-center text-sm text-muted-foreground">No rows</div>
         )}
       </div>
@@ -368,10 +425,27 @@ export function ResultGrid({
             read-only: {editing.gate.reason}
           </span>
         )}
-        {editing?.gate.state === "editable" && changed > 0 && (
+        {insertable && (
+          <button
+            type="button"
+            disabled={editing.applying}
+            title="Add a row; columns you leave alone take their default"
+            className="focus-glow inline-flex h-6 items-center gap-1 rounded border border-border-strong bg-raised px-2 text-foreground transition-colors duration-interact hover:border-muted-foreground/50 disabled:opacity-50"
+            onClick={editing.onAddRow}
+          >
+            <Plus className="h-3 w-3" />
+            Add row
+          </button>
+        )}
+        {editing?.gate.state === "editable" && changed + newCount > 0 && (
           <span className="flex items-center gap-2 text-foreground">
             <span>
-              {changed} pending change{changed === 1 ? "" : "s"}
+              {[
+                changed > 0 && `${changed} pending change${changed === 1 ? "" : "s"}`,
+                newCount > 0 && `${newCount} new row${newCount === 1 ? "" : "s"}`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
             </span>
             {/* D-027: applied together, in one transaction, after review of
                 the exact statements (T-057). Discard is the only undo; there
@@ -550,6 +624,88 @@ function EditableCell({
         <button
           type="button"
           title="Revert this cell"
+          className="focus-glow shrink-0 rounded border border-transparent p-0.5 text-muted-foreground hover:text-foreground"
+          onClick={onUnstage}
+        >
+          <Undo2 className="h-3 w-3" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A cell of a row added in the grid. With no value it shows the column will
+ * take its default; double-click gives it one, and revert puts the default
+ * back. The first cell of the row also carries the row's remove button.
+ */
+function NewCell({
+  sessionId,
+  column,
+  value,
+  editable,
+  disabled,
+  onStage,
+  onUnstage,
+  onRemove,
+}: {
+  sessionId: string;
+  column: ColumnDesc;
+  value: WireValue | undefined;
+  editable: boolean;
+  disabled: boolean;
+  onStage: (v: WireValue) => void;
+  onUnstage: () => void;
+  onRemove?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const reason = editable ? newCellReadOnlyReason(column) : "This path is not a column of the relation.";
+
+  if (open) {
+    return (
+      <CellEditor
+        column={column}
+        value={value ?? { t: "null" }}
+        onCommit={(v) => {
+          setOpen(false);
+          onStage(v);
+        }}
+        onCancel={() => setOpen(false)}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={cn("flex items-center gap-1", value !== undefined && "-mx-3 bg-caution/10 px-3 shadow-inset-caution")}
+      title={reason ?? (value === undefined ? "Takes the column default · double-click to set a value" : "Double-click to edit")}
+      onDoubleClick={() => {
+        if (!reason && !disabled) setOpen(true);
+      }}
+    >
+      {onRemove && (
+        <button
+          type="button"
+          title="Remove this new row"
+          aria-label="Remove new row"
+          disabled={disabled}
+          className="focus-glow shrink-0 rounded border border-transparent p-0.5 text-muted-foreground hover:text-destructive disabled:opacity-50"
+          onClick={onRemove}
+        >
+          <Trash2 className="h-3 w-3" />
+        </button>
+      )}
+      <div className="min-w-0 flex-1">
+        {value === undefined ? (
+          <span className="block truncate italic text-muted-foreground">DEFAULT</span>
+        ) : (
+          <Cell sessionId={sessionId} value={value} column={column} />
+        )}
+      </div>
+      {value !== undefined && !disabled && (
+        <button
+          type="button"
+          title="Use the column default"
           className="focus-glow shrink-0 rounded border border-transparent p-0.5 text-muted-foreground hover:text-foreground"
           onClick={onUnstage}
         >

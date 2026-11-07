@@ -53,7 +53,7 @@ pub use panic_guard::{
     NonPoisonMutex, SessionId,
 };
 pub use request::{
-    BoundParam, BrowseRequest, EditGate, EditPlan, EditRequest, PlannedStatement, FilterTree, NavNode, NodeId, Original, Predicate, RawRequest,
+    BoundParam, BrowseRequest, EditGate, EditOp, EditPlan, EditRequest, PlannedStatement, FilterTree, NavNode, NodeId, Original, Predicate, RawRequest,
     SortKey,
 };
 pub use redact::{redact_shapes, Redactor};

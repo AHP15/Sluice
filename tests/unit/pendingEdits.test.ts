@@ -9,8 +9,14 @@ import { describe, expect, test } from "bun:test";
 import type { ColumnDesc, EditGate, NodeId, WireValue } from "../../src/lib/contract";
 import {
   EMPTY,
+  NO_NEW_ROWS,
+  addNewRow,
   applyToRows,
   buildEditRequests,
+  clearNewCell,
+  removeNewRow,
+  setNewCell,
+  totalPending,
   cellReadOnlyReason,
   parseCellInput,
   pendingCount,
@@ -164,3 +170,44 @@ describe("cell input", () => {
   });
 });
 
+describe("new rows", () => {
+  test("a new row lists only the columns given a value, after the updates", () => {
+    let n = addNewRow(NO_NEW_ROWS);
+    n = setNewCell(n, 0, 2, { t: "numeric", v: "3" });
+    n = setNewCell(n, 0, 1, text("c"));
+    n = addNewRow(n);
+    const p = stage(EMPTY, 0, 1, text("x"), rows[0][1]);
+    const built = buildEditRequests(p, rel, columns, rows, gate, n);
+    if (!built.ok) throw new Error(built.reason);
+    expect(built.edits.length).toBe(3);
+    expect(built.edits[0].op).toBeUndefined();
+    expect(built.edits[1]).toEqual({
+      op: "insert",
+      relation: rel,
+      key: [],
+      set: [
+        { column: "name", value: text("c") },
+        { column: "score", value: { t: "numeric", v: "3" } },
+      ],
+      originals: [],
+    });
+    // Untouched: every column takes its default.
+    expect(built.edits[2]).toEqual({ op: "insert", relation: rel, key: [], set: [], originals: [] });
+    expect(totalPending(p, n)).toBe(3);
+  });
+
+  test("clearing a cell restores the default; removing a row drops only that row", () => {
+    let n = setNewCell(addNewRow(addNewRow(NO_NEW_ROWS)), 1, 1, text("keep"));
+    n = setNewCell(n, 0, 1, text("gone"));
+    n = clearNewCell(n, 0, 1);
+    expect(n[0].size).toBe(0);
+    n = removeNewRow(n, 0);
+    expect(n.length).toBe(1);
+    expect(n[0].get(1)).toEqual(text("keep"));
+  });
+
+  test("a read-only gate refuses new rows too", () => {
+    const built = buildEditRequests(EMPTY, rel, columns, rows, { state: "read_only", reason: "no key" }, addNewRow(NO_NEW_ROWS));
+    expect(built.ok).toBe(false);
+  });
+});
