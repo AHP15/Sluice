@@ -13,8 +13,9 @@
     "windows": [
       {
         "title": "Sluice",
-        "width": 1280,
-        "height": 800,
+        "width": 1920,
+        "height": 1200,
+        "center": true,
         "minWidth": 800,
         "minHeight": 500,
         "label": "main"

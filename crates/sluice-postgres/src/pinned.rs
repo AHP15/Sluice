@@ -22,75 +22,14 @@
 
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use sluice_core::{DriverError, ErrorKind, ExecutionResult, TxDisposition, TxMode};
 
 use crate::error_map;
 use crate::lease::Lease;
 
-/// D-028's idle timeout for an open transaction in an editor tab. Past it the
-/// transaction is rolled back (never committed) and the tab is told.
-pub const IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-/// The transaction state as the server reports it after the last run.
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum TxState {
-    /// No transaction block: each statement commits as it runs.
-    Idle,
-    /// An explicit transaction is open; nothing in it is durable yet.
-    Open,
-    /// The open transaction hit an error; the server will accept only a
-    /// rollback.
-    Failed,
-}
-
-/// T-043 / R-037: the session state a pinned connection holds, as the
-/// *server* reports it — which is what lets the app *show* a tab is stateless
-/// rather than guess it from the statements it ran (`SELECT set_config(…)` or
-/// `SELECT pg_advisory_lock(…)` change session state without a `SET` in
-/// sight).
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionHeld {
-    /// Settings changed for the session (`SET`, `set_config(…, false)`).
-    pub settings: Vec<String>,
-    pub temp_tables: i64,
-    /// `PREPARE`d statements (SQL-level; the driver's own are excluded).
-    pub prepared: i64,
-    /// Named cursors still open (`DECLARE … WITH HOLD`).
-    pub cursors: i64,
-    pub advisory_locks: i64,
-    pub listening: i64,
-    pub transaction: bool,
-}
-
-impl SessionHeld {
-    pub fn is_empty(&self) -> bool {
-        self == &SessionHeld::default()
-    }
-
-    /// Human-readable, one item per kind of state held.
-    pub fn describe(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.transaction {
-            out.push("an open transaction".to_string());
-        }
-        if !self.settings.is_empty() {
-            out.push(format!("SET {}", self.settings.join(", ")));
-        }
-        let n = |k: i64, one: &str, many: &str| match k {
-            0 => None,
-            1 => Some(format!("1 {one}")),
-            k => Some(format!("{k} {many}")),
-        };
-        out.extend(n(self.temp_tables, "temp table", "temp tables"));
-        out.extend(n(self.prepared, "prepared statement", "prepared statements"));
-        out.extend(n(self.cursors, "open cursor", "open cursors"));
-        out.extend(n(self.advisory_locks, "advisory lock", "advisory locks"));
-        out.extend(n(self.listening, "LISTEN channel", "LISTEN channels"));
-        out
-    }
-}
+// T-077: the session vocabulary is engine-neutral and lives in core; the
+// re-exports keep this module's paths stable.
+pub use sluice_core::{lost_message, SessionHeld, SessionStatus, TxState, IDLE_TRANSACTION_TIMEOUT};
 
 const HELD: &str = "SELECT \
     (SELECT string_agg(name, ',' ORDER BY name) FROM pg_settings WHERE source = 'session'), \
@@ -99,20 +38,6 @@ const HELD: &str = "SELECT \
     (SELECT count(*) FROM pg_cursors WHERE name <> ''), \
     (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()), \
     (SELECT count(*) FROM pg_listening_channels())";
-
-/// What the editor tab shows about its session.
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-pub struct SessionStatus {
-    pub tx: TxState,
-    /// Seconds the open transaction has been idle, when one is open.
-    pub tx_idle_secs: Option<u64>,
-    /// The idle timeout after which an open transaction is rolled back.
-    pub idle_timeout_secs: u64,
-    /// The connection is gone; nothing more will run on this session.
-    pub lost: Option<String>,
-    /// T-043: session state held as of the last run, described.
-    pub holds: Vec<String>,
-}
 
 pub struct PinnedSession {
     lease: Option<Lease>,
@@ -124,12 +49,14 @@ pub struct PinnedSession {
     lost: Option<String>,
     /// T-043: what the server said the session held after the last run.
     held: SessionHeld,
+    /// For the cancel handle: the protocol cancel uses the session's TLS mode.
+    tls: crate::tls::TlsMode,
 }
 
 const PROBE: &str = "SELECT statement_timestamp() <> transaction_timestamp(), txid_current_if_assigned()";
 
 impl PinnedSession {
-    pub(crate) fn new(mut lease: Lease) -> Self {
+    pub(crate) fn new(mut lease: Lease, tls: crate::tls::TlsMode) -> Self {
         // Whatever the tab does is session state by definition.
         lease.mark_dirty();
         Self {
@@ -139,6 +66,7 @@ impl PinnedSession {
             last_used: Instant::now(),
             lost: None,
             held: SessionHeld::default(),
+            tls,
         }
     }
 
@@ -365,17 +293,37 @@ impl PinnedSession {
     }
 }
 
-/// T-043: a lost or released session's banner text, naming what went with it.
-pub fn lost_message(what_happened: &str, held: &SessionHeld) -> String {
-    let items = held.describe();
-    let gone = if items.is_empty() {
-        "It held no session state, so only the connection itself is gone.".to_string()
-    } else {
-        format!(
-            "Gone with it: {}{}.",
-            items.join(", "),
-            if held.transaction { " (rolled back, never committed)" } else { "" }
-        )
-    };
-    format!("{what_happened} {gone} Reconnect to continue in a new session.")
+/// T-077: the engine-neutral face of a pinned Postgres session.
+#[async_trait::async_trait]
+impl sluice_core::EditorSession for PinnedSession {
+    fn tx(&self) -> TxState {
+        PinnedSession::tx(self)
+    }
+    fn status(&self) -> SessionStatus {
+        PinnedSession::status(self)
+    }
+    fn idle_for(&self) -> Duration {
+        PinnedSession::idle_for(self)
+    }
+    fn cancel_handle(&self) -> Option<std::sync::Arc<dyn sluice_core::CancelHandle>> {
+        self.cancel_token().map(|t| crate::lease::PgCancel::new(t, self.tls) as std::sync::Arc<dyn sluice_core::CancelHandle>)
+    }
+    async fn held(&mut self) -> Result<SessionHeld, DriverError> {
+        PinnedSession::held(self).await
+    }
+    async fn run(&mut self, script: &str, budget: sluice_core::ExecBudget) -> Result<ExecutionResult, DriverError> {
+        PinnedSession::run(self, script, budget).await
+    }
+    async fn begin(&mut self) -> Result<SessionStatus, DriverError> {
+        PinnedSession::begin(self).await
+    }
+    async fn commit(&mut self) -> Result<SessionStatus, DriverError> {
+        PinnedSession::commit(self).await
+    }
+    async fn rollback(&mut self) -> Result<SessionStatus, DriverError> {
+        PinnedSession::rollback(self).await
+    }
+    async fn close(self: Box<Self>) {
+        PinnedSession::close(*self).await
+    }
 }

@@ -9,6 +9,7 @@ pub mod catalog_probe;
 pub mod edit;
 pub mod encode;
 pub mod error_map;
+pub mod export;
 pub mod lease;
 pub mod navigator;
 pub mod pinned;
@@ -23,7 +24,7 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use sluice_core::{
     Attribution, BrowseRequest, CancelSupport, Capabilities, Driver, DriverError, EditGate,
     EditPlan, EditRequest,
-    ErrorKind, ExecutionResult, FilterOpDecl, NavNode, NodeId, NodeKind, Outcome, OutcomeBody,
+    ErrorKind, ExecutionResult, FilterArity, FilterOpDecl, NavNode, NodeId, NodeKind, Outcome, OutcomeBody,
     RawPayloadKind, RawRequest, ResetSupport, ScriptDialect, Secret, SessionAffinity,
     TransactionSupport, TxContext, TxDisposition, TxMode, TypeClass, WireValue,
 };
@@ -31,7 +32,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::encode::DEFAULT_VALUE_CEILING;
-use crate::lease::{Lease, PoolStats, PoolStatsSnapshot};
+use crate::lease::{Lease, PgCancel, PoolStats, PoolStatsSnapshot};
 pub use crate::lease::CancelSlot;
 use crate::tls::TlsMode;
 
@@ -78,14 +79,8 @@ impl Default for ConnectSpec {
     }
 }
 
-/// One item of a streamed browse (T-049).
-#[derive(Debug, Clone)]
-pub enum BrowseBatch {
-    /// Always first: the page's column descriptors (D-006), and whether the
-    /// relation's rows may be edited (T-056).
-    Columns(Vec<sluice_core::ColumnDesc>, EditGate),
-    Rows(Vec<Vec<WireValue>>),
-}
+// T-076: the stream items are engine-neutral and live in core.
+pub use sluice_core::{BrowseBatch, BrowseStreamEnd};
 
 /// What the catalog says about one relation (T-047, T-056).
 struct RelationShape {
@@ -95,21 +90,10 @@ struct RelationShape {
     is_table: bool,
 }
 
-/// How a streamed browse ended.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrowseStreamEnd {
-    pub rows: usize,
-    /// The request's `limit` was reached (more rows may exist).
-    pub truncated: bool,
-    /// The consumer stopped it (cancel, timeout, or a closed channel).
-    pub stopped: bool,
-    /// T-047: the strategy used and the next page's position (unstopped only).
-    pub page: Option<sluice_core::PageInfo>,
-}
-
 /// D-028's per-profile connection budget, "~5, configurable" (T-042). One
 /// ceiling for pooled and pinned connections together.
-pub const DEFAULT_CONNECTION_BUDGET: usize = 5;
+/// The constant itself is engine-neutral and lives in core (T-079).
+pub use sluice_core::DEFAULT_CONNECTION_BUDGET;
 
 /// How long a request waits for a connection inside the budget before it is
 /// refused (T-042). Long enough to queue behind a running query; short enough
@@ -665,8 +649,8 @@ impl PgDriver {
     /// merely abandoned, which would leave the server producing rows nobody
     /// reads), and the lease is released.
     ///
-    /// An inherent method for now; lifting streaming into the `Driver` trait
-    /// belongs with the second engine.
+    /// Also reachable as `Driver::browse_batches` (T-076), which delegates
+    /// here.
     ///
     /// `emit` returns an owned future (rather than being an async closure) so a
     /// stream can be spawned onto a multi-threaded runtime: async closures that
@@ -743,15 +727,8 @@ impl PgDriver {
     }
 
     async fn send_cancel_checked(&self, token: &tokio_postgres::CancelToken) -> bool {
-        let r = if self.tls == TlsMode::Disabled {
-            token.cancel_query(tokio_postgres::NoTls).await
-        } else {
-            match tls::client_config(self.tls) {
-                Ok(cfg) => token.cancel_query(tokio_postgres_rustls::MakeRustlsConnect::new(cfg)).await,
-                Err(_) => return false,
-            }
-        };
-        r.is_ok()
+        use sluice_core::CancelHandle as _;
+        PgCancel { token: token.clone(), tls: self.tls }.cancel().await
     }
 
     /// Run `f` on a leased connection, then release it through the declared
@@ -778,7 +755,7 @@ impl PgDriver {
             // T-051: register this connection's cancel token; a slot already
             // cancelled refuses to start, closing the cancel-before-start race.
             if let Some(slot) = &self.cancel {
-                if !slot.arm(lease.client().cancel_token()) {
+                if !slot.arm(PgCancel::new(lease.client().cancel_token(), self.tls)) {
                     lease.release().await;
                     return Err(DriverError::new(ErrorKind::Cancelled, "cancelled before it started"));
                 }
@@ -856,10 +833,7 @@ impl PgDriver {
     /// request was sent; `false` means nothing was running (and nothing will
     /// start on that slot now) or the request could not be delivered.
     pub async fn cancel(&self, slot: &CancelSlot) -> bool {
-        match slot.trip() {
-            Some(token) => self.send_cancel_checked(&token).await,
-            None => false,
-        }
+        slot.cancel().await
     }
 
     /// T-041 / D-028: pin a connection for an editor tab's lifetime. Only
@@ -868,7 +842,7 @@ impl PgDriver {
         let lease = Lease::acquire(&self.pool, self.reset, self.stats.clone())
             .await
             .map_err(|e| self.redactor.error(e))?;
-        Ok(pinned::PinnedSession::new(lease))
+        Ok(pinned::PinnedSession::new(lease, self.tls))
     }
 
     /// T-041: run a raw script on a pinned session, with the same redaction
@@ -877,11 +851,11 @@ impl PgDriver {
     /// connection's token for the run, so Stop cancels it on the server.
     pub async fn run_pinned(
         &self,
-        session: &mut pinned::PinnedSession,
+        session: &mut (impl sluice_core::EditorSession + ?Sized),
         script: &str,
     ) -> Result<ExecutionResult, DriverError> {
-        if let (Some(slot), Some(token)) = (&self.cancel, session.cancel_token()) {
-            if !slot.arm(token) {
+        if let (Some(slot), Some(handle)) = (&self.cancel, session.cancel_handle()) {
+            if !slot.arm(handle) {
                 return Err(DriverError::new(ErrorKind::Cancelled, "cancelled before it started"));
             }
         }
@@ -909,6 +883,99 @@ impl PgDriver {
 
 #[async_trait]
 impl Driver for PgDriver {
+    // ---- T-076 / T-077: each delegates to the inherent method of the same
+    // name, so Postgres behaviour is exactly what it was before the lift.
+
+    async fn browse_batches(
+        &self,
+        request: BrowseRequest,
+        batch_rows: usize,
+        emit: sluice_core::BatchSink<BrowseBatch>,
+    ) -> Result<BrowseStreamEnd, DriverError> {
+        PgDriver::browse_batches(self, request, batch_rows, emit).await
+    }
+
+    async fn export_browse(
+        &self,
+        request: BrowseRequest,
+        batch_rows: usize,
+        emit: sluice_core::BatchSink<sluice_core::ExportBatch>,
+    ) -> Result<sluice_core::ExportEnd, DriverError> {
+        PgDriver::export_browse(self, request, batch_rows, emit).await
+    }
+
+    async fn export_query(
+        &self,
+        statement: String,
+        batch_rows: usize,
+        emit: sluice_core::BatchSink<sluice_core::ExportBatch>,
+    ) -> Result<sluice_core::ExportEnd, DriverError> {
+        PgDriver::export_query(self, statement, batch_rows, emit).await
+    }
+
+    fn export_literals(
+        &self,
+        relation: Option<NodeId>,
+        placeholder: String,
+    ) -> Result<Box<dyn sluice_core::SqlLiterals>, DriverError> {
+        Ok(Box::new(match relation {
+            Some(r) => export::PgLiterals::for_relation(&r)?,
+            None => export::PgLiterals::for_name(&placeholder),
+        }))
+    }
+
+    async fn fetch_value(&self, handle: String) -> Result<WireValue, DriverError> {
+        PgDriver::fetch_value(self, &handle).await
+    }
+
+    async fn stream_value_to_file(&self, handle: String, dest: std::path::PathBuf) -> Result<u64, DriverError> {
+        PgDriver::stream_value_to_file(self, &handle, &dest).await
+    }
+
+    fn with_cancel(self: Arc<Self>, slot: CancelSlot) -> Arc<dyn Driver> {
+        PgDriver::with_cancel(self, slot)
+    }
+
+    fn with_budget(self: Arc<Self>, budget: sluice_core::ExecBudget) -> Arc<dyn Driver> {
+        PgDriver::with_budget(self, budget)
+    }
+
+    async fn cancel(&self, slot: &CancelSlot) -> bool {
+        PgDriver::cancel(self, slot).await
+    }
+
+    async fn open_pinned(&self) -> Result<Box<dyn sluice_core::EditorSession>, DriverError> {
+        Ok(Box::new(PgDriver::open_pinned(self).await?))
+    }
+
+    async fn run_pinned(
+        &self,
+        session: &mut dyn sluice_core::EditorSession,
+        script: String,
+    ) -> Result<ExecutionResult, DriverError> {
+        PgDriver::run_pinned(self, session, &script).await
+    }
+
+    fn refresh_catalog(&self) {
+        PgDriver::refresh_catalog(self)
+    }
+
+    fn pool_stats(&self) -> PoolStatsSnapshot {
+        PgDriver::pool_stats(self)
+    }
+
+    fn connection_budget(&self) -> usize {
+        PgDriver::connection_budget(self)
+    }
+
+    fn max_connections(&self) -> Option<i64> {
+        PgDriver::max_connections(self)
+    }
+
+    fn redactor(&self) -> &sluice_core::Redactor {
+        PgDriver::redactor(self)
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "postgres".into(),
@@ -1406,19 +1473,27 @@ fn filter_ops(strings_case_sensitive: bool) -> Vec<FilterOpDecl> {
         TypeClass::Uuid,
     ];
     vec![
-        FilterOpDecl { id: "eq".into(), label: "equals".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
-        FilterOpDecl { id: "ne".into(), label: "not equals".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
-        FilterOpDecl { id: "gt".into(), label: "greater than".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
-        FilterOpDecl { id: "gte".into(), label: "at least".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
-        FilterOpDecl { id: "lt".into(), label: "less than".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
-        FilterOpDecl { id: "lte".into(), label: "at most".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
-        FilterOpDecl { id: "contains".into(), label: "contains".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
-        FilterOpDecl { id: "starts_with".into(), label: "starts with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
-        FilterOpDecl { id: "ends_with".into(), label: "ends with".into(), type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
-        FilterOpDecl { id: "in".into(), label: "is one of".into(), type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
-        FilterOpDecl { id: "between".into(), label: "between".into(), type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
-        FilterOpDecl { id: "is_null".into(), label: "is null".into(), type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
-        FilterOpDecl { id: "is_not_null".into(), label: "is not null".into(), type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "eq".into(), label: "equals".into(), arity: FilterArity::One, type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "ne".into(), label: "not equals".into(), arity: FilterArity::One, type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "gt".into(), label: "greater than".into(), arity: FilterArity::One, type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "gte".into(), label: "at least".into(), arity: FilterArity::One, type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "lt".into(), label: "less than".into(), arity: FilterArity::One, type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "lte".into(), label: "at most".into(), arity: FilterArity::One, type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "contains".into(), label: "contains".into(), arity: FilterArity::One, type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "starts_with".into(), label: "starts with".into(), arity: FilterArity::One, type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "ends_with".into(), label: "ends with".into(), arity: FilterArity::One, type_classes: vec![TypeClass::Text], case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "in".into(), label: "is one of".into(), arity: FilterArity::List, type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
+        FilterOpDecl { id: "between".into(), label: "between".into(), arity: FilterArity::Two, type_classes: all.clone(), case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "is_null".into(), label: "is null".into(), arity: FilterArity::None, type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
+        FilterOpDecl { id: "is_not_null".into(), label: "is not null".into(), arity: FilterArity::None, type_classes: vec![], case_sensitive: None, case_insensitive_toggle: false },
+        // T-014 / D-005: Postgres extension operators. Declared like the core
+        // set; the filter bar renders them from this declaration alone.
+        // POSIX regular expression (`~`, or `~*` with the case toggle). The
+        // pattern is bound as a parameter; a pathological one is bounded by the
+        // profile's statement timeout like any other query.
+        FilterOpDecl { id: "matches_regex".into(), label: "matches regex".into(), arity: FilterArity::One, type_classes: vec![TypeClass::Text], case_sensitive: Some(true), case_insensitive_toggle: true },
+        // `NOT IN`: like `ne`, a NULL cell never matches.
+        FilterOpDecl { id: "not_in".into(), label: "is none of".into(), arity: FilterArity::List, type_classes: all.clone(), case_sensitive: Some(strings_case_sensitive), case_insensitive_toggle: true },
     ]
 }
 

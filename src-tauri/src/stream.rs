@@ -14,7 +14,7 @@
 //! - a producer blocked on credit stays **cancellable** and still hits its
 //!   **deadline**: cancel closes the gate, which wakes the wait immediately, and
 //!   the wait races the deadline. Stopping cancels the query server-side
-//!   (`PgDriver::browse_batches`).
+//!   (`Driver::browse_batches`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -219,23 +219,10 @@ mod tests {
     /// cancelling it while blocked ends the query on the server.
     #[tokio::test]
     async fn a_blocked_live_stream_is_bounded_and_cancellable() {
-        use sluice_core::{BrowseRequest, Driver, NodeId, RawRequest, Secret};
-        use sluice_postgres::{tls::TlsMode, BrowseBatch, ConnectSpec, PgDriver};
+        use sluice_core::{BrowseRequest, NodeId, RawRequest};
+        use sluice_core::BrowseBatch;
 
-        let spec = ConnectSpec {
-            host: "localhost".into(),
-            port: 55432,
-            user: "postgres".into(),
-            password: Some(Secret::new("sluice_dev".into())),
-            dbname: "sluice_dev".into(),
-            tls: TlsMode::Disabled,
-            application_name: "sluice-stream-test".into(),
-            statement_timeout: None,
-        };
-        let Ok(d) = PgDriver::connect(spec).await else {
-            eprintln!("SKIP: no Postgres reachable");
-            return;
-        };
+        let Some(d) = crate::engines::test_postgres(sluice_core::DEFAULT_CONNECTION_BUDGET).await else { return };
         d.raw(RawRequest::Script(
             "drop table if exists stream_t; create table stream_t as select g as id from generate_series(1, 5000) g; alter table stream_t add primary key (id);".into(),
         ))
@@ -258,7 +245,7 @@ mod tests {
                         offset: None,
                     },
                     BATCH_ROWS,
-                    move |b| {
+                    sluice_core::sink(move |b| {
                         let (gate, sent) = (gate.clone(), sent.clone());
                         async move {
                             match b {
@@ -272,7 +259,7 @@ mod tests {
                                 }
                             }
                         }
-                    },
+                    }),
                 )
                 .await
             })

@@ -1,0 +1,24 @@
+[package]
+name = "sluice-sqlserver"
+description = "SQL Server driver implementing the Sluice contract."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sluice-core = { path = "../sluice-core" }
+
+# D-002: tiberius directly. T-072: `rustls`, never the default `native-tls`,
+# which fails the handshake outright on macOS against SQL Server 2022; `tds73`
+# is required for DATETIME2/DATETIMEOFFSET/TIME to decode at all.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# D-002: pooling via deadpool, hand-managed (no deadpool-tiberius crate).
+deadpool = { version = "0.12", default-features = false, features = ["managed", "rt_tokio_1"] }
+tokio = { workspace = true, features = ["net"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+async-trait = "0.1"
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

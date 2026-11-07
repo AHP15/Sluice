@@ -124,6 +124,11 @@ pub const CORE_FILTER_OPS: &[&str] = &[
 
 /// Core operators a driver's capability descriptor fails to declare — the
 /// conformance check every driver's tests run (T-013).
+/// Whether `id` is a driver extension rather than one of the core set.
+pub fn is_extension_op(id: &str) -> bool {
+    !CORE_FILTER_OPS.contains(&id)
+}
+
 pub fn missing_core_ops(declared: &[FilterOpDecl]) -> Vec<&'static str> {
     CORE_FILTER_OPS
         .iter()
@@ -132,11 +137,33 @@ pub fn missing_core_ops(declared: &[FilterOpDecl]) -> Vec<&'static str> {
         .collect()
 }
 
+/// How many values an operator takes (T-014 / D-005), and so which value
+/// inputs the filter bar renders. Declared, never inferred from the id: an
+/// extension operator the UI has never heard of must still render correctly.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterArity {
+    /// No value (`is_null`). The predicate's value is `Null`.
+    None,
+    /// One value.
+    One,
+    /// Exactly two, sent as a two-element `Array` (`between`).
+    Two,
+    /// One or more, sent as an `Array` (`in`).
+    List,
+}
+
 /// A filter operator the driver can compile (T-013/T-014).
+///
+/// The core set ([`CORE_FILTER_OPS`]) every driver must declare; anything else
+/// a driver declares is an **extension** operator (D-005) — engine-specific
+/// matching that the UI renders from this declaration alone.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FilterOpDecl {
     pub id: String,
     pub label: String,
+    /// T-014: which value inputs the operator takes.
+    pub arity: FilterArity,
     pub type_classes: Vec<TypeClass>,
     /// R-009: the universal `contains` is case-insensitive on Postgres (ILIKE)
     /// and case-sensitive on Mongo (`$regex`) unless the driver opts out.

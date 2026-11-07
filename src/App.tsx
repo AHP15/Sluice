@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Bug, Database, Play, Save, ShieldAlert, Square, Sun, Moon, Plug, Plus, X } from "lucide-react";
+import { Bug, Database, Monitor, Play, Rows3, Save, Square, Sun, Moon, Plus, X } from "lucide-react";
 import { Navigator } from "./components/Navigator";
 import { QueryEditor } from "./components/QueryEditor";
 import { EditPreview } from "./components/EditPreview";
@@ -18,6 +18,7 @@ import {
   type Pending,
 } from "./lib/pendingEdits";
 import { Button } from "./components/ui/button";
+import { StatusBanner, StatusPill } from "./components/ui/status";
 import type {
   CatalogSupport,
   ColumnDesc,
@@ -35,6 +36,7 @@ import type {
   ProfileMeta,
   SessionInfo,
   WireValue,
+  Engine,
 } from "./lib/contract";
 import {
   LAUNCH_PENDING_EVENT,
@@ -52,27 +54,28 @@ import {
   type SessionStatus,
   connectLaunch,
   coreVersion,
-  deleteProfile,
-  importConnectionUrl,
   loadWorkspace,
   queryClient,
   saveProfile,
   WORKSPACE_KEY,
   diagnosticsPreview,
   disconnect,
+  exportResult,
+  type ExportSource,
   runScript,
   saveSessionAsProfile,
   setVerboseDiagnostics,
-  storeCredential,
   takeLaunches,
   verboseDiagnostics,
 } from "./lib/ipc";
-import { useUiStore } from "./store/ui";
+import { applyAppearance, resolveTheme, useUiStore } from "./store/ui";
 import { cn } from "./lib/utils";
-import { SavedProfiles, newProfileId } from "./components/SavedProfiles";
 import { SavedQueries } from "./components/SavedQueries";
 import { FilterBar } from "./components/FilterBar";
 import { ConfirmPanel } from "./components/ConfirmPanel";
+import { ConnectionsSidebar, type SidebarConnection } from "./components/ConnectionsSidebar";
+import { ConnectionDialog, type DialogMode } from "./components/ConnectionDialog";
+import { createPortal } from "react-dom";
 import { ConnectionUsageIndicator } from "./components/ConnectionUsage";
 import { invalidateHistory } from "./components/HistoryPanel";
 
@@ -84,10 +87,24 @@ interface RowsView {
   /** T-056: set for a structured browse of one relation; raw results have none. */
   relation?: NodeId;
   edit?: EditGate;
+  /** T-074: how to re-read this result in full for export, or why it can't be. */
+  source?: ExportSource | { kind: "unavailable"; reason: string };
 }
 
 /** What a tab was opened for. */
-type TabSeed = { kind: "blank" } | { kind: "launch"; outcome: LaunchOutcome };
+type TabSeed =
+  | { kind: "blank" }
+  | { kind: "launch"; outcome: LaunchOutcome }
+  /** T-093: opened from the connections sidebar; connects at once. */
+  | { kind: "profile"; profile: ProfileMeta };
+
+/** T-093: what a tab reports about its session, for the sidebar. */
+interface TabSession {
+  /** The saved profile the session is on (the session id's prefix). */
+  profileId: string;
+  state: "connecting" | "connected" | "failed";
+  engine?: Engine;
+}
 
 interface Tab {
   id: number;
@@ -111,12 +128,76 @@ function titleFor(o: LaunchOutcome): string {
  * every later `sluice` invocation each arrive as a launch outcome from the core
  * and open a tab here. Tabs stay mounted while hidden so each keeps its state.
  */
-export function App() {
+/** T-092 / D-031: theme and density live as classes on <html>; `system`
+ *  follows the OS preference live. */
+function useAppearance() {
   const theme = useUiStore((s) => s.theme);
+  const density = useUiStore((s) => s.density);
+  useEffect(() => {
+    const mq = window.matchMedia?.("(prefers-color-scheme: light)");
+    const apply = () => applyAppearance(document.documentElement, resolveTheme(theme, !!mq?.matches), density);
+    apply();
+    mq?.addEventListener?.("change", apply);
+    return () => mq?.removeEventListener?.("change", apply);
+  }, [theme, density]);
+}
+
+export function App() {
+  useAppearance();
   const [tabs, setTabs] = useState<Tab[]>([{ id: 0, seed: { kind: "blank" }, title: "New connection" }]);
   const [active, setActive] = useState(0);
   const nextId = useRef(1);
   const [diagOpen, setDiagOpen] = useState(false);
+  // T-093: which tab holds a session on which saved profile.
+  const [tabSessions, setTabSessions] = useState<Record<number, TabSession | null>>({});
+  const workspace = useQuery({ queryKey: WORKSPACE_KEY, queryFn: loadWorkspace });
+  const profiles = workspace.data?.profiles ?? [];
+  const reportSession = useCallback((tabId: number, s: TabSession | null) => {
+    setTabSessions((prev) => (JSON.stringify(prev[tabId]) === JSON.stringify(s) ? prev : { ...prev, [tabId]: s }));
+  }, []);
+  // T-093: which tab shows which profile, and in what state.
+  const byProfile = useMemo(() => {
+    const out: Record<string, { tabId: number; s: TabSession }> = {};
+    for (const t of tabs) {
+      const s = tabSessions[t.id];
+      if (s && !out[s.profileId]) out[s.profileId] = { tabId: t.id, s };
+    }
+    return out;
+  }, [tabs, tabSessions]);
+  // Connections whose tree is open in the sidebar.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpanded = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  // A connection that just connected opens its tree.
+  const seenConnected = useRef(new Set<number>());
+  useEffect(() => {
+    for (const [id, s] of Object.entries(tabSessions)) {
+      const tabId = Number(id);
+      if (s?.state === "connected" && !seenConnected.current.has(tabId)) {
+        seenConnected.current.add(tabId);
+        const key = profiles.some((p) => p.id === s.profileId) ? s.profileId : `tab:${tabId}`;
+        setExpanded((prev) => new Set(prev).add(key));
+      }
+    }
+  }, [tabSessions, profiles]);
+  // The sidebar slot each tab's navigator renders into.
+  const [slots, setSlots] = useState<Record<number, HTMLDivElement | null>>({});
+  const slotRefs = useRef(new Map<number, (el: HTMLDivElement | null) => void>());
+  const slotRef = useCallback((tabId: number) => {
+    let f = slotRefs.current.get(tabId);
+    if (!f) {
+      f = (el) => setSlots((prev) => (prev[tabId] === el ? prev : { ...prev, [tabId]: el }));
+      slotRefs.current.set(tabId, f);
+    }
+    return f;
+  }, []);
+  // Create / edit a connection, in a modal.
+  const [dialog, setDialog] = useState<DialogMode | null>(null);
 
   const open = useCallback((outcomes: LaunchOutcome[], replaceInitial: boolean) => {
     const created: Tab[] = outcomes.map((o) => ({
@@ -149,6 +230,10 @@ export function App() {
   }, [open]);
 
   const close = (id: number) => {
+    setTabSessions((prev) => {
+      const { [id]: _gone, ...rest } = prev;
+      return rest;
+    });
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       if (active === id && next.length > 0) setActive(next[next.length - 1].id);
@@ -162,61 +247,260 @@ export function App() {
     setActive(id);
   };
 
+  /** T-093: switch to the profile's live tab, or open one that connects. An
+   *  idle blank tab in front is reused rather than left beside it. */
+  const openProfile = (p: ProfileMeta) => {
+    const live = byProfile[p.id];
+    setExpanded((prev) => new Set(prev).add(p.id));
+    if (live) {
+      setActive(live.tabId);
+      return;
+    }
+    const id = nextId.current++;
+    const tab: Tab = { id, seed: { kind: "profile", profile: p }, title: p.label };
+    setTabs((prev) => {
+      const current = prev.find((t) => t.id === active);
+      const reusable = current && current.seed.kind === "blank" && !tabSessions[current.id];
+      return reusable ? prev.map((t) => (t.id === active ? tab : t)) : [...prev, tab];
+    });
+    setActive(id);
+  };
+
+  /** T-094: rename in place, written to the portable profile file. */
+  const renameProfile = async (p: ProfileMeta, label: string) => {
+    queryClient.setQueryData(WORKSPACE_KEY, await saveProfile({ ...p, label }));
+  };
+
+  /** A tab on a saved profile is titled by the profile's current name. */
+  const titleOf = (t: Tab) => {
+    const pid = tabSessions[t.id]?.profileId ?? (t.seed.kind === "profile" ? t.seed.profile.id : null);
+    return profiles.find((p) => p.id === pid)?.label ?? t.title;
+  };
+
+  // The sidebar: every saved connection, then live sessions nobody saved
+  // (a command-line launch), each expandable into its navigator.
+  const sidebarItems: SidebarConnection[] = [
+    ...profiles.map((p) => {
+      const live = byProfile[p.id];
+      return {
+        key: p.id,
+        label: p.label,
+        engine: p.engine,
+        profile: p,
+        tabId: live?.tabId ?? null,
+        connected: live?.s.state === "connected",
+        connecting: live?.s.state === "connecting",
+        failed: live?.s.state === "failed",
+      };
+    }),
+    ...tabs
+      .filter((t) => {
+        const s = tabSessions[t.id];
+        return s?.state === "connected" && !profiles.some((p) => p.id === s.profileId);
+      })
+      .map((t) => ({
+        key: `tab:${t.id}`,
+        label: titleOf(t),
+        engine: tabSessions[t.id]?.engine,
+        profile: null,
+        tabId: t.id,
+        connected: true,
+        connecting: false,
+      })),
+  ];
+
+  /** Replace a tab that is not connected with a fresh one on `p`'s current
+   *  settings — the tab's seed is a copy taken when it opened, so retrying
+   *  on it would reuse settings the user has since changed. */
+  const reconnectTab = (tabId: number, p: ProfileMeta) => {
+    const id = nextId.current++;
+    setTabSessions((prev) => {
+      const { [tabId]: _old, ...rest } = prev;
+      return rest;
+    });
+    setTabs((prev) => prev.map((t) => (t.id === tabId ? { id, seed: { kind: "profile", profile: p }, title: p.label } : t)));
+    setActive(id);
+    setExpanded((prev) => new Set(prev).add(p.id));
+  };
+
+  const onDialogSaved = (p: ProfileMeta, connect: boolean) => {
+    if (!connect) return;
+    const live = byProfile[p.id];
+    // A failed or pending connect retries with the settings just saved; a
+    // live session is switched to (its settings change on next connect).
+    if (live && live.s.state !== "connected") reconnectTab(live.tabId, p);
+    else openProfile(p);
+  };
+
+  /** Retry from a failed tab: always with the profile as saved now. */
+  const retryTab = (tabId: number, profileId: string) => {
+    const latest = profiles.find((p) => p.id === profileId);
+    if (latest) reconnectTab(tabId, latest);
+  };
+
   return (
-    <div className={theme === "dark" ? "dark" : undefined}>
-      <div className="flex h-screen flex-col bg-background text-foreground">
-        <nav className="flex items-center gap-0.5 border-b bg-muted/40 px-1 pt-1 text-xs" role="tablist">
-          {tabs.map((t) => (
-            <div
-              key={t.id}
-              role="tab"
-              aria-selected={t.id === active}
-              className={
-                "flex items-center gap-1 rounded-t border border-b-0 px-2 py-1 " +
-                (t.id === active ? "bg-background" : "border-transparent text-muted-foreground")
-              }
-            >
-              <button type="button" onClick={() => setActive(t.id)} className="max-w-48 truncate">
-                {t.title}
-              </button>
-              <button type="button" aria-label={`Close ${t.title}`} onClick={() => close(t.id)}>
-                <X className="h-3 w-3" />
-              </button>
-            </div>
-          ))}
-          <button type="button" aria-label="New tab" className="px-1.5 py-1" onClick={addBlank}>
-            <Plus className="h-3.5 w-3.5" />
-          </button>
+    <div className="flex h-screen flex-col bg-background text-foreground">
+      {/* T-095 / D-031: one title bar — the mark, the tabs, the appearance
+          controls. Session state lives in each tab's own toolbar. */}
+      <header className="flex h-10 shrink-0 items-center gap-3 border-b bg-panel pl-3 pr-2">
+        <span className="flex select-none items-center gap-2 text-xs font-semibold tracking-label">
+          <span aria-hidden className="block h-2.5 w-2.5 rotate-45 border-[1.5px] border-primary" />
+          SLUICE
+        </span>
+        <nav className="flex min-w-0 items-center gap-1 overflow-x-auto" role="tablist" aria-label="Connection tabs">
+          {tabs.map((t) => {
+            const on = t.id === active;
+            return (
+              <div
+                key={t.id}
+                role="tab"
+                aria-selected={on}
+                className={cn(
+                  "group flex h-7 shrink-0 items-center gap-1.5 rounded border pl-2.5 pr-1 text-xs transition-[background-color,border-color,box-shadow] duration-interact",
+                  on
+                    ? "glow border-primary/60 bg-raised text-foreground"
+                    : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+              >
+                <button type="button" onClick={() => setActive(t.id)} className="max-w-48 truncate font-mono">
+                  {titleOf(t)}
+                </button>
+                <button
+                  type="button"
+                  aria-label={`Close ${titleOf(t)}`}
+                  className="rounded p-0.5 opacity-60 hover:bg-accent hover:opacity-100"
+                  onClick={() => close(t.id)}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            );
+          })}
           <button
             type="button"
-            className="ml-auto flex items-center gap-1 px-1.5 py-1 text-muted-foreground"
-            onClick={() => setDiagOpen(true)}
+            aria-label="New tab"
+            className="focus-glow rounded border border-transparent p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            onClick={addBlank}
           >
-            <Bug className="h-3.5 w-3.5" />
-            Diagnostics
+            <Plus className="h-3.5 w-3.5" />
           </button>
         </nav>
-        {diagOpen && <DiagnosticsPanel onClose={() => setDiagOpen(false)} />}
-        {tabs.map((t) => (
-          <div key={t.id} className={t.id === active ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
-            <Workspace seed={t.seed} />
-          </div>
-        ))}
+        <div className="ml-auto flex items-center gap-1">
+          <AppearanceControls />
+          <Button size="sm" variant="ghost" onClick={() => setDiagOpen(true)}>
+            <Bug className="h-3.5 w-3.5" />
+            Diagnostics
+          </Button>
+        </div>
+      </header>
+      {diagOpen && <DiagnosticsPanel onClose={() => setDiagOpen(false)} />}
+      {dialog && (
+        <ConnectionDialog
+          // A fresh form for each opening.
+          key={dialog.kind === "edit" ? `edit:${dialog.profile.id}:${dialog.reentry ? 1 : 0}` : "new"}
+          mode={dialog}
+          onClose={() => setDialog(null)}
+          onSaved={onDialogSaved}
+        />
+      )}
+      <div className="flex min-h-0 flex-1">
+        <ConnectionsSidebar
+          items={sidebarItems}
+          activeTabId={active}
+          expanded={expanded}
+          onOpen={(it) => {
+            if (it.profile) openProfile(it.profile);
+            else if (it.tabId != null) {
+              setActive(it.tabId);
+              setExpanded((prev) => new Set(prev).add(it.key));
+            }
+          }}
+          onToggle={toggleExpanded}
+          onDisconnect={close}
+          onNew={() => setDialog({ kind: "new" })}
+          onEdit={(profile) => setDialog({ kind: "edit", profile })}
+          onRename={renameProfile}
+          slotRef={slotRef}
+        />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {tabs.map((t) => (
+            <div key={t.id} className={t.id === active ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+              <Workspace
+                seed={t.seed}
+                onSession={(s) => reportSession(t.id, s)}
+                navSlot={slots[t.id] ?? null}
+                onNewConnection={() => setDialog({ kind: "new" })}
+                onEditProfile={(profile, reentry, reason) =>
+                  // Edit the profile as saved now, not the tab's copy of it.
+                  setDialog({
+                    kind: "edit",
+                    profile: profiles.find((p) => p.id === profile.id) ?? profile,
+                    reentry,
+                    reason,
+                  })
+                }
+                onRetryProfile={(profileId) => retryTab(t.id, profileId)}
+              />
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
 }
 
-/** One tab: one connection, its navigator, editor and results. */
-function Workspace({ seed }: { seed: TabSeed }) {
+/** T-095 / D-031: theme (dark → light → system) and density, always to hand. */
+function AppearanceControls() {
   const theme = useUiStore((s) => s.theme);
-  const toggleTheme = useUiStore((s) => s.toggleTheme);
+  const cycleTheme = useUiStore((s) => s.cycleTheme);
+  const density = useUiStore((s) => s.density);
+  const setDensity = useUiStore((s) => s.setDensity);
+  const ThemeIcon = theme === "dark" ? Moon : theme === "light" ? Sun : Monitor;
+  return (
+    <>
+      <Button size="sm" variant="ghost" onClick={cycleTheme} aria-label={`Theme: ${theme}. Switch theme`} title="Switch theme">
+        <ThemeIcon className="h-3.5 w-3.5" />
+        <span className="capitalize">{theme}</span>
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}
+        aria-label={`Density: ${density}. Switch density`}
+        title="Switch row density"
+      >
+        <Rows3 className="h-3.5 w-3.5" />
+        <span className="capitalize">{density}</span>
+      </Button>
+    </>
+  )
+}
+
+/** One tab: one connection, its navigator, editor and results. */
+function Workspace({
+  seed,
+  onSession,
+  navSlot,
+  onNewConnection,
+  onEditProfile,
+  onRetryProfile,
+}: {
+  seed: TabSeed;
+  onSession: (s: TabSession | null) => void;
+  /** The sidebar element this tab's navigator renders into, under its row. */
+  navSlot: HTMLElement | null;
+  onNewConnection: () => void;
+  onEditProfile: (profile: ProfileMeta, reentry?: boolean, reason?: string) => void;
+  /** Reconnect with the profile's current saved settings. */
+  onRetryProfile: (profileId: string) => void;
+}) {
   const initialQuery = useUiStore((s) => s.draftQuery);
   const [draftQuery, setDraftQuery] = useState(initialQuery);
 
   const core = useQuery({ queryKey: ["core-version"], queryFn: coreVersion });
 
   const launch = seed.kind === "launch" ? seed.outcome : null;
+  const profileSeed = seed.kind === "profile" ? seed.profile : null;
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(
     launch?.kind === "error" ? launch.message : null,
@@ -239,11 +523,52 @@ function Workspace({ seed }: { seed: TabSeed }) {
     }
   }, [launch]);
 
+  // T-093: a tab opened from the sidebar connects its profile at once. On
+  // failure the connect form opens on that profile, so a password can be
+  // re-entered (T-071) — the one time the form is needed.
+  const connectSeedProfile = useCallback(async () => {
+    if (!profileSeed) return;
+    setConnecting(true);
+    setLaunchError(null);
+    try {
+      setSession(await connect(profileSeed));
+    } catch (e) {
+      const de = e as DriverError;
+      const msg = String(de?.message ?? e);
+      setLaunchError(msg);
+      // T-071 / R-016: the stored password could not be used — ask for it
+      // again in the connection dialog rather than leaving a dead end.
+      if (de?.hints?.credential_reentry) onEditRef.current(profileSeed, true, msg);
+    } finally {
+      setConnecting(false);
+    }
+  }, [profileSeed]);
+  const onEditRef = useRef(onEditProfile);
+  onEditRef.current = onEditProfile;
+
   useEffect(() => {
     if (started.current) return;
     started.current = true;
     void connectLaunched();
-  }, [connectLaunched]);
+    void connectSeedProfile();
+  }, [connectLaunched, connectSeedProfile]);
+
+  // T-093: tell the shell which profile this tab is on, for the sidebar.
+  const onSessionRef = useRef(onSession);
+  onSessionRef.current = onSession;
+  useEffect(() => {
+    onSessionRef.current(
+      session
+        ? {
+            profileId: session.session_id.split("::")[0],
+            state: "connected",
+            engine: session.capabilities.engine as Engine,
+          }
+        : profileSeed && (connecting || launchError)
+          ? { profileId: profileSeed.id, state: connecting ? "connecting" : "failed", engine: profileSeed.engine }
+          : null,
+    );
+  }, [session, connecting, launchError, profileSeed]);
 
   // Closing the tab releases its connection.
   const sessionRef = useRef<SessionInfo | null>(null);
@@ -375,14 +700,16 @@ function Workspace({ seed }: { seed: TabSeed }) {
       const label = node.id.path.join(".");
       // T-009: the grid issues ONLY this structured request. It never builds
       // SQL, and it does not know what engine is on the other end.
+      const request = { relation: node.id, filter, sort: [], limit: 500, cursor: null };
+      const source: ExportSource = { kind: "browse", request };
       const stream = RowStream.open(
         session.session_id,
-        { relation: node.id, filter, sort: [], limit: 500, cursor: null },
+        request,
         (e) => {
           if (streamRef.current !== stream) return; // superseded
           switch (e.kind) {
             case "columns":
-              setView({ columns: e.columns, rows: [], truncated: false, label, relation: node.id, edit: e.edit });
+              setView({ columns: e.columns, rows: [], truncated: false, label, relation: node.id, edit: e.edit, source });
               break;
             case "rows":
               unretired.current += 1;
@@ -458,6 +785,16 @@ function Workspace({ seed }: { seed: TabSeed }) {
           rows: first.rows,
           truncated: first.truncated,
           label: "query result",
+          // T-074: export re-runs the query read-only on a pooled connection.
+          // Only a lone statement can be re-run without trusting the
+          // display-only splitter (R-040), and a pinned session's result can
+          // depend on state (an open transaction, temp tables) a fresh
+          // connection would not see — so those say why instead.
+          source: pinsSocket
+            ? { kind: "unavailable", reason: "the result came from a pinned editor session" }
+            : run.result.outcomes.length !== 1
+              ? { kind: "unavailable", reason: "run the statement on its own to export it" }
+              : { kind: "query", script: draftQuery },
         });
       }
     } catch (e) {
@@ -538,99 +875,217 @@ function Workspace({ seed }: { seed: TabSeed }) {
     if (runningQuery.current) void cancelQuery(runningQuery.current);
   }, []);
 
+  const caps = session?.capabilities;
+  const production = session?.guardrails.production.armed ?? false;
+  const relationLabel = view?.relation ? view.relation.path.join(" / ") : view ? view.label : null;
+
   return (
     <>
-        <header className="flex items-center gap-3 border-b px-3 py-2">
-          <Database className="h-4 w-4 text-primary" />
-          <span className="text-sm font-semibold">Sluice</span>
-          <span className="text-xs text-muted-foreground">
-            {core.isPending ? "starting…" : core.isError ? "core unreachable" : core.data}
-          </span>
-          {session && (
-            <span className="rounded bg-secondary px-1.5 py-0.5 text-xs">
-              {session.capabilities.engine}
-              {/* T-054: the parsed flavour and the product's own version. */}
-              {session.capabilities.flavour && session.capabilities.flavour !== session.capabilities.engine
-                ? ` · ${session.capabilities.flavour}`
-                : ""}
-              {session.capabilities.server_version ? ` ${session.capabilities.server_version}` : ""}
+      {/* D-032: a production session carries a persistent red rule. */}
+      {production && <div aria-hidden className="h-0.5 shrink-0 bg-destructive" />}
+
+      {/* T-095: the session toolbar — what this tab is connected to, its
+          guardrails as status pills (D-032), and the primary action. */}
+      <div className="flex h-10 shrink-0 items-center gap-2 border-b bg-background px-3">
+        {session ? (
+          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <Database aria-hidden className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate font-mono">
+              {session.guardrails.provenance === "manual" ? "" : `${PROVENANCE_LABEL[session.guardrails.provenance]} · `}
+              {relationLabel ? <span className="text-foreground">{relationLabel}</span> : "no relation selected"}
             </span>
-          )}
-          <div className="ml-auto flex items-center gap-2">
-            {busy && runningQuery.current ? (
-              <Button size="sm" variant="secondary" onClick={onStop}>
-                <Square className="h-3.5 w-3.5" />
-                Stop
-              </Button>
-            ) : (
-              <Button size="sm" variant="secondary" onClick={() => void onRun()} disabled={!session || busy}>
-                <Play className="h-3.5 w-3.5" />
-                Run
-              </Button>
-            )}
-            {session && <ConnectionUsageIndicator sessionId={session.session_id} />}
-            <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
-              {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">{connecting ? "Connecting…" : "Not connected"}</span>
+        )}
+        <div className="ml-auto flex min-w-0 items-center gap-1.5">
+          {session && <GuardrailPills guardrails={session.guardrails} tls={!!session.tls_warning} />}
+          {busy && runningQuery.current ? (
+            <Button size="sm" variant="secondary" onClick={onStop}>
+              <Square className="h-3.5 w-3.5" />
+              Stop
             </Button>
-          </div>
-        </header>
+          ) : (
+            <Button size="sm" onClick={() => void onRun()} disabled={!session || busy} title="Run (⌘↵)">
+              <Play className="h-3.5 w-3.5" />
+              Run
+            </Button>
+          )}
+        </div>
+      </div>
+      {/* D-031 §6: the one looping motion, while a query runs. */}
+      {busy && (
+        <div className="scan-line shrink-0" role="progressbar" aria-label="Running">
+          <i />
+        </div>
+      )}
 
-        {/* D-007: an opt-out from TLS verification must be visible wherever the
-            connection is. The text comes from the core with the session. */}
-        {session?.tls_warning && (
-          <div className="flex items-center gap-2 border-b bg-destructive px-3 py-1 text-xs text-destructive-foreground">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span>{session.tls_warning}</span>
-          </div>
-        )}
+      {/* D-007: an opt-out from TLS verification must be visible wherever the
+          connection is. D-032: it is a caution, not a danger. */}
+      {session?.tls_warning && <StatusBanner tone="caution">{session.tls_warning}</StatusBanner>}
+      {/* T-044 / R-038: a raised budget is a deliberate choice, said plainly. */}
+      {session?.budget_warning && <StatusBanner tone="caution">{session.budget_warning}</StatusBanner>}
 
-        {/* T-044 / R-038: a raised budget is a deliberate choice, said plainly. */}
-        {session?.budget_warning && (
-          <div className="flex items-center gap-2 border-b bg-secondary px-3 py-1 text-xs">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span>{session.budget_warning}</span>
-          </div>
-        )}
+      {session && (
+        <GuardrailBar
+          guardrails={session.guardrails}
+          origin={launch?.kind === "connect" ? launch : null}
+          onSave={async (label) => {
+            const saved = await saveSessionAsProfile(session.session_id, label);
+            setSession({ ...session, guardrails: saved.guardrails });
+            void queryClient.invalidateQueries({ queryKey: WORKSPACE_KEY });
+            return { label: saved.profile.label, notice: saved.notice ?? null };
+          }}
+        />
+      )}
 
-        {session && (
-          <GuardrailBar
-            guardrails={session.guardrails}
-            origin={launch?.kind === "connect" ? launch : null}
-            onSave={async (label) => {
-              const saved = await saveSessionAsProfile(session.session_id, label);
-              setSession({ ...session, guardrails: saved.guardrails });
-              void queryClient.invalidateQueries({ queryKey: WORKSPACE_KEY });
-              return { label: saved.profile.label, notice: saved.notice ?? null };
-            }}
-          />
-        )}
+      <div className="flex min-h-0 flex-1">
+        {/* The navigator lives in the sidebar, under this connection's row. */}
+        {session &&
+          navSlot &&
+          createPortal(
+            <div className="py-1 pr-1">
+              <CatalogNote catalog={session.capabilities.catalog} />
+              <Navigator
+                sessionId={session.session_id}
+                capabilities={session.capabilities}
+                selected={selected}
+                onSelect={(node) => onSelectRelation(node)}
+              />
+            </div>,
+            navSlot,
+          )}
 
-        <div className="flex min-h-0 flex-1">
-          <aside className="flex w-64 shrink-0 flex-col border-r">
-            {session ? (
-              <div className="min-h-0 flex-1 overflow-auto p-1">
-                <CatalogNote catalog={session.capabilities.catalog} />
-                <Navigator
-                  sessionId={session.session_id}
-                  capabilities={session.capabilities}
-                  selected={selected}
-                  onSelect={(node) => onSelectRelation(node)}
-                />
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {confirmation && (
+            <ConfirmPanel
+              request={confirmation}
+              onConfirm={(phrase) => void onRun(phrase)}
+              onCancel={() => setConfirmation(null)}
+            />
+          )}
+
+          {error ? (
+            <StatusBanner tone="danger">{error}</StatusBanner>
+          ) : (
+            summary && (
+              <div role="status" className="border-b px-3 py-1.5 font-mono text-xs text-muted-foreground">
+                {summary}
               </div>
-            ) : (
-              <>
-                <LaunchBanner
-                  launch={launch}
-                  connecting={connecting}
-                  error={launchError}
-                  onRetry={launch?.kind === "connect" ? connectLaunched : undefined}
-                />
-                {!connecting && <ConnectPanel onConnected={setSession} />}
-              </>
-            )}
-          </aside>
+            )
+          )}
 
-          <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {outcomes && outcomes.length > 1 && <OutcomeStrip outcomes={outcomes} />}
+
+          {session && view?.relation && (
+            <FilterBar
+              // A new relation starts with an empty bar.
+              key={view.relation.path.join(".")}
+              columns={view.columns}
+              ops={session.capabilities.filter_ops}
+              onApply={(f) => browsedNode.current && onSelectRelation(browsedNode.current, f)}
+            />
+          )}
+
+          <section className="min-h-0 flex-1">
+            {session && view ? (
+              <ResultGrid
+                sessionId={session.session_id}
+                columns={view.columns}
+                rows={view.rows}
+                truncated={view.truncated}
+                exporting={
+                  view.source
+                    ? view.source.kind === "unavailable"
+                      ? { available: false, reason: view.source.reason }
+                      : {
+                          available: true,
+                          run: (format, queryId) =>
+                            exportResult(session.session_id, view.source as ExportSource, format, view.label, queryId),
+                        }
+                    : undefined
+                }
+                editing={
+                  view.edit
+                    ? {
+                        gate: view.edit,
+                        pending,
+                        // Staging is frozen while a preview is open, so what
+                        // runs is what was reviewed.
+                        applying: applying || review !== null,
+                        onStage: (r, c, v) => setPending((p) => stage(p, r, c, v, view.rows[r][c])),
+                        onUnstage: (r, c) => setPending((p) => unstage(p, r, c)),
+                        onApply,
+                        onDiscard: () => {
+                          setPending(EMPTY);
+                          setError(null);
+                        },
+                      }
+                    : undefined
+                }
+              />
+            ) : (
+              <EmptyState
+                connected={!!session}
+                onNewConnection={onNewConnection}
+                notice={
+                  session ? null : (
+                    <>
+                      <LaunchBanner
+                        launch={launch}
+                        connecting={connecting}
+                        error={launchError}
+                        onRetry={launch?.kind === "connect" ? connectLaunched : undefined}
+                      />
+                      {profileSeed && (connecting || launchError) && (
+                        <div className="space-y-2 text-sm" role={launchError ? "alert" : "status"}>
+                          <p>
+                            {connecting ? "Connecting to " : "Could not connect to "}
+                            <span className="font-medium">{profileSeed.label}</span>
+                            {connecting && "…"}
+                          </p>
+                          {launchError && <p className="text-xs text-destructive">{launchError}</p>}
+                          {launchError && (
+                            <div className="flex justify-center gap-2">
+                              <Button size="sm" variant="secondary" onClick={() => onRetryProfile(profileSeed.id)}>
+                                Retry
+                              </Button>
+                              <Button size="sm" variant="secondary" onClick={() => onEditProfile(profileSeed)}>
+                                Edit connection
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )
+                }
+              />
+            )}
+          </section>
+
+          {review && (
+            <EditPreview
+              plan={review.plan}
+              applying={applying}
+              onConfirm={onConfirm}
+              onBack={() => setReview(null)}
+              compareRendered={review.edits.some((e) => e.compare_rendered)}
+              onCompareRendered={async (on) => {
+                // T-060: re-preview; apply then runs exactly this plan.
+                const edits = review.edits.map((e) => ({ ...e, compare_rendered: on }));
+                try {
+                  const plan = await previewEdits(session!.session_id, edits);
+                  setReview({ ...review, edits, plan });
+                } catch (e2) {
+                  setError(String((e2 as { message?: string })?.message ?? e2));
+                }
+              }}
+            />
+          )}
+
+          {/* T-095 / D-031: the editor docks below the results, like the mock. */}
+          <section aria-label="Query editor" className="flex h-56 shrink-0 flex-col border-t border-border-strong bg-panel">
             {editor && (
               <EditorSessionBar
                 status={editor.status}
@@ -640,104 +1095,68 @@ function Workspace({ seed }: { seed: TabSeed }) {
                 onReconnect={onReconnect}
               />
             )}
-            {!editor && editorNotice && (
-              <div className="border-b px-3 py-1 text-xs text-destructive">{editorNotice}</div>
-            )}
+            {!editor && editorNotice && <StatusBanner tone="danger">{editorNotice}</StatusBanner>}
             <SavedQueries
               sql={draftQuery}
               profileId={session ? session.session_id.split("::")[0] : null}
               onLoad={setDraftQuery}
             />
-            {confirmation && (
-              <ConfirmPanel
-                request={confirmation}
-                onConfirm={(phrase) => void onRun(phrase)}
-                onCancel={() => setConfirmation(null)}
-              />
-            )}
-            <section className="h-40 shrink-0 border-b">
+            <div className="min-h-0 flex-1">
               <QueryEditor value={draftQuery} onChange={setDraftQuery} onRun={() => void onRun()} />
-            </section>
+            </div>
+          </section>
+        </main>
+      </div>
 
-            {(summary || error) && (
-              <div
-                className={
-                  error
-                    ? "border-b bg-destructive px-3 py-1 text-xs text-destructive-foreground"
-                    : "border-b px-3 py-1 text-xs text-muted-foreground"
-                }
-              >
-                {error ?? summary}
-              </div>
-            )}
-
-            {outcomes && outcomes.length > 1 && <OutcomeStrip outcomes={outcomes} />}
-
-            {session && view?.relation && (
-              <FilterBar
-                // A new relation starts with an empty bar.
-                key={view.relation.path.join(".")}
-                columns={view.columns}
-                ops={session.capabilities.filter_ops}
-                onApply={(f) => browsedNode.current && onSelectRelation(browsedNode.current, f)}
-              />
-            )}
-
-            <section className="min-h-0 flex-1">
-              {session && view ? (
-                <ResultGrid
-                  sessionId={session.session_id}
-                  columns={view.columns}
-                  rows={view.rows}
-                  truncated={view.truncated}
-                  editing={
-                    view.edit
-                      ? {
-                          gate: view.edit,
-                          pending,
-                          // Staging is frozen while a preview is open, so what
-                          // runs is what was reviewed.
-                          applying: applying || review !== null,
-                          onStage: (r, c, v) => setPending((p) => stage(p, r, c, v, view.rows[r][c])),
-                          onUnstage: (r, c) => setPending((p) => unstage(p, r, c)),
-                          onApply,
-                          onDiscard: () => {
-                            setPending(EMPTY);
-                            setError(null);
-                          },
-                        }
-                      : undefined
-                  }
-                />
-              ) : (
-                <div className="p-6 text-sm text-muted-foreground">
-                  {session ? "Pick a relation, or run a query." : "Connect to a database to start."}
-                </div>
-              )}
-            </section>
-
-            {review && (
-              <EditPreview
-                plan={review.plan}
-                applying={applying}
-                onConfirm={onConfirm}
-                onBack={() => setReview(null)}
-                compareRendered={review.edits.some((e) => e.compare_rendered)}
-                onCompareRendered={async (on) => {
-                  // T-060: re-preview; apply then runs exactly this plan.
-                  const edits = review.edits.map((e) => ({ ...e, compare_rendered: on }));
-                  try {
-                    const plan = await previewEdits(session!.session_id, edits);
-                    setReview({ ...review, edits, plan });
-                  } catch (e2) {
-                    setError(String((e2 as { message?: string })?.message ?? e2));
-                  }
-                }}
-              />
-            )}
-          </main>
-        </div>
+      {/* T-095: the status bar — engine, budget, collation, core. */}
+      <footer className="flex h-6 shrink-0 items-center gap-4 border-t bg-background px-3 font-mono text-2xs text-muted-foreground">
+        {caps ? (
+          <span className="text-foreground">
+            {caps.engine}
+            {/* T-054: the parsed flavour and the product's own version. */}
+            {caps.flavour && caps.flavour !== caps.engine ? ` · ${caps.flavour}` : ""}
+            {caps.server_version ? ` ${caps.server_version}` : ""}
+          </span>
+        ) : (
+          <span>not connected</span>
+        )}
+        {session && <ConnectionUsageIndicator sessionId={session.session_id} />}
+        {caps?.string_collation && <span>collation {caps.string_collation}</span>}
+        {busy && <span className="motion-reduce-label text-primary">Running…</span>}
+        <span className="ml-auto">{core.isPending ? "starting…" : core.isError ? "core unreachable" : core.data}</span>
+      </footer>
     </>
+  );
+}
+
+/** T-095: what an empty results area says, quietly. */
+function EmptyState({
+  connected,
+  onNewConnection,
+  notice,
+}: {
+  connected: boolean;
+  onNewConnection: () => void;
+  notice?: React.ReactNode;
+}) {
+  return (
+    <div className="flex h-full items-center justify-center p-6">
+      <div className="max-w-md space-y-3 text-center">
+        <span aria-hidden className="mx-auto block h-3 w-3 rotate-45 border-[1.5px] border-primary/60" />
+        {notice}
+        <p className="text-sm text-muted-foreground">
+          {connected
+            ? "Pick a relation in the navigator, or run a query."
+            : "Pick a connection on the left, or create one."}
+        </p>
+        {!connected && (
+          <Button size="sm" onClick={onNewConnection}>
+            <Plus className="h-3.5 w-3.5" />
+            New connection
+          </Button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -775,11 +1194,11 @@ function DiagnosticsPanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-label="Diagnostics">
-      <div className="flex max-h-[85vh] w-[46rem] flex-col gap-2 rounded border bg-background p-3 text-xs">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-overlay/60" role="dialog" aria-label="Diagnostics">
+      <div className="flex max-h-[85vh] w-[46rem] flex-col gap-2 rounded border border-border-strong bg-raised p-3 text-xs shadow-float">
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold">Diagnostics</span>
-          <button type="button" className="ml-auto" aria-label="Close" onClick={onClose}>
+          <button type="button" className="focus-glow ml-auto rounded border border-transparent p-0.5 text-muted-foreground hover:text-foreground" aria-label="Close" onClick={onClose}>
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -801,7 +1220,7 @@ function DiagnosticsPanel({ onClose }: { onClose: () => void }) {
         <p className="text-muted-foreground">
           This is everything that will be copied. It stays on this machine unless you paste it somewhere.
         </p>
-        <pre className="min-h-0 flex-1 overflow-auto rounded border bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap">
+        <pre className="min-h-0 flex-1 overflow-auto rounded border bg-background p-2 font-mono text-2xs whitespace-pre-wrap">
           {text ?? "loading…"}
         </pre>
         <div className="flex items-center gap-2">
@@ -831,6 +1250,34 @@ const PROVENANCE_LABEL: Record<Guardrails["provenance"], string> = {
  * production guard says *why* it is armed; history and safety mode are stated
  * rather than implied.
  */
+/**
+ * T-027 / R-002 + T-095: the session's guardrails as status pills in the
+ * toolbar. D-032 decides the hue: production is danger; read-only the
+ * database enforces is verified; read-only asked for but not enforced, and a
+ * TLS opt-out, are caution. History and write access are neutral facts.
+ */
+function GuardrailPills({ guardrails: g, tls }: { guardrails: Guardrails; tls: boolean }) {
+  return (
+    <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+      {g.production.armed && (
+        <StatusPill tone="danger" title={`Production confirmation armed:\n${g.production.reasons.join("\n")}`}>
+          Production
+        </StatusPill>
+      )}
+      <SafetyBadge mode={g.safety_mode} />
+      {tls && <StatusPill tone="caution">TLS unverified</StatusPill>}
+      <StatusPill tone="neutral" icon={false} title="Query history for this connection">
+        history {g.history}
+      </StatusPill>
+    </div>
+  );
+}
+
+/**
+ * T-027: where a launched connection came from, and saving it as a profile.
+ * Shown only while there is something to say — a saved, hand-entered
+ * connection needs no row.
+ */
 function GuardrailBar({
   guardrails: g,
   origin,
@@ -850,12 +1297,14 @@ function GuardrailBar({
       : origin?.origin.kind === "evaluated"
         ? ` · ${origin.origin.config}`
         : "";
+  const unsaved = !g.saved && g.provenance !== "manual";
+  if (!t && !unsaved && !savedAs && !err) return null;
 
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b px-3 py-1 text-xs">
+    <div className="flex flex-wrap items-center gap-2 border-b bg-panel px-3 py-1.5 text-xs">
       <span className="font-medium">
         {PROVENANCE_LABEL[g.provenance]}
-        {g.saved ? "" : g.provenance === "manual" ? "" : " · not saved"}
+        {unsaved ? " · not saved" : ""}
       </span>
       {t && (
         <span className="font-mono text-muted-foreground">
@@ -863,18 +1312,7 @@ function GuardrailBar({
           {source}
         </span>
       )}
-      <span className="rounded bg-secondary px-1.5 py-0.5">history {g.history}</span>
-      <SafetyBadge mode={g.safety_mode} />
-      {g.production.armed && (
-        <span
-          className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
-          title={g.production.reasons.join("\n")}
-        >
-          <ShieldAlert className="h-3 w-3" />
-          production confirmation armed: {g.production.reasons[0]}
-        </span>
-      )}
-      {!g.saved && g.provenance !== "manual" && (
+      {unsaved && (
         <Button
           size="sm"
           variant="secondary"
@@ -908,15 +1346,15 @@ function GuardrailBar({
 
 /**
  * T-055 / R-028: say at connect, not mid-navigation, when introspection on
- * this server will be partial or its flavour is unverified.
+ * this server will be partial or its flavour is unverified. D-032: a note.
  */
 function CatalogNote({ catalog }: { catalog: CatalogSupport | undefined }) {
   if (!catalog) return null;
   const missing = catalog.features.filter((f) => !f.available).map((f) => f.label);
   if (catalog.flavour_verified && missing.length === 0) return null;
   return (
-    <p className="mb-1 rounded bg-secondary px-2 py-1 text-[11px] text-muted-foreground" role="note">
-      {!catalog.flavour_verified && "Unrecognized server: treated as vanilla Postgres, unverified. "}
+    <p className="mb-1 rounded border border-info/40 bg-info/10 px-2 py-1 text-2xs text-info" role="note">
+      {!catalog.flavour_verified && "Unrecognized server: treated as vanilla, unverified. "}
       {missing.length > 0 ? `Not available on this server: ${missing.join(", ")}.` : "Every catalog probe succeeded."}
     </p>
   );
@@ -931,31 +1369,23 @@ function SafetyBadge({ mode }: { mode: Guardrails["safety_mode"] }) {
   const db = mode.database;
   if (db.state === "enforced") {
     return (
-      <span className="rounded bg-secondary px-1.5 py-0.5" title={db.basis}>
-        read-only · enforced by the database
-      </span>
+      <StatusPill tone="verified" title={db.basis}>
+        Read-only enforced
+      </StatusPill>
     );
   }
   if (mode.requested) {
     const why = db.state === "not_enforced" ? db.reasons.join("\n") : db.reason;
     return (
-      <span
-        className="flex items-center gap-1 rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
-        title={why}
-      >
-        <ShieldAlert className="h-3 w-3" />
-        read-only requested but NOT enforced by the database
-        {db.state === "not_enforced" ? `: ${db.reasons[0]}` : " (could not verify)"}
-      </span>
+      <StatusPill tone="caution" title={`Read-only requested but NOT enforced by the database:\n${why}`}>
+        Read-only not enforced
+      </StatusPill>
     );
   }
   return (
-    <span
-      className="rounded bg-secondary px-1.5 py-0.5"
-      title={db.state === "not_enforced" ? db.reasons.join("\n") : db.reason}
-    >
+    <StatusPill tone="neutral" icon={false} title={db.state === "not_enforced" ? db.reasons.join("\n") : db.reason}>
       {db.state === "not_enforced" ? "writable" : "write access unknown"}
-    </span>
+    </StatusPill>
   );
 }
 
@@ -981,7 +1411,7 @@ function LaunchBanner({
       ? `${launch.target.scheme}://${launch.target.user}@${launch.target.host}:${launch.target.port}/${launch.target.database}`
       : null;
   return (
-    <div className="space-y-1 border-b p-2 text-xs">
+    <div className="space-y-1.5 border-b p-3 text-xs">
       {target && (
         <p>
           {connecting ? "Connecting to " : "Launch target "}
@@ -1005,14 +1435,15 @@ function LaunchBanner({
  */
 function OutcomeStrip({ outcomes }: { outcomes: Outcome[] }) {
   return (
-    <div className="flex flex-wrap gap-1 border-b px-3 py-1 text-xs">
+    <div className="flex flex-wrap gap-1 border-b px-3 py-1.5 font-mono text-2xs">
       {outcomes.map((o, i) => (
         <span
           key={i}
           className={
+            // D-032: a failed statement is danger; the rest are neutral facts.
             o.kind === "error"
-              ? "rounded bg-destructive px-1.5 py-0.5 text-destructive-foreground"
-              : "rounded bg-secondary px-1.5 py-0.5"
+              ? "rounded-sm border border-destructive/60 bg-destructive/10 px-1.5 py-0.5 text-destructive"
+              : "rounded-sm border border-border-strong bg-raised px-1.5 py-0.5 text-muted-foreground"
           }
           title={
             // T-011: only offer a position when attribution is a real span.
@@ -1032,265 +1463,5 @@ function OutcomeStrip({ outcomes }: { outcomes: Outcome[] }) {
         </span>
       ))}
     </div>
-  );
-}
-
-/**
- * D-007: the password is sent inward to be stored in the keychain and is never
- * read back. The webview keeps the profile id and metadata only.
- */
-function ConnectPanel({ onConnected }: { onConnected: (s: SessionInfo) => void }) {
-  const [form, setForm] = useState<ProfileMeta>({
-    id: newProfileId(),
-    label: "Local",
-    host: "localhost",
-    port: 55432,
-    user: "postgres",
-    dbname: "sluice_dev",
-    tls: "disabled",
-  });
-  // T-036: the portable profile file, re-read from disk by the core.
-  const workspace = useQuery({ queryKey: WORKSPACE_KEY, queryFn: loadWorkspace });
-  const [saveNote, setSaveNote] = useState<string | null>(null);
-  // T-034: a pasted URL is a credential until the core strips it, so it is
-  // held only until submitted and rendered as a password field.
-  const [importUrl, setImportUrl] = useState("");
-  const [secret, setSecret] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  // T-071 / R-016: the core says the stored password could not be used (an
-  // unreadable keychain item after a signing change, or a server refusal).
-  // Not a dead end: ask for it again; storing it re-creates the keychain item
-  // under this build's identity.
-  const [reentry, setReentry] = useState(false);
-
-  const field = (k: keyof ProfileMeta, label: string, type = "text") => (
-    <label className="block px-2 py-1 text-xs">
-      <span className="text-muted-foreground">{label}</span>
-      <input
-        type={type}
-        className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
-        value={String(form[k])}
-        onChange={(e) =>
-          setForm({ ...form, [k]: k === "port" ? Number(e.target.value) : e.target.value })
-        }
-      />
-    </label>
-  );
-
-  return (
-    <form
-      className="flex flex-col gap-0.5 overflow-auto p-1"
-      onSubmit={async (e) => {
-        e.preventDefault();
-        setBusy(true);
-        setErr(null);
-        try {
-          if (secret) await storeCredential(form.id, secret);
-          setSecret("");
-          setReentry(false);
-          onConnected(await connect(form));
-        } catch (e2) {
-          const de = e2 as DriverError;
-          setReentry(de?.hints?.credential_reentry === true);
-          setErr(String(de?.message ?? e2));
-        } finally {
-          setBusy(false);
-        }
-      }}
-    >
-      <SavedProfiles
-        workspace={workspace.data}
-        selectedId={form.id}
-        onPick={(p) => {
-          setForm(p);
-          setSecret("");
-          setReentry(false);
-          setErr(null);
-          setSaveNote(null);
-        }}
-        onDelete={async (id) => {
-          try {
-            queryClient.setQueryData(WORKSPACE_KEY, await deleteProfile(id));
-            if (id === form.id) setForm({ ...form, id: newProfileId() });
-          } catch (e2) {
-            setErr(String((e2 as { message?: string })?.message ?? e2));
-          }
-        }}
-      />
-      {workspace.error && (
-        <p className="px-2 py-1 text-xs text-destructive">
-          {String((workspace.error as { message?: string })?.message ?? workspace.error)}
-        </p>
-      )}
-      <div className="flex items-center gap-1 px-2 py-1">
-        <input
-          type="password"
-          aria-label="Import connection URL"
-          autoComplete="off"
-          className="min-w-0 flex-1 rounded border border-input bg-transparent px-1.5 py-1 text-xs"
-          placeholder="Paste postgres:// URL to import"
-          value={importUrl}
-          onChange={(e) => setImportUrl(e.target.value)}
-        />
-        <Button
-          type="button"
-          size="sm"
-          variant="secondary"
-          className="h-7"
-          disabled={!importUrl.trim()}
-          onClick={async () => {
-            setErr(null);
-            setSaveNote(null);
-            const url = importUrl;
-            setImportUrl("");
-            try {
-              const view = await importConnectionUrl(url, "");
-              queryClient.setQueryData(WORKSPACE_KEY, view);
-              const added = view.profiles[view.profiles.length - 1];
-              if (added) setForm(added);
-              setSaveNote(view.notice ?? "Imported. Any password in the URL is now in the keychain.");
-            } catch (e2) {
-              setErr(String((e2 as { message?: string })?.message ?? e2));
-            }
-          }}
-        >
-          Import
-        </Button>
-      </div>
-      <div className="flex items-center justify-between px-2 py-1">
-        <p className="text-xs font-medium uppercase text-muted-foreground">Connect</p>
-        <button
-          type="button"
-          className="text-xs text-muted-foreground hover:text-foreground"
-          onClick={() => {
-            setForm({ ...form, id: newProfileId(), label: "New profile" });
-            setSecret("");
-            setSaveNote(null);
-          }}
-        >
-          New
-        </button>
-      </div>
-      {field("label", "Name")}
-      {field("host", "Host")}
-      {field("port", "Port", "number")}
-      {field("user", "User")}
-      {field("dbname", "Database")}
-      <label className="block px-2 py-1 text-xs">
-        <span className="text-muted-foreground">Connection budget</span>
-        <input
-          type="text"
-          inputMode="numeric"
-          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
-          value={form.connection_budget == null ? "" : String(form.connection_budget)}
-          placeholder="5 — shared by browsing and editor tabs"
-          onChange={(e) => {
-            const t = e.target.value.trim();
-            setForm({ ...form, connection_budget: /^\d+$/.test(t) ? Number(t) : null });
-          }}
-        />
-        {/* T-044 / R-038: raising it is allowed, and explicit. */}
-        {(form.connection_budget ?? 5) > 5 && (
-          <span className="mt-0.5 block text-[10px] text-destructive">
-            Above the default of 5. Every connection comes out of the server's max_connections, which all its clients share.
-          </span>
-        )}
-        {(form.connection_budget ?? 5) <= 2 && (
-          <span className="mt-0.5 block text-[10px] text-muted-foreground">
-            2 connections are always kept for browsing, so this budget leaves no room for editor sessions.
-          </span>
-        )}
-      </label>
-      <label className="block px-2 py-1 text-xs">
-        <span className="text-muted-foreground">
-          {reentry ? "Re-enter password — it will be stored again in the keychain" : "Password"}
-        </span>
-        <input
-          type="password"
-          className={cn(
-            "mt-0.5 w-full rounded border bg-transparent px-1.5 py-1 text-sm",
-            reentry ? "border-destructive" : "border-input",
-          )}
-          value={secret}
-          autoFocus={reentry}
-          required={reentry}
-          onChange={(e) => setSecret(e.target.value)}
-          placeholder="stored in the OS keychain"
-        />
-      </label>
-      <label className="block px-2 py-1 text-xs">
-        <span className="text-muted-foreground">TLS</span>
-        <select
-          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
-          value={form.tls}
-          onChange={(e) => setForm({ ...form, tls: e.target.value as ProfileMeta["tls"] })}
-        >
-          <option value="verify">Verify certificates (default)</option>
-          <option value="accept_invalid_certs">Accept invalid certificates</option>
-          <option value="disabled">Disabled</option>
-        </select>
-      </label>
-      <label className="flex items-center gap-1.5 px-2 py-1 text-xs">
-        <input
-          type="checkbox"
-          checked={form.read_only ?? false}
-          onChange={(e) => setForm({ ...form, read_only: e.target.checked })}
-        />
-        <span>
-          Read-only profile
-          <span className="block text-[10px] text-muted-foreground">
-            Use a read-only database role; Sluice checks whether the server enforces it.
-          </span>
-        </span>
-      </label>
-      <label className="block px-2 py-1 text-xs">
-        <span className="text-muted-foreground">Query history</span>
-        <select
-          className="mt-0.5 w-full rounded border border-input bg-transparent px-1.5 py-1 text-sm"
-          value={form.history ?? ""}
-          onChange={(e) =>
-            setForm({ ...form, history: e.target.value === "" ? null : (e.target.value as "on" | "off") })
-          }
-        >
-          <option value="">Default — off for production, on otherwise</option>
-          <option value="on">Keep history for this profile</option>
-          <option value="off">Never keep history for this profile</option>
-        </select>
-      </label>
-      {err && <p className="px-2 py-1 text-xs text-destructive">{err}</p>}
-      <div className="px-2 py-1">
-        <Button type="submit" size="sm" disabled={busy} className="w-full">
-          <Plug className="h-3.5 w-3.5" />
-          {busy ? "Connecting…" : "Connect"}
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          disabled={busy}
-          className="mt-1 w-full"
-          onClick={async () => {
-            setErr(null);
-            setSaveNote(null);
-            try {
-              // D-007: the password goes to the keychain; the file gets metadata.
-              if (secret) await storeCredential(form.id, secret);
-              setSecret("");
-              const view = await saveProfile(form);
-              queryClient.setQueryData(WORKSPACE_KEY, view);
-              // T-037 / R-019: the one-time "this file names your hosts" notice.
-              setSaveNote(view.notice ?? "Saved to the profile file.");
-            } catch (e2) {
-              setErr(String((e2 as { message?: string })?.message ?? e2));
-            }
-          }}
-        >
-          <Save className="h-3.5 w-3.5" />
-          Save profile
-        </Button>
-        {saveNote && <p className="pt-1 text-xs text-muted-foreground">{saveNote}</p>}
-      </div>
-    </form>
   );
 }

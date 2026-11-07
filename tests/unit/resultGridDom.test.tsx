@@ -138,4 +138,13 @@ describe("ResultGrid editing", () => {
     fireEvent.doubleClick(screen.getByText("alice"));
     expect(document.querySelector("tbody input")).toBeNull();
   });
+
+  test("T-096 / D-031: numeric columns are right-aligned, text is not", () => {
+    const { unmount } = render(<ResultGrid sessionId="s" columns={COLS} rows={ROWS} truncated={false} />);
+    const first = bodyRows()[0].querySelectorAll("td");
+    expect(first[0].className).toContain("text-right"); // integer
+    expect(first[1].className).not.toContain("text-right"); // text
+    expect(first[2].className).toContain("text-right"); // exact numeric
+    unmount();
+  });
 });

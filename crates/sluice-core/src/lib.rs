@@ -23,20 +23,24 @@ pub mod capability;
 pub mod danger;
 pub mod driver;
 pub mod error;
+pub mod export;
 pub mod outcome;
 pub mod panic_guard;
 pub mod request;
 pub mod script;
 pub mod redact;
 pub mod secret;
+pub mod session;
 pub mod statement_redact;
+pub mod tls;
 pub mod value;
 
-pub use capability::{missing_core_ops, CORE_FILTER_OPS, 
+pub use capability::{is_extension_op, missing_core_ops, CORE_FILTER_OPS, FilterArity,
     CancelSupport, Capabilities, FilterOpDecl, NodeKind, RawPayloadKind, ResetSupport,
     CatalogFeature, CatalogSupport, ReadOnlyGuarantee, SessionAffinity, TransactionSupport,
 };
 pub use driver::Driver;
+pub use export::{ExportError, ExportFormat, ExportWriter, SqlLiterals};
 pub use error::{ConfirmationRequest, DriverError, EnginePayload, ErrorHints, ErrorKind, QueryPosition};
 pub use outcome::{row_cost, BudgetLimit, BudgetMeter, BudgetReport, ExecBudget, PageInfo, 
     Attribution, ExecutionResult, Outcome, OutcomeBody, TxContext, TxDisposition, TxMode,
@@ -53,6 +57,12 @@ pub use request::{
 pub use redact::{redact_shapes, Redactor};
 pub use danger::{dangerous_statements, Dangerous};
 pub use statement_redact::{redact_statement, StoredStatement};
+pub use session::{
+    lost_message, sink, BatchSink, BoxFuture, BrowseBatch, BrowseStreamEnd, CancelHandle, CancelSlot,
+    EditorSession, ExportBatch, ExportEnd, PoolStatsSnapshot, SessionHeld, SessionStatus, TxState,
+    DEFAULT_CONNECTION_BUDGET, IDLE_TRANSACTION_TIMEOUT,
+};
+pub use tls::TlsMode;
 pub use secret::{deserialize_optional_secret, Secret, REDACTED};
 pub use value::{ColumnDesc, ExactDomain, TypeClass, WireValue};
 
@@ -80,6 +90,7 @@ mod contract_tests {
         assert_wire_shaped::<RawPayloadKind>();
         assert_wire_shaped::<NodeKind>();
         assert_wire_shaped::<FilterOpDecl>();
+        assert_wire_shaped::<FilterArity>();
 
         assert_wire_shaped::<NodeId>();
         assert_wire_shaped::<ExactDomain>();
@@ -136,6 +147,7 @@ mod contract_tests {
             filter_ops: vec![FilterOpDecl {
                 id: "contains".into(),
                 label: "contains".into(),
+                arity: FilterArity::One,
                 type_classes: vec![TypeClass::Text],
                 case_sensitive: Some(false),
                 case_insensitive_toggle: true,

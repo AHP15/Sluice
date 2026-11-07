@@ -28,3 +28,5 @@ D-027 | accepted | Staged edits with null-safe, type-aware optimistic concurrenc
 D-028 | accepted | Capability-declared session model under one per-profile connection budget
 D-029 | accepted | Three-part contract with a statement-outcome sequence result model
 D-030 | accepted | SQL Server cancellation: close-and-declare baseline, KILL only when verified
+D-031 | accepted | Instrument-panel visual direction for the UI overhaul
+D-032 | accepted | Status colours are reserved, never carried by the accent or by colour alone

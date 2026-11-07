@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 async-trait = "0.1"
 # FutureExt::catch_unwind — T-006 must contain panics across await points, which
 # std::panic::catch_unwind alone cannot do.

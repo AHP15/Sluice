@@ -22,6 +22,68 @@
 
 use serde::{Deserialize, Serialize};
 
+/// T-075 / D-022: which database engine a profile connects to.
+///
+/// Carried on every profile, imported URL and discovered connection, so the
+/// app core can pick the driver from the profile rather than assuming one.
+/// Absent from an older file means `postgres` — the only engine those files
+/// could have meant. An unrecognised value is a load error that names it,
+/// never a silent fallback to Postgres.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    #[default]
+    Postgres,
+    Sqlserver,
+    Mongodb,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 3] = [Engine::Postgres, Engine::Sqlserver, Engine::Mongodb];
+
+    /// The engine a connection-URL scheme names, if it names one Sluice has
+    /// an engine for. `mysql`, `sqlite` and the like are recognised as
+    /// database URLs elsewhere but have no engine here.
+    pub fn from_scheme(scheme: &str) -> Option<Engine> {
+        match scheme.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Some(Engine::Postgres),
+            "sqlserver" | "mssql" => Some(Engine::Sqlserver),
+            "mongodb" | "mongodb+srv" => Some(Engine::Mongodb),
+            _ => None,
+        }
+    }
+
+    /// The id as written in the profile file and sent to the webview.
+    pub fn id(self) -> &'static str {
+        match self {
+            Engine::Postgres => "postgres",
+            Engine::Sqlserver => "sqlserver",
+            Engine::Mongodb => "mongodb",
+        }
+    }
+
+    /// The product name, for messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Engine::Postgres => "Postgres",
+            Engine::Sqlserver => "SQL Server",
+            Engine::Mongodb => "MongoDB",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Engine::Postgres => 5432,
+            Engine::Sqlserver => 1433,
+            Engine::Mongodb => 27017,
+        }
+    }
+
+    pub fn is_postgres(&self) -> bool {
+        *self == Engine::Postgres
+    }
+}
+
 /// How the connection reaches the server.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -152,6 +214,38 @@ mod tests {
         assert!(parse("auth = { provider = \"keychain\", password = \"hunter2\" }\n").is_err());
         assert!(parse("auth = { provider = \"static\", value = \"hunter2\" }\n").is_err());
         assert!(parse("auth = \"hunter2\"\n").is_err());
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct E {
+        #[serde(default)]
+        engine: Engine,
+    }
+
+    #[test]
+    fn engine_defaults_to_postgres_and_unknown_engines_are_named_errors() {
+        assert_eq!(toml::from_str::<E>("").unwrap().engine, Engine::Postgres);
+        for e in Engine::ALL {
+            assert_eq!(toml::from_str::<E>(&format!("engine = \"{}\"\n", e.id())).unwrap().engine, e);
+        }
+        let err = toml::from_str::<E>("engine = \"mysql\"\n").unwrap_err().to_string();
+        assert!(err.contains("mysql"), "{err}");
+    }
+
+    #[test]
+    fn schemes_map_to_their_engine() {
+        for (scheme, e) in [
+            ("postgres", Some(Engine::Postgres)),
+            ("postgresql", Some(Engine::Postgres)),
+            ("sqlserver", Some(Engine::Sqlserver)),
+            ("MSSQL", Some(Engine::Sqlserver)),
+            ("mongodb", Some(Engine::Mongodb)),
+            ("mongodb+srv", Some(Engine::Mongodb)),
+            ("mysql", None),
+            ("sqlite", None),
+        ] {
+            assert_eq!(Engine::from_scheme(scheme), e, "{scheme}");
+        }
     }
 
     #[test]

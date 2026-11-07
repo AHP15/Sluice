@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice — workspace mock (D-031 / D-032)</title>
+<!--
+  T-091: the static reference T-092..T-096 implement against.
+  Tokens here are exactly D-031's; colour roles exactly D-032's.
+  Written to the WebKitGTK 4.1 floor (D-023): flexbox and plain grid,
+  hsl() custom properties, no color-mix / oklch / :has / @property /
+  @container / backdrop-filter. Fonts: the app bundles Inter and
+  JetBrains Mono (T-092); this file falls back to system faces if they
+  are not installed.
+  Toggle the theme with the button in the title bar.
+-->
+<style>
+  :root {
+    /* D-031 dark (default) */
+    --base: 216 37% 7%;        /* #0B1018 */
+    --panel: 220 38% 11%;      /* #111826 */
+    --raised: 220 37% 15%;     /* #172033 */
+    --fg: 215 52% 94%;         /* #E6EDF7 */
+    --muted: 218 20% 62%;      /* #8A99B3 */
+    --line: 215 40% 60%;       /* hairline, used at low alpha */
+    --accent: 188 86% 53%;     /* #22D3EE — interaction only (D-032) */
+    --accent-fg: 216 37% 7%;
+    /* D-032 reserved status hues */
+    --danger: 1 85% 68%;       /* #F26B68 */
+    --caution: 40 90% 61%;     /* #F5B841 */
+    --verified: 151 65% 54%;   /* #3DD68C */
+    --info: 255 92% 76%;       /* #A78BFA */
+    /* Syntax: desaturated, deliberately outside the accent and the D-032
+       status hues, so code never reads as a status. */
+    --syn-kw: 205 45% 74%;
+    --syn-str: 330 35% 76%;
+    --syn-num: 45 25% 72%;
+    --row-h: 28px;             /* compact; comfortable = 34px */
+    --radius: 4px;
+  }
+  .light {
+    --base: 216 33% 97%;       /* #F6F8FB */
+    --panel: 0 0% 100%;
+    --raised: 214 32% 95%;     /* #EEF2F7 */
+    --fg: 218 46% 10%;         /* #0E1726 */
+    --muted: 219 17% 41%;      /* #55627A */
+    --line: 218 30% 40%;
+    --accent: 192 82% 31%;     /* #0E7490 */
+    --accent-fg: 0 0% 100%;
+    --danger: 1 63% 43%;       /* #B42C29 */
+    --caution: 36 100% 27%;    /* #8A5300 */
+    --verified: 157 77% 26%;   /* #0F7550 */
+    --info: 254 52% 51%;       /* #5B3FC4 */
+    --syn-kw: 210 45% 34%;
+    --syn-str: 330 40% 38%;
+    --syn-num: 40 30% 32%;
+  }
+  .comfortable { --row-h: 34px; }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: hsl(var(--base));
+    color: hsl(var(--fg));
+    font: 13px/1.4 "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    overflow: hidden;
+  }
+  .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+  .app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* D-032: production sessions carry a persistent red top rule. */
+  .prod-rule { height: 2px; background: hsl(var(--danger)); }
+
+  .titlebar {
+    display: flex; align-items: center; gap: 12px;
+    height: 40px; padding: 0 12px;
+    background: hsl(var(--panel));
+    border-bottom: 1px solid hsl(var(--line) / 0.14);
+  }
+  .mark { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: 0.04em; }
+  .mark i { width: 10px; height: 10px; transform: rotate(45deg); border: 1.5px solid hsl(var(--accent)); display: block; }
+  .tabs { display: flex; gap: 2px; margin-left: 12px; }
+  .tab {
+    display: flex; align-items: center; gap: 6px;
+    height: 28px; padding: 0 10px; border-radius: var(--radius);
+    color: hsl(var(--muted)); border: 1px solid transparent;
+  }
+  .tab.active {
+    color: hsl(var(--fg)); background: hsl(var(--raised));
+    border-color: hsl(var(--accent) / 0.6);
+    box-shadow: 0 0 0 1px hsl(var(--accent) / 0.25), 0 0 12px hsl(var(--accent) / 0.18);
+  }
+  .spacer { flex: 1; }
+
+  /* D-032: status = hue + icon + label, never hue alone. */
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    height: 20px; padding: 0 7px; border-radius: 3px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+    border: 1px solid currentColor;
+  }
+  .pill.danger { color: hsl(var(--danger)); background: hsl(var(--danger) / 0.10); }
+  .pill.caution { color: hsl(var(--caution)); background: hsl(var(--caution) / 0.10); }
+  .pill.verified { color: hsl(var(--verified)); background: hsl(var(--verified) / 0.10); }
+  .pill.info { color: hsl(var(--info)); background: hsl(var(--info) / 0.10); }
+
+  .btn {
+    height: 26px; padding: 0 10px; border-radius: var(--radius);
+    font: inherit; color: hsl(var(--fg));
+    background: hsl(var(--raised)); border: 1px solid hsl(var(--line) / 0.2);
+    transition: border-color 120ms ease-out, box-shadow 120ms ease-out;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: hsl(var(--line) / 0.4); }
+  .btn:focus-visible, .btn.focus {
+    outline: none; border-color: hsl(var(--accent));
+    box-shadow: 0 0 0 1px hsl(var(--accent) / 0.4), 0 0 12px hsl(var(--accent) / 0.25);
+  }
+  .btn.primary { background: hsl(var(--accent)); color: hsl(var(--accent-fg)); border-color: transparent; font-weight: 600; }
+
+  .body { flex: 1; display: flex; min-height: 0; }
+
+  /* Navigator */
+  .nav {
+    width: 248px; flex: none; display: flex; flex-direction: column;
+    background: hsl(var(--panel));
+    border-right: 1px solid hsl(var(--line) / 0.14);
+  }
+  .section { padding: 10px 12px 6px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: hsl(var(--muted)); }
+  .tree { padding: 0 6px; }
+  .node {
+    display: flex; align-items: center; gap: 6px;
+    height: var(--row-h); padding: 0 6px; border-radius: 3px;
+    color: hsl(var(--fg)); white-space: nowrap;
+  }
+  .node .k { width: 14px; color: hsl(var(--muted)); text-align: center; flex: none; }
+  .node.l1 { padding-left: 20px; } .node.l2 { padding-left: 34px; } .node.l3 { padding-left: 48px; }
+  .node.sel { background: hsl(var(--accent) / 0.12); box-shadow: inset 2px 0 0 hsl(var(--accent)); }
+  .node.note { color: hsl(var(--info)); font-size: 12px; }
+  .node .ty { color: hsl(var(--muted)); margin-left: auto; font-size: 11.5px; }
+
+  /* Main */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 12px;
+    border-bottom: 1px solid hsl(var(--line) / 0.14);
+  }
+  .crumb { color: hsl(var(--muted)); } .crumb b { color: hsl(var(--fg)); font-weight: 500; }
+
+  .filters { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid hsl(var(--line) / 0.14); }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px;
+    border-radius: var(--radius); background: hsl(var(--raised)); border: 1px solid hsl(var(--line) / 0.2);
+    font-size: 12px;
+  }
+  .chip .op { color: hsl(var(--muted)); }
+
+  /* Grid */
+  .grid { flex: 1; overflow: hidden; position: relative; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; }
+  th, td {
+    height: var(--row-h); padding: 0 12px; text-align: left; white-space: nowrap;
+    border-bottom: 1px solid hsl(var(--line) / 0.08);
+    border-right: 1px solid hsl(var(--line) / 0.08);
+  }
+  th {
+    position: sticky; top: 0; background: hsl(var(--panel));
+    font-weight: 500; color: hsl(var(--muted)); font-size: 12px;
+    border-bottom: 1px solid hsl(var(--line) / 0.18);
+  }
+  th .t { font-weight: 400; opacity: 0.7; margin-left: 6px; font-size: 11px; }
+  td { font-size: 12.5px; }
+  td.num { text-align: right; }
+  td.null { color: hsl(var(--muted)); font-style: italic; }
+  tr:hover td { background: hsl(var(--line) / 0.05); }
+  tr.sel td { background: hsl(var(--accent) / 0.08); }
+  td.cell-focus {
+    box-shadow: inset 0 0 0 1px hsl(var(--accent)), 0 0 12px hsl(var(--accent) / 0.25);
+    position: relative;
+  }
+  td.staged { box-shadow: inset 2px 0 0 hsl(var(--caution)); }
+  .rowno { color: hsl(var(--muted)); width: 44px; text-align: right; font-size: 11.5px; }
+
+  /* Running-query scan line: the one looping motion (D-031). */
+  .scan { height: 2px; background: hsl(var(--accent) / 0.15); overflow: hidden; }
+  .scan i { display: block; width: 30%; height: 100%; background: hsl(var(--accent)); animation: scan 1.4s ease-in-out infinite; }
+  @keyframes scan { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  .running-label { display: none; }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+    .scan { display: none; } .running-label { display: inline; }
+  }
+
+  /* Banner (D-032 caution) */
+  .banner {
+    display: flex; align-items: center; gap: 10px; margin: 10px 12px 0; padding: 8px 10px;
+    border-radius: var(--radius); font-size: 12.5px;
+    color: hsl(var(--caution)); background: hsl(var(--caution) / 0.08); border: 1px solid hsl(var(--caution) / 0.35);
+  }
+  .banner span { color: hsl(var(--fg)); }
+
+  /* Editor dock */
+  .dock { height: 172px; flex: none; display: flex; flex-direction: column; border-top: 1px solid hsl(var(--line) / 0.18); background: hsl(var(--panel)); }
+  .dockbar { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-bottom: 1px solid hsl(var(--line) / 0.12); }
+  .code { flex: 1; padding: 10px 14px; font-size: 12.5px; line-height: 1.6; }
+  .kw { color: hsl(var(--syn-kw)); } .str { color: hsl(var(--syn-str)); } .numl { color: hsl(var(--syn-num)); } .cm { color: hsl(var(--muted)); }
+  .gutter { color: hsl(var(--muted) / 0.6); display: inline-block; width: 22px; }
+
+  .status {
+    display: flex; align-items: center; gap: 14px; height: 26px; padding: 0 12px;
+    font-size: 11.5px; color: hsl(var(--muted));
+    background: hsl(var(--base)); border-top: 1px solid hsl(var(--line) / 0.14);
+  }
+  .status b { color: hsl(var(--fg)); font-weight: 500; }
+
+  /* Floating layer: the only place drop shadows appear. */
+  .menu {
+    position: absolute; right: 24px; top: 46px; width: 200px; padding: 4px;
+    background: hsl(var(--raised)); border: 1px solid hsl(var(--line) / 0.22); border-radius: var(--radius);
+    box-shadow: 0 12px 32px hsl(216 60% 2% / 0.55);
+  }
+  .menu div { height: 28px; display: flex; align-items: center; padding: 0 8px; border-radius: 3px; }
+  .menu div.hl { background: hsl(var(--accent) / 0.14); }
+  .menu div.danger { color: hsl(var(--danger)); }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="prod-rule"></div>
+  <div class="titlebar">
+    <div class="mark"><i></i>SLUICE</div>
+    <div class="tabs">
+      <div class="tab active"><span class="mono">shop@db.prod</span></div>
+      <div class="tab"><span class="mono">sluice_t081@sql.internal</span></div>
+      <div class="tab">+</div>
+    </div>
+    <div class="spacer"></div>
+    <span class="pill danger">▲ Production</span>
+    <span class="pill verified">✓ Read-only enforced</span>
+    <span class="pill caution">! TLS unverified</span>
+    <button class="btn" onclick="document.getElementById('app').parentElement.classList.toggle('light')">Theme</button>
+    <button class="btn" onclick="document.body.classList.toggle('comfortable')">Density</button>
+  </div>
+
+  <div class="body">
+    <aside class="nav">
+      <div class="section">Navigator</div>
+      <div class="tree mono">
+        <div class="node"><span class="k">▾</span>shop</div>
+        <div class="node l1"><span class="k">▾</span>app</div>
+        <div class="node l2 sel"><span class="k">▦</span>orders</div>
+        <div class="node l3"><span class="k">·</span>id<span class="ty">int · pk</span></div>
+        <div class="node l3"><span class="k">·</span>note<span class="ty">nvarchar(50)</span></div>
+        <div class="node l3"><span class="k">·</span>total<span class="ty">decimal(19,4)</span></div>
+        <div class="node l2"><span class="k">▦</span>customers</div>
+        <div class="node l2"><span class="k">◇</span>big_orders</div>
+        <div class="node l1"><span class="k">▸</span>dbo</div>
+        <div class="node l1"><span class="k">▸</span>audit</div>
+        <div class="node l1 note"><span class="k">i</span>not permitted to read billing</div>
+        <div class="node"><span class="k">▸</span>warehouse</div>
+      </div>
+    </aside>
+
+    <section class="main">
+      <div class="toolbar">
+        <span class="crumb">shop / app / <b>orders</b></span>
+        <div class="spacer"></div>
+        <button class="btn">Refresh</button>
+        <button class="btn">Export ▾</button>
+        <button class="btn focus">Preview 2 edits</button>
+        <button class="btn primary">Apply</button>
+      </div>
+      <div class="filters">
+        <span class="chip mono">total <span class="op">&gt;</span> 100</span>
+        <span class="chip mono">status <span class="op">in</span> ('open','held')</span>
+        <span class="chip">+ Filter</span>
+        <div class="spacer"></div>
+        <span class="mono" style="color:hsl(var(--muted));font-size:11.5px">keyset · 200 rows · more available</span>
+      </div>
+      <div class="scan"><i></i></div>
+      <div class="banner">! Open transaction <span>— editor 2 has uncommitted changes, idle 4 min. Rolled back automatically at 15 min.</span></div>
+
+      <div class="grid">
+        <table class="mono">
+          <thead><tr>
+            <th class="rowno">#</th>
+            <th>id<span class="t">int</span></th>
+            <th>customer<span class="t">nvarchar</span></th>
+            <th>status<span class="t">varchar</span></th>
+            <th>total<span class="t">decimal(19,4)</span></th>
+            <th>placed_at<span class="t">datetime2</span></th>
+            <th>note<span class="t">nvarchar(50)</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td class="rowno">1</td><td class="num">10041</td><td>Ada Lovelace</td><td>open</td><td class="num">1250.0000</td><td>2026-11-04 09:12:33.1200000</td><td class="null">null</td></tr>
+            <tr><td class="rowno">2</td><td class="num">10042</td><td>Grace Hopper</td><td>held</td><td class="num">922337203685477.5807</td><td>2026-11-04 09:40:02.0000000</td><td>money edge</td></tr>
+            <tr class="sel"><td class="rowno">3</td><td class="num">10043</td><td>Edsger Dijkstra</td><td class="staged">open</td><td class="num cell-focus">340.5000</td><td>2026-11-05 14:01:19.5500000</td><td>rush</td></tr>
+            <tr><td class="rowno">4</td><td class="num">10044</td><td>Barbara Liskov</td><td>open</td><td class="num">108.9900</td><td>2026-11-05 16:22:47.0000000</td><td class="null">null</td></tr>
+            <tr><td class="rowno">5</td><td class="num">10045</td><td>Ken Thompson</td><td class="staged">held</td><td class="num">4999.0000</td><td>2026-11-06 08:03:11.9000000</td><td>gift wrap</td></tr>
+            <tr><td class="rowno">6</td><td class="num">10046</td><td>Radia Perlman</td><td>open</td><td class="num">212.0000</td><td>2026-11-06 10:47:05.0000000</td><td class="null">null</td></tr>
+            <tr><td class="rowno">7</td><td class="num">10047</td><td>Leslie Lamport</td><td>open</td><td class="num">1001.0100</td><td>2026-11-06 11:30:00.0000000</td><td>split ship</td></tr>
+            <tr><td class="rowno">8</td><td class="num">10048</td><td>Frances Allen</td><td>held</td><td class="num">155.2500</td><td>2026-11-06 12:15:44.2500000</td><td class="null">null</td></tr>
+          </tbody>
+        </table>
+        <div class="menu">
+          <div class="hl">Export CSV</div><div>Export JSONL</div><div>Export SQL INSERT</div><div class="danger">▲ Truncate table…</div>
+        </div>
+      </div>
+
+      <div class="dock">
+        <div class="dockbar">
+          <span>Editor 2</span>
+          <span class="pill caution">! Transaction open</span>
+          <span class="running-label" style="color:hsl(var(--accent))">Running…</span>
+          <div class="spacer"></div>
+          <button class="btn">Rollback</button>
+          <button class="btn">Commit</button>
+          <button class="btn primary">Run ⌘↵</button>
+        </div>
+        <div class="code mono">
+          <div><span class="gutter">1</span><span class="cm">-- held orders over the threshold</span></div>
+          <div><span class="gutter">2</span><span class="kw">UPDATE</span> app.orders <span class="kw">SET</span> status = <span class="str">'open'</span></div>
+          <div><span class="gutter">3</span><span class="kw">WHERE</span> status = <span class="str">'held'</span> <span class="kw">AND</span> total &gt; <span class="numl">100</span>;</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="status mono">
+    <span><b>postgres 17.2</b></span>
+    <span>pool 3/5 · 2 kept for browsing</span>
+    <span>collation en_US.UTF-8 · case-sensitive</span>
+    <div class="spacer"></div>
+    <span>2 staged edits</span>
+  </div>
+</div>
+</body>
+</html>

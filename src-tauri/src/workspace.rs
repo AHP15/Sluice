@@ -25,9 +25,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sluice_core::{guard_driver_call, DriverError, ErrorKind, SessionId};
-use sluice_postgres::tls::TlsMode;
+use sluice_core::TlsMode;
 use sluice_state::config::{self, DocumentSpec, Migration};
-use sluice_state::profile::{CredentialProvider, Transport};
+use sluice_state::profile::{Engine, CredentialProvider, Transport};
 
 use crate::commands::ProfileMeta;
 use crate::guardrails::HistoryPolicy;
@@ -85,8 +85,9 @@ pub struct ProfileEntry {
     /// under, so renaming it orphans the stored password.
     pub id: String,
     pub label: String,
-    #[serde(default = "default_engine")]
-    pub engine: String,
+    /// T-075 / D-022. Absent in older files, which could only mean Postgres.
+    #[serde(default)]
+    pub engine: Engine,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -127,10 +128,6 @@ pub struct SavedQuery {
     pub sql: String,
 }
 
-fn default_engine() -> String {
-    "postgres".into()
-}
-
 fn is_default_tls(t: &TlsMode) -> bool {
     *t == TlsMode::Verify
 }
@@ -140,7 +137,7 @@ impl ProfileEntry {
         Self {
             id: m.id.clone(),
             label: m.label.clone(),
-            engine: default_engine(),
+            engine: m.engine,
             host: m.host.clone(),
             port: m.port,
             user: m.user.clone(),
@@ -159,6 +156,7 @@ impl ProfileEntry {
         ProfileMeta {
             id: self.id.clone(),
             label: self.label.clone(),
+            engine: self.engine,
             host: self.host.clone(),
             port: self.port,
             user: self.user.clone(),
@@ -224,6 +222,15 @@ fn validate_id(id: &str) -> Result<(), DriverError> {
     Ok(())
 }
 
+/// T-094: the name a connection is listed by — trimmed, never empty.
+fn validate_label(label: &str) -> Result<String, DriverError> {
+    let t = label.trim();
+    if t.is_empty() {
+        return Err(DriverError::new(ErrorKind::Conflict, "a saved connection needs a name"));
+    }
+    Ok(t.to_string())
+}
+
 // -------------------------------------------------------------------- IPC
 
 /// What the webview gets: metadata only (D-007), plus where the file is so
@@ -284,6 +291,8 @@ pub async fn save_profile(
 ) -> Result<WorkspaceView, DriverError> {
     guard_driver_call(&sid(), async {
         validate_id(&profile.id)?;
+        // T-094: a saved connection is listed by name; it must have one.
+        let profile = ProfileMeta { label: validate_label(&profile.label)?, ..profile };
         let dirs = stores.dirs()?;
         let ws = file.update(&dirs.config, |ws| {
             upsert(&mut ws.profiles, ProfileEntry::from_meta(&profile), |p| &p.id);
@@ -331,21 +340,26 @@ pub struct ImportedUrl {
 pub fn decompose_url(url: &sluice_core::Secret<String>, id: &str, label: &str) -> Result<ImportedUrl, DriverError> {
     let parsed = sluice_config::connection_url::parse(url.expose())
         .map_err(|e| DriverError::new(ErrorKind::Conflict, e.to_string()))?;
-    if !matches!(parsed.scheme.as_str(), "postgres" | "postgresql") {
-        return Err(DriverError::new(
+    // T-075: the scheme names the engine; one with no Sluice engine is
+    // refused by name rather than imported as Postgres.
+    let engine = Engine::from_scheme(&parsed.scheme).ok_or_else(|| {
+        DriverError::new(
             ErrorKind::Conflict,
-            format!("`{}` URLs cannot be imported yet — this build connects to Postgres only", parsed.scheme),
-        ));
-    }
+            format!(
+                "`{}` URLs cannot be imported — Sluice has engines for Postgres, SQL Server and MongoDB",
+                parsed.scheme
+            ),
+        )
+    })?;
     let host = parsed.host.clone().unwrap_or_else(|| "localhost".into());
-    let database = parsed.database.clone().unwrap_or_else(|| "postgres".into());
+    let database = parsed.database.clone().unwrap_or_else(|| crate::launcher::default_database(engine).into());
     let entry = ProfileEntry {
         id: id.to_string(),
         label: if label.trim().is_empty() { format!("{database}@{host}") } else { label.trim().to_string() },
-        engine: default_engine(),
+        engine,
         host,
-        port: parsed.port.unwrap_or(5432),
-        user: parsed.user.clone().unwrap_or_else(|| "postgres".into()),
+        port: parsed.port.unwrap_or(engine.default_port()),
+        user: parsed.user.clone().unwrap_or_else(|| crate::launcher::default_user(engine).into()),
         database,
         tls: crate::launcher::tls_from_params(&parsed),
         statement_timeout_secs: None,
@@ -440,6 +454,7 @@ mod tests {
         ProfileMeta {
             id: id.into(),
             label: "Local".into(),
+            engine: Engine::Postgres,
             host: "localhost".into(),
             port: 5432,
             user: "postgres".into(),
@@ -514,7 +529,7 @@ mod tests {
     fn a_hand_written_minimal_profile_loads_with_defaults() {
         let text = "[[profile]]\nid = \"x\"\nlabel = \"X\"\nhost = \"db\"\nport = 5432\nuser = \"u\"\ndatabase = \"d\"\n";
         let ws = config::parse::<Workspace>(text, &SPEC).unwrap().value;
-        assert_eq!(ws.profiles[0].engine, "postgres");
+        assert_eq!(ws.profiles[0].engine, Engine::Postgres);
         assert_eq!(ws.profiles[0].tls, TlsMode::Verify, "TLS verification is the default (D-007)");
     }
 
@@ -583,11 +598,32 @@ mod tests {
     }
 
     #[test]
-    fn importing_a_non_postgres_or_broken_url_says_why_without_echoing_it() {
-        let e = decompose_url(&sluice_core::Secret::new("mongodb://u:hunter2@h/db".into()), "p", "").err().unwrap();
-        assert!(e.message.contains("Postgres only") && !e.message.contains("hunter2"), "{}", e.message);
+    fn importing_an_engineless_or_broken_url_says_why_without_echoing_it() {
+        let e = decompose_url(&sluice_core::Secret::new("mysql://u:hunter2@h/db".into()), "p", "").err().unwrap();
+        assert!(e.message.contains("`mysql`") && !e.message.contains("hunter2"), "{}", e.message);
         let e = decompose_url(&sluice_core::Secret::new("not a url hunter2".into()), "p", "").err().unwrap();
         assert!(!e.message.contains("hunter2"), "{}", e.message);
+    }
+
+    /// T-094: saving requires a name; surrounding space is not part of it.
+    #[test]
+    fn a_saved_connection_needs_a_non_empty_name() {
+        assert!(validate_label("").is_err());
+        assert!(validate_label("   ").unwrap_err().message.contains("needs a name"));
+        assert_eq!(validate_label("  Shop prod ").unwrap(), "Shop prod");
+    }
+
+    /// T-075: an imported URL carries its engine and that engine's defaults,
+    /// and the password still goes nowhere but the keychain.
+    #[test]
+    fn importing_another_engines_url_records_the_engine() {
+        let i = decompose_url(&sluice_core::Secret::new("mssql://sa:hunter2@sql.internal/app".into()), "p", "").unwrap();
+        assert_eq!((i.entry.engine, i.entry.port, i.entry.database.as_str()), (Engine::Sqlserver, 1433, "app"));
+        assert_eq!(i.password.as_ref().unwrap().expose(), "hunter2");
+        let i = decompose_url(&sluice_core::Secret::new("mongodb://h".into()), "p", "").unwrap();
+        assert_eq!((i.entry.engine, i.entry.port, i.entry.database.as_str()), (Engine::Mongodb, 27017, "admin"));
+        let text = config::render(&Workspace { profiles: vec![i.entry], queries: vec![] }, &SPEC).unwrap();
+        assert!(text.contains("engine = \"mongodb\""), "{text}");
     }
 
     /// T-037 / R-019: the header states exactly what the file reveals.

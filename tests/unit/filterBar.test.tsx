@@ -104,4 +104,38 @@ describe("FilterBar", () => {
     fireEvent.click(screen.getByText("Apply"));
     expect(applied.at(-1)).toBeNull();
   });
+
+  // T-014 / D-005: an extension operator the UI has never heard of renders
+  // from its declaration alone — its arity picks the inputs, its type classes
+  // pick the columns — and is sent under its declared id.
+  test("renders a driver extension operator from its declaration alone", () => {
+    const ext = [
+      ...OPS,
+      { id: "near", arity: "two" as const, label: "within radius of", type_classes: ["text" as const], case_sensitive: null, case_insensitive_toggle: false },
+      { id: "is_blank", arity: "none" as const, label: "is blank", type_classes: ["text" as const], case_sensitive: null, case_insensitive_toggle: false },
+    ];
+    const applied: (FilterTree | null)[] = [];
+    render(<FilterBar columns={COLS} ops={ext} onApply={(f) => applied.push(f)} />);
+    fireEvent.click(screen.getByText("Filter"));
+    const op = inRow(0).getByLabelText("Operator") as HTMLSelectElement;
+    expect([...op.options].map((o) => o.text)).toContain("within radius of");
+
+    fireEvent.change(op, { target: { value: "is_blank" } });
+    expect(inRow(0).queryByLabelText("Value")).toBeNull();
+
+    fireEvent.change(op, { target: { value: "near" } });
+    fireEvent.change(inRow(0).getByLabelText("Value"), { target: { value: "a" } });
+    fireEvent.change(inRow(0).getByLabelText("Upper value"), { target: { value: "b" } });
+    fireEvent.click(screen.getByText("Apply"));
+    expect(applied.at(-1)).toEqual({
+      node: "and",
+      0: [{ node: "pred", 0: { column: "name", op: "near", value: { t: "array", v: [{ t: "text", v: "a" }, { t: "text", v: "b" }] } } }],
+    });
+
+    // Not offered on a column outside its declared type classes.
+    fireEvent.change(inRow(0).getByLabelText("Column"), { target: { value: "1" } });
+    expect([...(inRow(0).getByLabelText("Operator") as HTMLSelectElement).options].map((o) => o.text)).not.toContain(
+      "within radius of",
+    );
+  });
 });

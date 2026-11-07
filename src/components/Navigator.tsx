@@ -36,10 +36,12 @@ export function Navigator({
 
   return (
     <div className="text-sm">
-      <div className="flex items-center justify-end px-1 pb-1">
+      {/* Rendered under its connection's row in the sidebar, so it needs no
+          heading of its own — only the refresh D-016 makes the contract. */}
+      <div className="flex h-6 items-center justify-end px-1">
         <button
           type="button"
-          className="flex items-center gap-1 rounded px-1 text-xs text-muted-foreground hover:bg-accent"
+          className="focus-glow flex h-6 items-center gap-1 rounded border border-transparent px-1.5 text-2xs text-muted-foreground transition-colors duration-interact hover:bg-accent hover:text-foreground"
           title="Re-read the catalog (changes made outside this app are not detected automatically)"
           disabled={refreshing}
           onClick={async () => {
@@ -112,7 +114,11 @@ function Level({
   }, [load]);
 
   if (error) {
-    return <p className="px-2 py-1 text-xs text-destructive">{error}</p>;
+    return (
+      <p role="alert" className="px-2 py-1 text-xs text-destructive">
+        {error}
+      </p>
+    );
   }
   if (nodes === null || loading) {
     return (
@@ -143,8 +149,11 @@ function Level({
             <button
               type="button"
               className={cn(
-                "flex w-full items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent",
-                sameNode(selected, node.id) && "bg-accent font-medium",
+                // D-031: row height follows density; selection is the accent
+                // inset (interaction), notices are notes in the info hue (D-032).
+                "focus-glow flex h-row w-full items-center gap-1.5 rounded border border-transparent px-1 text-left font-mono text-data transition-colors duration-interact",
+                node.id.kind === "notice" ? "font-sans text-xs text-info" : "hover:bg-accent",
+                sameNode(selected, node.id) && "bg-primary/10 text-foreground shadow-inset-accent",
               )}
               style={{ paddingLeft: `${depth * 12 + 4}px` }}
               onClick={() => {
@@ -162,19 +171,23 @@ function Level({
             >
               {canExpand ? (
                 isOpen ? (
-                  <ChevronDown className="h-3 w-3 shrink-0" />
+                  <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
                 ) : (
-                  <ChevronRight className="h-3 w-3 shrink-0" />
+                  <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
                 )
               ) : (
                 <span className="w-3 shrink-0" />
               )}
               {/* Labels are database content: rendered as a text node, never
                   as markup (T-021/D-007). */}
-              <span className="truncate">{node.label}</span>
-              <span className="ml-auto shrink-0 pl-2 text-[10px] uppercase text-muted-foreground">
-                {kind?.label ?? node.id.kind}
-              </span>
+              <span className="truncate" title={node.label}>{node.label}</span>
+              {/* Leaves (columns, indexes) describe themselves in their
+                  label; the kind tag would only crowd it out. */}
+              {canExpand && (
+                <span className="ml-auto shrink-0 pl-2 font-sans text-2xs uppercase tracking-label text-muted-foreground/70">
+                  {kind?.label ?? node.id.kind}
+                </span>
+              )}
             </button>
 
             {canExpand && isOpen && (

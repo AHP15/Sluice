@@ -70,7 +70,7 @@ export function SavedProfiles({
         ))}
       </ul>
       {workspace?.path && (
-        <p className="truncate px-2 pt-1 text-[10px] text-muted-foreground" title={workspace.path}>
+        <p className="truncate px-2 pt-1 text-2xs text-muted-foreground" title={workspace.path}>
           {workspace.path}
         </p>
       )}

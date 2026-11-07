@@ -8,6 +8,7 @@ mod consent_dialog;
 mod credentials;
 mod diagnostics;
 mod editor;
+mod engines;
 mod execution;
 mod guardrails;
 mod launcher;
@@ -101,6 +102,7 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file,
+        commands::export_result,
         commands::debug_panicking_driver_call
     ]
 }
@@ -144,6 +146,7 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::apply_edits,
         commands::cancel_query,
         commands::fetch_value,
-        commands::save_value_to_file
+        commands::save_value_to_file,
+        commands::export_result
     ]
 }

@@ -20,14 +20,22 @@ export interface FilterRow {
   caseInsensitive: boolean;
 }
 
-/** Operators that take no value. */
-const NULLARY = new Set(["is_null", "is_not_null"]);
-
-export function arity(op: string): 0 | 1 | 2 | "list" {
-  if (NULLARY.has(op)) return 0;
-  if (op === "between") return 2;
-  if (op === "in") return "list";
-  return 1;
+/**
+ * T-014 / D-005: the value inputs an operator takes, from the driver's
+ * declaration. Never from the operator id: an extension operator this UI has
+ * never heard of renders from its declaration alone.
+ */
+export function arity(decl: FilterOpDecl | undefined): 0 | 1 | 2 | "list" {
+  switch (decl?.arity) {
+    case "none":
+      return 0;
+    case "two":
+      return 2;
+    case "list":
+      return "list";
+    default:
+      return 1;
+  }
 }
 
 /**
@@ -54,7 +62,7 @@ export function toPredicate(row: FilterRow, columns: ColumnDesc[], ops: FilterOp
   if (!column || !decl) return null;
 
   let value: WireValue;
-  switch (arity(row.op)) {
+  switch (arity(decl)) {
     case 0:
       value = { t: "null" };
       break;

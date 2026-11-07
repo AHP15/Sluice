@@ -24,11 +24,11 @@ function shown(v: string | null): { text: string; note: string | null; isNull: b
 function Statement({ s, n }: { s: PlannedStatement; n: number }) {
   return (
     <li className="flex flex-col gap-1">
-      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+      <div className="text-2xs uppercase tracking-label text-muted-foreground">
         statement {n}
         {s.inline === null && " · shown parameterized: a value cannot be inlined faithfully"}
       </div>
-      <pre className="whitespace-pre-wrap break-all rounded bg-secondary px-2 py-1 font-mono text-xs">
+      <pre className="whitespace-pre-wrap break-all rounded border bg-background px-2.5 py-1.5 font-mono text-data">
         {s.inline ?? s.statement}
       </pre>
       {s.inline === null && (
@@ -60,7 +60,7 @@ function Statement({ s, n }: { s: PlannedStatement; n: number }) {
       {/* T-060 / R-035: reduced protection, said here — on the edit it
           affects, when it is about to run — rather than as a standing banner. */}
       {s.concurrency_omitted.length > 0 && (
-        <div className="text-xs text-destructive">
+        <div className="text-xs text-caution">
           not checked for concurrent changes (protected by unique key only): {s.concurrency_omitted.join(", ")}
         </div>
       )}
@@ -95,8 +95,8 @@ export function EditPreview({
     onCompareRendered &&
     plan.statements.some((s) => s.concurrency_omitted.length > 0 || (s.concurrency_rendered?.length ?? 0) > 0);
   return (
-    <div className="flex max-h-[50vh] flex-col border-t bg-background">
-      <div className="flex items-center gap-2 border-b px-3 py-1.5 text-xs">
+    <div className="flex max-h-[50vh] flex-col border-t border-border-strong bg-panel">
+      <div className="flex min-h-9 items-center gap-2 border-b px-3 py-1.5 text-xs">
         <span className="font-medium">
           Review {n} statement{n === 1 ? "" : "s"} — exactly what will run, in one transaction
         </span>
@@ -119,7 +119,7 @@ export function EditPreview({
           <button
             type="button"
             disabled={applying}
-            className="rounded px-2 py-0.5 hover:bg-secondary disabled:opacity-50"
+            className="focus-glow h-6 rounded border border-border-strong bg-raised px-2.5 transition-colors duration-interact hover:border-muted-foreground/50 disabled:opacity-50"
             onClick={onBack}
           >
             Back to editing
@@ -127,7 +127,7 @@ export function EditPreview({
           <button
             type="button"
             disabled={applying}
-            className="rounded bg-primary px-2 py-0.5 text-primary-foreground disabled:opacity-50"
+            className="focus-glow h-6 rounded bg-primary px-2.5 font-semibold text-primary-foreground transition-opacity duration-interact hover:opacity-90 disabled:opacity-50"
             onClick={onConfirm}
           >
             {applying ? "Running…" : `Run ${n} statement${n === 1 ? "" : "s"}`}

@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sluice_core::DriverError;
-use sluice_postgres::pinned::{PinnedSession, SessionStatus, TxState, IDLE_TRANSACTION_TIMEOUT};
+use sluice_core::{EditorSession, SessionStatus, TxState, IDLE_TRANSACTION_TIMEOUT};
+
+/// T-078: a pinned session of whatever engine the tab is connected to.
+pub type Pinned = Arc<Mutex<Box<dyn EditorSession>>>;
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
@@ -41,7 +44,7 @@ pub struct Editor {
     pub session_id: String,
     /// T-042: the profile whose connection budget this session draws on.
     pub profile_key: String,
-    pub pinned: Arc<Mutex<PinnedSession>>,
+    pub pinned: Pinned,
 }
 
 #[derive(Default)]
@@ -81,7 +84,7 @@ impl Editors {
         self.live.lock().await.insert(id, e);
     }
 
-    pub async fn get(&self, id: &str) -> Option<Arc<Mutex<PinnedSession>>> {
+    pub async fn get(&self, id: &str) -> Option<Pinned> {
         self.live.lock().await.get(id).map(|e| e.pinned.clone())
     }
 
@@ -118,7 +121,7 @@ impl Editors {
             ));
         }
         let mut live = self.live.lock().await;
-        let mine: Vec<(String, Arc<Mutex<PinnedSession>>)> = live
+        let mine: Vec<(String, Pinned)> = live
             .iter()
             .filter(|(_, e)| e.profile_key == profile_key)
             .map(|(k, e)| (k.clone(), e.pinned.clone()))
@@ -171,9 +174,9 @@ impl Editors {
         drop(live);
         // T-043: the banner names what was lost — here, provably nothing but
         // the connection itself.
-        let reason = sluice_postgres::pinned::lost_message(
+        let reason = sluice_core::lost_message(
             "This editor's session was released to make room for another tab within the profile's connection budget.",
-            &sluice_postgres::pinned::SessionHeld::default(),
+            &sluice_core::SessionHeld::default(),
         );
         self.released.lock().await.insert(victim.clone(), reason.clone());
         close_pinned(e.pinned).await;
@@ -253,7 +256,7 @@ impl Editors {
     /// A session busy running something is skipped (`try_lock`), never waited
     /// on — a long query is not idle.
     pub async fn reap(&self, timeout: Duration) -> Vec<EditorEvent> {
-        let editors: Vec<(String, Arc<Mutex<PinnedSession>>)> =
+        let editors: Vec<(String, Pinned)> =
             self.live.lock().await.iter().map(|(k, e)| (k.clone(), e.pinned.clone())).collect();
         let mut events = Vec::new();
         for (id, p) in editors {
@@ -272,7 +275,7 @@ impl Editors {
     }
 }
 
-async fn close_pinned(p: Arc<Mutex<PinnedSession>>) {
+async fn close_pinned(p: Pinned) {
     // Wait for an in-flight run to finish (or be cancelled) before closing,
     // so the rollback is not racing it. The session is then the only owner.
     let lock = p.lock().await;
@@ -300,24 +303,13 @@ pub fn spawn_reaper(app: tauri::AppHandle, editors: Arc<Editors>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sluice_core::{Driver, RawRequest, Secret, WireValue};
-    use sluice_postgres::{tls::TlsMode, ConnectSpec, PgDriver};
+    use sluice_core::{Driver, RawRequest, WireValue};
 
-    async fn driver() -> Option<Arc<PgDriver>> {
-        let spec = ConnectSpec {
-            host: "localhost".into(),
-            port: 55432,
-            user: "postgres".into(),
-            password: Some(Secret::new("sluice_dev".into())),
-            dbname: "sluice_dev".into(),
-            tls: TlsMode::Disabled,
-            application_name: "sluice-editor-test".into(),
-            statement_timeout: None,
-        };
-        PgDriver::connect(spec).await.map_err(|_| eprintln!("SKIP: no Postgres reachable")).ok()
+    async fn driver() -> Option<Arc<dyn Driver>> {
+        crate::engines::test_postgres(sluice_core::DEFAULT_CONNECTION_BUDGET).await
     }
 
-    async fn count(d: &PgDriver) -> WireValue {
+    async fn count(d: &dyn Driver) -> WireValue {
         let r = d.raw(RawRequest::Script("SELECT count(*) FROM public.t041_reap".into())).await.unwrap();
         r.first_rows().unwrap().1[0][0].clone()
     }
@@ -333,7 +325,7 @@ mod tests {
         let editors = Editors::default();
         let mut open = d.open_pinned().await.unwrap();
         open.begin().await.unwrap();
-        d.run_pinned(&mut open, "INSERT INTO public.t041_reap VALUES (1)").await.unwrap();
+        d.run_pinned(&mut *open, "INSERT INTO public.t041_reap VALUES (1)".into()).await.unwrap();
         editors.insert("open".into(), Editor { session_id: "s".into(), profile_key: "p".into(), pinned: Arc::new(Mutex::new(open)) }).await;
         let idle = d.open_pinned().await.unwrap();
         editors.insert("idle".into(), Editor { session_id: "s".into(), profile_key: "p".into(), pinned: Arc::new(Mutex::new(idle)) }).await;
@@ -346,13 +338,13 @@ mod tests {
         assert_eq!(events[0].editor_id, "open");
         assert_eq!(events[0].status.tx, TxState::Idle);
         assert!(events[0].message.contains("rolled back") && events[0].message.contains("Nothing in it was committed"));
-        assert_eq!(count(&d).await, WireValue::Text("0".into()));
+        assert_eq!(count(&*d).await, WireValue::Text("0".into()));
 
         editors.close_for_session("s").await;
         assert!(editors.get("open").await.is_none() && editors.get("idle").await.is_none());
     }
 
-    fn ed(p: PinnedSession) -> Editor {
+    fn ed(p: Box<dyn EditorSession>) -> Editor {
         Editor { session_id: "s".into(), profile_key: "p".into(), pinned: Arc::new(Mutex::new(p)) }
     }
 
@@ -408,10 +400,10 @@ mod tests {
         let Some(d) = driver().await else { return };
         let editors = Editors::default();
         let mut a = d.open_pinned().await.unwrap();
-        d.run_pinned(&mut a, "SELECT set_config('work_mem', '8MB', false)").await.unwrap();
+        d.run_pinned(&mut *a, "SELECT set_config('work_mem', '8MB', false)".into()).await.unwrap();
         editors.insert("setcfg".into(), ed(a)).await;
         let mut b = d.open_pinned().await.unwrap();
-        d.run_pinned(&mut b, "CREATE TEMP TABLE t043e (x int)").await.unwrap();
+        d.run_pinned(&mut *b, "CREATE TEMP TABLE t043e (x int)".into()).await.unwrap();
         editors.insert("temp".into(), ed(b)).await;
 
         let e = editors.make_room("p", 2, 5).await.unwrap_err();
@@ -437,7 +429,7 @@ mod tests {
         let editors = Editors::default();
         let mut p = d.open_pinned().await.unwrap();
         p.begin().await.unwrap();
-        d.run_pinned(&mut p, "INSERT INTO public.t041_close VALUES (1)").await.unwrap();
+        d.run_pinned(&mut *p, "INSERT INTO public.t041_close VALUES (1)".into()).await.unwrap();
         editors.insert("e".into(), Editor { session_id: "s".into(), profile_key: "p".into(), pinned: Arc::new(Mutex::new(p)) }).await;
         editors.close_all().await;
         let r = d.raw(RawRequest::Script("SELECT count(*) FROM public.t041_close".into())).await.unwrap();
