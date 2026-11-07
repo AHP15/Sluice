@@ -8,13 +8,20 @@ import { EditPreview } from "./components/EditPreview";
 import { EditorSessionBar } from "./components/EditorSessionBar";
 import { editorSessionPolicy } from "./lib/sessionPolicy";
 import { ResultGrid } from "./components/ResultGrid";
+import { pathKey, rowsAsDocuments } from "./lib/columnLayout";
 import {
   EMPTY,
+  NO_NEW_ROWS,
+  addNewRow,
   applyToRows,
   buildEditRequests,
-  pendingCount,
+  clearNewCell,
+  removeNewRow,
+  setNewCell,
   stage,
+  totalPending,
   unstage,
+  type NewRows,
   type Pending,
 } from "./lib/pendingEdits";
 import { Button } from "./components/ui/button";
@@ -62,6 +69,7 @@ import {
   disconnect,
   exportResult,
   type ExportSource,
+  inferColumns,
   runScript,
   saveSessionAsProfile,
   setVerboseDiagnostics,
@@ -659,9 +667,15 @@ function Workspace({
   // discarded. Nothing replaces the view while any are pending, so they are
   // never dropped silently.
   const [pending, setPending] = useState<Pending>(EMPTY);
+  // Rows added in the grid, staged with the cell edits and applied with them.
+  const [newRows, setNewRows] = useState<NewRows>(NO_NEW_ROWS);
   const [applying, setApplying] = useState(false);
+  // Read through a ref so a callback created before a commit (the reload
+  // after an insert) sees the pending set as it is now, not as it was.
+  const heldRef = useRef(0);
+  heldRef.current = totalPending(pending, newRows);
   const holdForPending = () => {
-    const n = pendingCount(pending);
+    const n = heldRef.current;
     if (n === 0) return false;
     setError(`Apply or discard ${n} pending change${n === 1 ? "" : "s"} first.`);
     return true;
@@ -815,7 +829,7 @@ function Workspace({
 
   const onApply = useCallback(async () => {
     if (!session || !view?.relation || !view.edit) return;
-    const built = buildEditRequests(pending, view.relation, view.columns, view.rows, view.edit);
+    const built = buildEditRequests(pending, view.relation, view.columns, view.rows, view.edit, newRows);
     if (!built.ok) {
       setError(built.reason);
       return;
@@ -830,7 +844,7 @@ function Workspace({
     } finally {
       setApplying(false);
     }
-  }, [session, view, pending]);
+  }, [session, view, pending, newRows]);
 
   const onConfirm = useCallback(async () => {
     if (!session || !review) return;
@@ -845,7 +859,20 @@ function Workspace({
         // now the rows, and the pending set is gone.
         setView((v) => (v ? { ...v, rows: applyToRows(v.rows, applied) } : v));
         setPending(EMPTY);
-        setSummary(`${edits.length} row${edits.length === 1 ? "" : "s"} updated`);
+        setNewRows(NO_NEW_ROWS);
+        const inserted = edits.filter((e) => e.op === "insert").length;
+        const updated = edits.length - inserted;
+        const plural = (n: number, verb: string) => `${n} row${n === 1 ? "" : "s"} ${verb}`;
+        const done = [updated > 0 && plural(updated, "updated"), inserted > 0 && plural(inserted, "inserted")]
+          .filter(Boolean)
+          .join(", ");
+        if (inserted > 0 && browsedNode.current) {
+          // New rows take values only the database knows (defaults, serials,
+          // generated columns), so the relation is read again to show them.
+          heldRef.current = 0;
+          onSelectRelation(browsedNode.current, view?.source?.kind === "browse" ? view.source.request.filter : null);
+        }
+        setSummary(done);
       } else {
         // Rolled back: nothing was written, so the changes stay staged.
         const failed = run.result.outcomes.find((o) => o.kind === "error");
@@ -869,7 +896,7 @@ function Workspace({
     } finally {
       setApplying(false);
     }
-  }, [session, review]);
+  }, [session, review, view, onSelectRelation]);
 
   const onStop = useCallback(() => {
     if (runningQuery.current) void cancelQuery(runningQuery.current);
@@ -994,6 +1021,24 @@ function Workspace({
                 columns={view.columns}
                 rows={view.rows}
                 truncated={view.truncated}
+                layout={
+                  // T-063 / D-018: declared, never inferred from the engine
+                  // name (D-003). Until T-064 supplies a dedicated sample,
+                  // the page in view is the sample.
+                  session.capabilities.column_inference?.mode === "inferred" && view.relation
+                    ? {
+                        key: `${session.session_id}::${pathKey(view.relation.path)}`,
+                        infer: () =>
+                          inferColumns(rowsAsDocuments(view.columns, view.rows), null, {
+                            sample_limit:
+                              session.capabilities.column_inference?.mode === "inferred"
+                                ? session.capabilities.column_inference.sample_limit
+                                : 1000,
+                            max_depth: 1,
+                          }),
+                      }
+                    : undefined
+                }
                 exporting={
                   view.source
                     ? view.source.kind === "unavailable"
@@ -1018,8 +1063,14 @@ function Workspace({
                         onApply,
                         onDiscard: () => {
                           setPending(EMPTY);
+                          setNewRows(NO_NEW_ROWS);
                           setError(null);
                         },
+                        newRows,
+                        onAddRow: () => setNewRows((n) => addNewRow(n)),
+                        onStageNew: (r, c, v) => setNewRows((n) => setNewCell(n, r, c, v)),
+                        onUnstageNew: (r, c) => setNewRows((n) => clearNewCell(n, r, c)),
+                        onRemoveNew: (r) => setNewRows((n) => removeNewRow(n, r)),
                       }
                     : undefined
                 }

@@ -18,10 +18,13 @@
 //!   rest; a lease dropped by an unwinding panic is closed, never reused.
 //!
 //! What this crate does today: connect, publish a capability descriptor, pool
-//! within the profile's budget, and navigate the catalog (T-081). Browse, raw
-//! scripts, staged edits and export are declared unavailable with a message
-//! saying so, until their own work lands.
+//! within the profile's budget, navigate the catalog (T-081), and run
+//! structured browse — compiled to parameterised T-SQL with keyset or
+//! declared `OFFSET … FETCH` paging and lossless per-type encoding (T-082,
+//! see [`browse`]). Raw scripts, staged edits and export are declared
+//! unavailable with a message saying so, until their own work lands.
 
+pub mod browse;
 pub mod error_map;
 pub mod navigator;
 pub mod pool;
@@ -32,9 +35,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sluice_core::{
     BatchSink, BrowseBatch, BrowseRequest, BrowseStreamEnd, CancelSlot, CancelSupport, Capabilities, CatalogSupport,
-    Driver, DriverError, EditPlan, EditRequest, EditorSession, ErrorKind, ExecBudget, ExecutionResult, ExportBatch,
-    ExportEnd, NavNode, NodeId, PoolStatsSnapshot, RawPayloadKind, RawRequest, ReadOnlyGuarantee, Redactor,
-    ResetSupport, Secret, SessionAffinity, SqlLiterals, TlsMode, TransactionSupport, WireValue,
+    Driver, DriverError, EditGate, EditPlan, EditRequest, EditorSession, ErrorKind, ExecBudget, ExecutionResult,
+    ExportBatch, ExportEnd, FilterArity, FilterOpDecl, NavNode, NodeId, PoolStatsSnapshot, RawPayloadKind, RawRequest,
+    ReadOnlyGuarantee, Redactor, ResetSupport, Secret, SessionAffinity, SqlLiterals, TlsMode, TransactionSupport,
+    TypeClass, WireValue,
 };
 
 use crate::navigator::{rows, text};
@@ -138,6 +142,8 @@ pub struct SqlServerDriver {
     cancel: Option<CancelSlot>,
     /// T-050: what one raw execution may retain for display.
     exec_budget: ExecBudget,
+    /// T-018 / R-008: the per-value byte ceiling browse applies in SQL.
+    ceiling: i64,
 }
 
 /// The named refusal for a capability this driver does not have yet.
@@ -170,6 +176,7 @@ impl SqlServerDriver {
             nav_cache: Arc::default(),
             cancel: None,
             exec_budget: ExecBudget::default(),
+            ceiling: browse::DEFAULT_VALUE_CEILING,
         };
 
         // Prove the credentials now rather than on first expand, and learn
@@ -238,8 +245,160 @@ impl SqlServerDriver {
             nav_cache: self.nav_cache.clone(),
             cancel: self.cancel.clone(),
             exec_budget: self.exec_budget,
+            ceiling: self.ceiling,
         }
     }
+
+    /// A copy with a different per-value ceiling (T-018), sharing the pool.
+    pub fn with_ceiling(self: Arc<Self>, ceiling: i64) -> Arc<Self> {
+        let mut copy = self.copy();
+        copy.ceiling = ceiling;
+        Arc::new(copy)
+    }
+
+    /// Read the relation's declared shape from the catalog and compile the
+    /// request against it (T-082). Never `SELECT *`: the projection is
+    /// written per declared type, so no column reaches tiberius's decoder in
+    /// a form it would round or panic on (T-072).
+    pub async fn compile_browse(&self, c: &mut Conn, request: &BrowseRequest) -> Result<browse::CompiledBrowse, DriverError> {
+        if !navigator::is_relation_kind(&request.relation.kind) {
+            return Err(DriverError::new(
+                ErrorKind::NotFound,
+                format!("a `{}` node cannot be browsed", request.relation.kind),
+            ));
+        }
+        let (db, schema, rel) = browse::qualified(&request.relation)?;
+        let found = rows(c, &browse::shape_sql(&db), &[&schema, &rel]).await?;
+        let shape = browse::shape_from_rows(&found)?;
+        browse::compile(&request.relation, &shape, request, self.ceiling)
+    }
+
+    /// Structured browse, streamed in batches (T-049 / D-010).
+    ///
+    /// Rows are read from the TDS stream as `emit` grants credit. When the
+    /// consumer stops mid-page, the rest of the page is still on the wire and
+    /// tiberius has no Attention to stop it (T-072), so the connection is
+    /// closed rather than reused — the server abandons the request on
+    /// disconnect.
+    async fn stream_browse(
+        &self,
+        request: &BrowseRequest,
+        batch_rows: usize,
+        emit: &mut BatchSink<BrowseBatch>,
+    ) -> Result<BrowseStreamEnd, DriverError> {
+        use futures_util::TryStreamExt as _;
+
+        let batch_rows = batch_rows.max(1);
+        let stopped = |rows| BrowseStreamEnd { rows, truncated: false, stopped: true, page: None };
+        let out = async {
+            let mut lease = Lease::acquire(&self.pool, self.stats.clone()).await?;
+            // (end, whether the connection was abandoned mid-stream)
+            let result: Result<(BrowseStreamEnd, bool), DriverError> = async {
+                let c = lease.conn();
+                let compiled = self.compile_browse(c, request).await?;
+                if !emit(BrowseBatch::Columns(compiled.column_descs(), read_only_gate())).await {
+                    return Ok((stopped(0), false));
+                }
+                let params = compiled.sql_params();
+                let mut stream = c
+                    .query(compiled.sql.as_str(), &params)
+                    .await
+                    .map_err(|e| error_map::map_error(&e))?
+                    .into_row_stream();
+                let mut sent = 0usize;
+                let mut last: Option<Vec<WireValue>> = None;
+                let mut batch: Vec<Vec<WireValue>> = Vec::with_capacity(batch_rows);
+                while let Some(row) = stream.try_next().await.map_err(|e| error_map::map_error(&e))? {
+                    let decoded = browse::decode_row(&compiled, &row);
+                    last = Some(decoded.clone());
+                    batch.push(decoded);
+                    if batch.len() == batch_rows {
+                        let n = batch.len();
+                        if !emit(BrowseBatch::Rows(std::mem::take(&mut batch))).await {
+                            return Ok((stopped(sent), true));
+                        }
+                        sent += n;
+                    }
+                }
+                drop(stream);
+                if !batch.is_empty() {
+                    let n = batch.len();
+                    if !emit(BrowseBatch::Rows(batch)).await {
+                        return Ok((stopped(sent), false));
+                    }
+                    sent += n;
+                }
+                let page = compiled.paging.page_info(&compiled.columns, last.as_deref(), sent, compiled.limit);
+                Ok((
+                    BrowseStreamEnd { rows: sent, truncated: sent as u32 >= compiled.limit, stopped: false, page: Some(page) },
+                    false,
+                ))
+            }
+            .await;
+            match &result {
+                Ok((_, true)) => lease.mark_dirty(),
+                Err(e) if e.kind == ErrorKind::ConnectionFailed => lease.mark_dirty(),
+                _ => {}
+            }
+            lease.release().await;
+            result.map(|(end, _)| end)
+        }
+        .await;
+        out.map_err(|e| self.redactor.error(e))
+    }
+}
+
+/// Staged edits on SQL Server are T-085's; until then a browsed relation says
+/// why it cannot be edited rather than offering an edit that would fail.
+fn read_only_gate() -> EditGate {
+    EditGate::ReadOnly { reason: "editing rows is not available on SQL Server in this build of Sluice yet".into() }
+}
+
+/// D-005's core operators, compiled by [`browse`]. Case sensitivity is the
+/// server collation's (R-009): reported, not overridden; the per-predicate
+/// toggle opts out with `LOWER()` on both sides.
+fn filter_ops(strings_case_sensitive: bool) -> Vec<FilterOpDecl> {
+    let all = vec![
+        TypeClass::Boolean,
+        TypeClass::Integer,
+        TypeClass::Float,
+        TypeClass::ExactNumeric,
+        TypeClass::Text,
+        TypeClass::Timestamp,
+        TypeClass::Uuid,
+    ];
+    let op = |id: &str, label: &str, arity: FilterArity, classes: Vec<TypeClass>, strings: bool| FilterOpDecl {
+        id: id.into(),
+        label: label.into(),
+        arity,
+        type_classes: classes,
+        case_sensitive: strings.then_some(strings_case_sensitive),
+        case_insensitive_toggle: strings,
+    };
+    vec![
+        op("eq", "equals", FilterArity::One, all.clone(), true),
+        op("ne", "not equals", FilterArity::One, all.clone(), true),
+        op("gt", "greater than", FilterArity::One, all.clone(), false),
+        op("gte", "at least", FilterArity::One, all.clone(), false),
+        op("lt", "less than", FilterArity::One, all.clone(), false),
+        op("lte", "at most", FilterArity::One, all.clone(), false),
+        op("contains", "contains", FilterArity::One, vec![TypeClass::Text], true),
+        op("starts_with", "starts with", FilterArity::One, vec![TypeClass::Text], true),
+        op("ends_with", "ends with", FilterArity::One, vec![TypeClass::Text], true),
+        op("in", "is one of", FilterArity::List, all.clone(), true),
+        op("between", "between", FilterArity::Two, all, false),
+        op("is_null", "is null", FilterArity::None, vec![], false),
+        op("is_not_null", "is not null", FilterArity::None, vec![], false),
+    ]
+}
+
+/// A SQL Server collation distinguishes case when its name says `_CS`, or
+/// when it is binary (`_BIN`, `_BIN2`). The installation default is `_CI`.
+fn collation_case_sensitive(collation: Option<&str>) -> bool {
+    collation.is_some_and(|c| {
+        let c = c.to_ascii_uppercase();
+        c.contains("_CS") || c.contains("_BIN")
+    })
 }
 
 async fn probe_server(c: &mut Conn) -> Result<ServerInfo, DriverError> {
@@ -313,14 +472,14 @@ impl Driver for SqlServerDriver {
             transactions: Some(TransactionSupport { interactive: true, max_idle_seconds: None }),
             raw_payload: RawPayloadKind::Script,
             node_kinds: navigator::node_kinds(),
-            // Filter compilation arrives with browse; none are offered until
-            // a browse exists to apply them to.
-            filter_ops: Vec::new(),
+            // T-082 / D-005: the core set, compiled to bound T-SQL.
+            filter_ops: filter_ops(collation_case_sensitive(self.server.collation.as_deref())),
             fixed_schema: true,
             supports_script: true,
             string_collation: self.server.collation.clone(),
             read_only: self.read_only.clone(),
             catalog: self.catalog.clone(),
+            column_inference: sluice_core::ColumnDerivation::Catalog,
         }
     }
 
@@ -342,8 +501,22 @@ impl Driver for SqlServerDriver {
         Ok(nodes)
     }
 
-    async fn browse(&self, _request: BrowseRequest) -> Result<ExecutionResult, DriverError> {
-        Err(not_yet("Browsing a table"))
+    /// D-029: structured browse yields exactly one `rows` outcome, with the
+    /// paging strategy declared (D-010).
+    async fn browse(&self, request: BrowseRequest) -> Result<ExecutionResult, DriverError> {
+        self.with_lease(false, async |c: &mut Conn| {
+            let compiled = self.compile_browse(c, &request).await?;
+            let params = compiled.sql_params();
+            let found = rows(c, &compiled.sql, &params).await?;
+            let out: Vec<Vec<WireValue>> = found.iter().map(|r| browse::decode_row(&compiled, r)).collect();
+            let truncated = out.len() as u32 >= compiled.limit;
+            let page = compiled.paging.page_info(&compiled.columns, out.last().map(Vec::as_slice), out.len(), compiled.limit);
+            let mut result = ExecutionResult::single_rows(compiled.column_descs(), out, truncated);
+            result.page = Some(page);
+            result.edit = Some(read_only_gate());
+            Ok(result)
+        })
+        .await
     }
 
     async fn preview_edits(&self, _edits: Vec<EditRequest>) -> Result<EditPlan, DriverError> {
@@ -360,11 +533,11 @@ impl Driver for SqlServerDriver {
 
     async fn browse_batches(
         &self,
-        _request: BrowseRequest,
-        _batch_rows: usize,
-        _emit: BatchSink<BrowseBatch>,
+        request: BrowseRequest,
+        batch_rows: usize,
+        mut emit: BatchSink<BrowseBatch>,
     ) -> Result<BrowseStreamEnd, DriverError> {
-        Err(not_yet("Browsing a table"))
+        self.stream_browse(&request, batch_rows, &mut emit).await
     }
 
     async fn export_browse(
@@ -460,6 +633,23 @@ mod tests {
         let s = ConnectSpec { password: Some(Secret::new("hunter2".into())), ..Default::default() };
         assert!(!format!("{s:?}").contains("hunter2"));
         assert!(!format!("{:?}", tiberius_config(&s)).contains("hunter2"));
+    }
+
+    /// T-013: the conformance check every driver's tests run.
+    #[test]
+    fn every_core_filter_operator_is_declared() {
+        assert!(sluice_core::missing_core_ops(&filter_ops(false)).is_empty());
+        let contains = filter_ops(false).into_iter().find(|o| o.id == "contains").unwrap();
+        assert_eq!(contains.case_sensitive, Some(false));
+        assert!(contains.case_insensitive_toggle);
+    }
+
+    #[test]
+    fn case_sensitivity_is_read_from_the_collation_name() {
+        assert!(!collation_case_sensitive(Some("SQL_Latin1_General_CP1_CI_AS")));
+        assert!(collation_case_sensitive(Some("Latin1_General_CS_AS")));
+        assert!(collation_case_sensitive(Some("Latin1_General_BIN2")));
+        assert!(!collation_case_sensitive(None));
     }
 
     #[test]

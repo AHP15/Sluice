@@ -38,7 +38,7 @@ pub struct Target {
 
 /// Every engine this build can connect to.
 pub fn compiled_engines() -> &'static [Engine] {
-    &[Engine::Postgres, Engine::Sqlserver]
+    &[Engine::Postgres, Engine::Sqlserver, Engine::Mongodb]
 }
 
 /// The named refusal for an engine with no driver in this build.
@@ -86,7 +86,22 @@ pub async fn connect(target: Target) -> Result<Arc<dyn Driver>, DriverError> {
             let d: Arc<dyn Driver> = sluice_sqlserver::SqlServerDriver::connect(spec, target.budget).await?;
             Ok(d)
         }
-        other @ Engine::Mongodb => Err(not_in_this_build(other)),
+        // T-087: the official `mongodb` crate, its own pool sized from the
+        // budget. Mongo has no session statement timeout to set; the client
+        // watchdog in `execution::run` bounds every call (D-010).
+        Engine::Mongodb => {
+            let spec = sluice_mongo::ConnectSpec {
+                host: target.host,
+                port: target.port,
+                user: target.user,
+                password: target.password,
+                database: target.database,
+                tls: target.tls,
+                application_name: "sluice".into(),
+            };
+            let d: Arc<dyn Driver> = sluice_mongo::MongoDriver::connect(spec, target.budget).await?;
+            Ok(d)
+        }
     }
 }
 
@@ -179,17 +194,56 @@ mod tests {
         }
     }
 
-    /// T-079: an engine with no driver in the build is refused by name — and
-    /// is never handed to the Postgres driver.
-    #[tokio::test]
-    async fn an_engine_missing_from_the_build_is_named_not_routed_to_postgres() {
-        for engine in [Engine::Mongodb] {
-            assert!(!compiled_engines().contains(&engine));
-            let e = connect(target(engine)).await.err().expect("refused");
+    /// T-079: every engine has a driver in this build (T-087 added the last),
+    /// and the refusal an engine without one would get names it.
+    #[test]
+    fn every_engine_is_compiled_and_a_missing_one_would_be_named() {
+        for engine in Engine::ALL {
+            assert!(compiled_engines().contains(&engine), "{engine:?}");
+            let e = not_in_this_build(engine);
             assert_eq!(e.kind, ErrorKind::ConnectionFailed);
             assert!(e.message.contains(engine.label()), "{}", e.message);
-            assert!(!e.message.contains("hunter2"));
         }
+    }
+
+    /// T-087: a MongoDB target reaches the Mongo driver, within the budget it
+    /// was given — never the Postgres one. Skipped without a mongod.
+    #[tokio::test]
+    async fn mongodb_goes_to_the_mongo_driver() {
+        let t = Target {
+            engine: Engine::Mongodb,
+            host: std::env::var("SLUICE_TEST_MONGO_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("SLUICE_TEST_MONGO_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(27018),
+            user: String::new(),
+            password: None,
+            database: "admin".into(),
+            tls: TlsMode::Disabled,
+            statement_timeout: None,
+            budget: 3,
+        };
+        let d = match connect(t).await {
+            Ok(d) => d,
+            Err(e) => {
+                assert!(!e.message.contains("not available in this build"), "{}", e.message);
+                eprintln!("SKIP: no mongod reachable ({e})");
+                return;
+            }
+        };
+        let caps = d.capabilities();
+        assert_eq!(caps.engine, "mongodb");
+        assert_eq!(caps.affinity, sluice_core::SessionAffinity::Session);
+        assert_eq!(d.connection_budget(), 3);
+        assert!(!d.navigator_children(None).await.unwrap().is_empty());
+    }
+
+    /// A wrong password on a Mongo target is refused without echoing it.
+    #[tokio::test]
+    async fn a_mongo_target_never_echoes_its_password() {
+        let mut t = target(Engine::Mongodb);
+        t.user = "u".into();
+        let e = connect(t).await.err().expect("nothing listens on port 1");
+        assert_eq!(e.kind, ErrorKind::ConnectionFailed);
+        assert!(!e.message.contains("hunter2"), "{}", e.message);
     }
 
     /// T-080: a SQL Server target reaches the SQL Server driver, within the

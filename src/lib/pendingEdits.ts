@@ -164,15 +164,63 @@ export function editorText(v: WireValue): string {
   }
 }
 
+// ---- New rows ---------------------------------------------------------------
+//
+// A row added in the grid is held client-side like a cell edit: it is staged,
+// previewed, applied in the same single transaction, and discarded with the
+// rest. Each new row maps column index → value; a column it does not mention
+// takes the database's default, so an untouched new row is `DEFAULT VALUES`.
+
+export type NewRows = readonly ReadonlyMap<number, WireValue>[];
+
+export const NO_NEW_ROWS: NewRows = [];
+
+export function addNewRow(n: NewRows): NewRows {
+  return [...n, new Map()];
+}
+
+export function removeNewRow(n: NewRows, i: number): NewRows {
+  return n.filter((_, j) => j !== i);
+}
+
+/** Give a new row's cell a value. */
+export function setNewCell(n: NewRows, i: number, col: number, value: WireValue): NewRows {
+  return n.map((cells, j) => (j === i ? new Map(cells).set(col, value) : cells));
+}
+
+/** Put a new row's cell back to the column default. */
+export function clearNewCell(n: NewRows, i: number, col: number): NewRows {
+  return n.map((cells, j) => {
+    if (j !== i || !cells.has(col)) return cells;
+    const next = new Map(cells);
+    next.delete(col);
+    return next;
+  });
+}
+
+/** Everything awaiting apply: changed cells plus new rows. */
+export function totalPending(p: Pending, n: NewRows): number {
+  return pendingCount(p) + n.length;
+}
+
+/**
+ * Why a new row's cell cannot be given a value here, or `null`. The column's
+ * class decides, since there is no value as read.
+ */
+export function newCellReadOnlyReason(column: ColumnDesc): string | null {
+  return cellReadOnlyReason(column, { t: "null" });
+}
+
 export type Built = { ok: true; edits: EditRequest[] } | { ok: false; reason: string };
 
-/** One `EditRequest` per changed row, in row order. */
+/** One `EditRequest` per changed row, in row order, then one per new row. */
 export function buildEditRequests(
   p: Pending,
   relation: NodeId,
   columns: ColumnDesc[],
   rows: WireValue[][],
   gate: EditGate,
+  newRows: NewRows = NO_NEW_ROWS,
 ): Built {
   if (gate.state !== "editable") return { ok: false, reason: gate.reason };
   const keyIdx: number[] = [];
@@ -191,6 +239,11 @@ export function buildEditRequests(
     const set: Original[] = cols.map((c) => ({ column: columns[c].name, value: cells.get(c)! }));
     const originals: Original[] = cols.map((c) => ({ column: columns[c].name, value: row[c] }));
     edits.push({ relation, key, set, originals });
+  }
+  for (const cells of newRows) {
+    const cols = [...cells.keys()].sort((a, b) => a - b);
+    const set: Original[] = cols.map((c) => ({ column: columns[c].name, value: cells.get(c)! }));
+    edits.push({ op: "insert", relation, key: [], set, originals: [] });
   }
   return { ok: true, edits };
 }

@@ -72,6 +72,11 @@ describe("T-056: staged editing in the footer", () => {
     onUnstage: () => {},
     onApply: () => {},
     onDiscard: () => {},
+    newRows: [],
+    onAddRow: () => {},
+    onStageNew: () => {},
+    onUnstageNew: () => {},
+    onRemoveNew: () => {},
   });
   const render = (e: ReturnType<typeof editing>) =>
     renderToStaticMarkup(<ResultGrid sessionId="s" columns={columns} rows={rows} truncated={false} editing={e} />);
@@ -117,6 +122,11 @@ test("T-060: the footer carries no standing protection banner", () => {
         onUnstage: () => {},
         onApply: () => {},
         onDiscard: () => {},
+        newRows: [],
+        onAddRow: () => {},
+        onStageNew: () => {},
+        onUnstageNew: () => {},
+        onRemoveNew: () => {},
       }}
     />,
   );

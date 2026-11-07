@@ -60,7 +60,7 @@ T-059 | done | M | D-027,R-034 | Bind concurrency originals with an explicit per
 T-060 | done | M | D-027,R-035 | Determine concurrency comparability by probing the catalog | 2026-11-06
 T-061 | done | M | D-027 | Database-enforced safety mode and production confirmation | 2026-11-06
 T-062 | todo | M | D-027,D-018,R-026 | Classify Mongo document paths as editable or read-only |
-T-063 | todo | L | D-018 | Column derivation for schemaless collections |
+T-063 | done | L | D-018 | Column derivation for schemaless collections | 2026-11-07
 T-064 | todo | M | D-018,R-015 | Sample both ends of a collection and show inference coverage |
 T-065 | todo | M | D-018,D-029,R-025 | Declare sortability per relation and per path |
 T-066 | done | L | D-017 | Layered error model with normalized kind, hints, and verbatim payload | 2026-08-03
@@ -79,12 +79,12 @@ T-078 | done | M | D-003,D-022 | Hold and dispatch sessions as engine-neutral dr
 T-079 | done | M | D-003,D-022 | Build each session's driver from its engine at connect time | 2026-11-06
 T-080 | done | L | D-002,D-022,D-028 | SQL Server driver crate: connect, TLS, auth, and pooled reset over tiberius | 2026-11-06
 T-081 | done | M | D-016,D-029 | SQL Server navigator and lazy catalog introspection | 2026-11-06
-T-082 | todo | L | D-005,D-006,D-010,D-029 | SQL Server browse compilation, lossless type encoding, and core filters |
+T-082 | done | L | D-005,D-006,D-010,D-029 | SQL Server browse compilation, lossless type encoding, and core filters | 2026-11-07
 T-083 | todo | M | D-029,D-010 | SQL Server raw scripts as a budgeted statement-outcome sequence |
 T-084 | todo | M | D-030,D-010 | SQL Server cancellation: close-and-declare baseline with verified KILL |
 T-085 | todo | M | D-027 | Staged edits on SQL Server behind the unique-key gate |
 T-086 | todo | M | D-021,D-006 | SQL Server type-fidelity corpus in CI against a service container |
-T-087 | todo | L | D-002,D-022,D-028 | MongoDB driver crate: connect, capability descriptor, and navigator |
+T-087 | done | L | D-002,D-022,D-028 | MongoDB driver crate: connect, capability descriptor, and navigator | 2026-11-07
 T-088 | todo | L | D-005,D-006,D-010,D-029 | MongoDB browse with BSON-faithful encoding and operator-safe filters |
 T-089 | todo | M | D-029,D-010 | MongoDB raw command documents as an outcome sequence |
 T-090 | todo | M | D-021,D-006 | MongoDB fidelity corpus in CI against a mongod service container |
@@ -94,3 +94,21 @@ T-093 | done | M | D-011,D-014 | Persistent sidebar listing saved connections | 
 T-094 | done | S | D-011 | Name and rename connections | 2026-11-06
 T-095 | done | L | D-023,D-031,D-032 | Restyle the app shell, navigator, and editor to the new design | 2026-11-06
 T-096 | done | M | D-023,D-031,D-032 | Restyle the result grid, filter bar, and edit and confirm panels | 2026-11-06
+T-097 | todo | M | D-040 | Engine-neutral Address on Target and in the profile file |
+T-098 | todo | M | D-043 | Closed per-engine connection options |
+T-099 | todo | M | D-043 | TLS trust anchor and client identity across engines |
+T-100 | todo | S | R-060 | Portable certificate and key paths |
+T-101 | todo | M | D-038,R-053 | Profile file version 2 written only when needed |
+T-102 | todo | L | D-041 | Classify connection URL parameters per engine |
+T-103 | todo | S | D-036 | Refuse Mongo auth mechanisms without a credential provider |
+T-104 | todo | S | R-055 | Single host plus replicaSet maps to a one-element seed list |
+T-105 | todo | M | D-041,R-058 | Postgres behaviour under pgbouncer=true transaction pooling |
+T-106 | todo | M | D-040,R-047 | Mongo connection URI built only from validated typed values |
+T-107 | todo | M | D-040,R-056 | Mongo topology: direct for Host, discovery for seeds and SRV, tunnel refusal |
+T-108 | todo | M | R-057 | Confirm discovered members outside the configured seeds |
+T-109 | todo | M | D-040 | Guardrails over every configured and discovered member |
+T-110 | todo | M | D-036,R-048 | Mongo auth source default, visible field, and failure hint |
+T-111 | todo | M | D-039 | SRV TXT options, loadBalanced refusal, and DNS provenance |
+T-112 | todo | S | R-054 | Explain SRV resolution failures and verify over a VPN |
+T-113 | todo | M | D-035 | Declare Mongo monitoring sockets as budget overhead |
+T-114 | todo | M | R-046 | Split the budget across mongos routers |

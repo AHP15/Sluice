@@ -597,7 +597,7 @@ impl PgDriver {
                 shapes.push((e.relation.clone(), shape));
             }
             let (_, shape) = shapes.iter().find(|(r, _)| r == &e.relation).expect("inserted above");
-            compiled.push(edit::compile_update_with(i, e, &shape.columns, &shape.gate, &self.comparability)?);
+            compiled.push(edit::compile_with(i, e, &shape.columns, &shape.gate, &self.comparability)?);
         }
         Ok(compiled)
     }
@@ -1003,6 +1003,8 @@ impl Driver for PgDriver {
             string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
             read_only: self.read_only.clone(),
             catalog: self.catalog.clone(),
+            // D-018: the catalog declares every column.
+            column_inference: sluice_core::ColumnDerivation::Catalog,
         }
     }
 
@@ -1072,6 +1074,7 @@ impl Driver for PgDriver {
     /// opens a transaction. Inside it, each `UPDATE` must affect exactly one
     /// row; anything else (zero: the row is gone or its key changed) rolls the
     /// whole batch back and is reported as a conflict at that edit's ordinal.
+    /// A new row's `INSERT` must likewise add exactly one row.
     async fn preview_edits(&self, edits: Vec<EditRequest>) -> Result<EditPlan, DriverError> {
         // Structured catalog reads only: the connection stays clean.
         self.with_lease(false, async |client: &tokio_postgres::Client| {
@@ -1121,6 +1124,7 @@ impl Driver for PgDriver {
                         c.params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
                     let failure = match client.execute(&c.sql, &params).await {
                         Ok(1) => None,
+                        Ok(0) if c.op == sluice_core::EditOp::Insert => Some(c.conflict(i, false)),
                         Ok(0) => {
                             // T-058: tell "gone" from "changed since read".
                             let pp: Vec<&(dyn ToSql + Sync)> =
@@ -1156,7 +1160,13 @@ impl Driver for PgDriver {
                         attribution: Attribution::Ordinal { ordinal },
                         body: OutcomeBody::Affected {
                             count: 1,
-                            statement_kind: Some("UPDATE".into()),
+                            statement_kind: Some(
+                                match c.op {
+                                    sluice_core::EditOp::Insert => "INSERT",
+                                    sluice_core::EditOp::Update => "UPDATE",
+                                }
+                                .into(),
+                            ),
                             concurrency_omitted: c.concurrency_omitted.clone(),
                             document_errors: vec![],
                         },

@@ -41,3 +41,20 @@ R-040 | mitigate | high | Attaching a text span to each outcome forces the in-ap
 R-041 | mitigate | high | The outcome sequence carries no transactional context, so a partial-success report may be false [tasks: T-012]
 R-042 | mitigate | medium | Credit-based backpressure across a multi-result script pauses the server mid-transaction [tasks: T-052]
 R-043 | mitigate | medium | D-010's row cap is per query, so it no longer bounds one execution [tasks: T-050]
+R-044 | fix | high | Replica-set discovery connects around an `ssh -L` tunnel to the members' real hostnames
+R-045 | fix | high | Production guardrails evaluate one configured host string, not the servers actually connected
+R-046 | mitigate | medium | Through mongos, one profile's pool fills on every router, multiplying the budget [tasks: T-114]
+R-047 | mitigate | medium | SRV and TXT handling exist only behind the crate's connection-string parser, so typed options must be re-serialised into a URI [tasks: T-106]
+R-048 | mitigate | medium | The default auth source fails the most common local Mongo setup once a database is chosen [tasks: T-110]
+R-049 | fix | medium | Refusing unrecognised URL parameters breaks launches from ORM-style URLs that work today
+R-050 | fix | medium | D-037's harmlessness test misses parameters some servers require, such as `retryWrites=false`
+R-051 | fix | medium | No setting carries a custom CA bundle or client certificate, so common managed databases cannot verify TLS
+R-052 | accept | low | Fixing reads to the primary forbids browsing a secondary or a replica set with no primary
+R-053 | mitigate | medium | One version-2 profile makes the whole synced file unreadable on an older build [tasks: T-101]
+R-054 | mitigate | medium | SRV lookups through the crate's own resolver can ignore OS split-DNS that VPN users depend on [tasks: T-112]
+R-055 | mitigate | medium | A single seed with `replicaSet` stops meaning discovery, so the most common replica-set URL loses failover [tasks: T-104]
+R-056 | mitigate | low | The loopback-seed refusal rejects standard local Docker replica sets that are not tunnels [tasks: T-107]
+R-057 | mitigate | medium | Forwarders on non-loopback addresses are not recognised, so discovery still routes around them [tasks: T-108]
+R-058 | mitigate | medium | Honouring `pgbouncer=true` as unnamed statements misses what transaction pooling also breaks [tasks: T-105]
+R-059 | fix | medium | Adding the CA to the system roots weakens what `sslrootcert` and `tlsCAFile` users asked for
+R-060 | mitigate | low | Certificate and key paths in a synced profile file break on every other machine [tasks: T-100]

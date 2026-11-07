@@ -97,9 +97,25 @@ pub struct Original {
     pub value: WireValue,
 }
 
+/// What a staged edit does to its relation.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EditOp {
+    /// Change one existing row, identified by its unique key (T-056).
+    #[default]
+    Update,
+    /// Add one new row. `set` holds the columns given a value; every other
+    /// column takes its default. `key` and `originals` must be empty: there is
+    /// no existing row to identify or compare against.
+    Insert,
+}
+
 /// A staged edit against one row (T-056/D-027).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EditRequest {
+    /// Absent on the wire means `update`, the only operation before inserts.
+    #[serde(default)]
+    pub op: EditOp,
     pub relation: NodeId,
     /// Unique-key columns identifying the row.
     pub key: Vec<Original>,
