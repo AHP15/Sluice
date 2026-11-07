@@ -1,0 +1,24 @@
+[package]
+name = "sluice-mongo"
+description = "MongoDB driver implementing the Sluice contract."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sluice-core = { path = "../sluice-core" }
+
+# D-002: the official `mongodb` crate directly — no wrappers. It owns its own
+# connection pool (R-011), so no bb8/deadpool is layered on top: the pool is
+# sized from the profile's budget through `max_pool_size` instead (D-028).
+# Its default features carry rustls (never native-tls, as T-072 chose for SQL
+# Server) and the DNS resolver `mongodb+srv` needs.
+mongodb = "3"
+tokio = { workspace = true }
+serde = { workspace = true }
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
