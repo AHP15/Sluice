@@ -3,6 +3,7 @@ import { QueryClient } from "@tanstack/react-query";
 import type {
   BrowseRequest,
   ColumnDesc,
+  ColumnInference,
   EditGate,
   EditPlan,
   EditRequest,
@@ -248,6 +249,19 @@ export function cancelQuery(queryId: string): Promise<boolean> {
 }
 
 /** T-018: pull one oversized value on demand. */
+/**
+ * T-063 / D-018: derive columns from a validator and/or documents already in
+ * hand. Pure in the core — nothing is fetched — so the grid's explicit refresh
+ * can re-run it freely.
+ */
+export function inferColumns(
+  sample: [string, WireValue][][],
+  validator: unknown | null = null,
+  options: { sample_limit: number; max_depth: number } | null = null,
+): Promise<ColumnInference> {
+  return invoke<ColumnInference>("infer_columns", { validator, sample, options });
+}
+
 export function fetchValue(sessionId: string, handle: string): Promise<WireValue> {
   return invoke<WireValue>("fetch_value", { sessionId, handle });
 }

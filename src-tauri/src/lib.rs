@@ -103,6 +103,7 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::fetch_value,
         commands::save_value_to_file,
         commands::export_result,
+        commands::infer_columns,
         commands::debug_panicking_driver_call
     ]
 }
@@ -147,6 +148,7 @@ fn build_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stati
         commands::cancel_query,
         commands::fetch_value,
         commands::save_value_to_file,
-        commands::export_result
+        commands::export_result,
+        commands::infer_columns
     ]
 }

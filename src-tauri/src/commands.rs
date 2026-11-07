@@ -1263,6 +1263,22 @@ pub async fn core_version() -> Result<String, DriverError> {
     .await
 }
 
+/// T-063 / D-018: derive a relation's grid columns from a validator and/or a
+/// sample the caller already holds. Pure — no session, no driver, no server
+/// round trip — so the grid's explicit refresh re-runs inference without
+/// fetching. Fetching the sample itself is the driver's (T-064 / T-088).
+#[tauri::command]
+pub async fn infer_columns(
+    validator: Option<serde_json::Value>,
+    sample: Vec<sluice_core::schema_infer::Document>,
+    options: Option<sluice_core::InferOptions>,
+) -> Result<sluice_core::ColumnInference, DriverError> {
+    guard_driver_call(&sid("infer-columns"), async move {
+        Ok(sluice_core::infer_columns(validator.as_ref(), &sample, options.unwrap_or_default()))
+    })
+    .await
+}
+
 /// Deliberate fault injection, debug builds only (T-006).
 #[cfg(debug_assertions)]
 #[tauri::command]

@@ -321,6 +321,7 @@ impl Driver for SqlServerDriver {
             string_collation: self.server.collation.clone(),
             read_only: self.read_only.clone(),
             catalog: self.catalog.clone(),
+            column_inference: sluice_core::ColumnDerivation::Catalog,
         }
     }
 

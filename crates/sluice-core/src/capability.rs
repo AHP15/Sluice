@@ -250,6 +250,30 @@ impl CatalogSupport {
     }
 }
 
+/// T-063 / D-018: where a relation's grid columns come from.
+///
+/// Declared rather than inferred from `fixed_schema` or the engine name, so a
+/// future document or key-value engine opts in by data alone (D-003).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ColumnDerivation {
+    /// The catalog declares every relation's columns; nothing is inferred.
+    #[default]
+    Catalog,
+    /// Columns are derived by `schema_infer::infer_columns` — from the
+    /// relation's JSON-Schema validator when one exists, otherwise from a
+    /// bounded sample of at most `sample_limit` documents.
+    Inferred {
+        /// The engine can supply a JSON-Schema validator (Mongo `$jsonSchema`).
+        validator: bool,
+        /// The bound on a sample, in documents.
+        sample_limit: u32,
+        /// A deeper random sample can be requested (Mongo `$sample`), at a cost
+        /// D-018 says is not free on a large relation.
+        deep_sample: bool,
+    },
+}
+
 /// The full descriptor a driver publishes about itself.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Capabilities {
@@ -289,4 +313,8 @@ pub struct Capabilities {
     /// T-055 / R-028: what the catalog demonstrably supports.
     #[serde(default)]
     pub catalog: CatalogSupport,
+    /// T-063 / D-018: how grid columns are derived. Defaults to `Catalog`, so a
+    /// descriptor that predates the field still loads as fixed-schema.
+    #[serde(default)]
+    pub column_inference: ColumnDerivation,
 }

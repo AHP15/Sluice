@@ -8,6 +8,7 @@ import { EditPreview } from "./components/EditPreview";
 import { EditorSessionBar } from "./components/EditorSessionBar";
 import { editorSessionPolicy } from "./lib/sessionPolicy";
 import { ResultGrid } from "./components/ResultGrid";
+import { pathKey, rowsAsDocuments } from "./lib/columnLayout";
 import {
   EMPTY,
   applyToRows,
@@ -62,6 +63,7 @@ import {
   disconnect,
   exportResult,
   type ExportSource,
+  inferColumns,
   runScript,
   saveSessionAsProfile,
   setVerboseDiagnostics,
@@ -994,6 +996,24 @@ function Workspace({
                 columns={view.columns}
                 rows={view.rows}
                 truncated={view.truncated}
+                layout={
+                  // T-063 / D-018: declared, never inferred from the engine
+                  // name (D-003). Until T-064 supplies a dedicated sample,
+                  // the page in view is the sample.
+                  session.capabilities.column_inference?.mode === "inferred" && view.relation
+                    ? {
+                        key: `${session.session_id}::${pathKey(view.relation.path)}`,
+                        infer: () =>
+                          inferColumns(rowsAsDocuments(view.columns, view.rows), null, {
+                            sample_limit:
+                              session.capabilities.column_inference?.mode === "inferred"
+                                ? session.capabilities.column_inference.sample_limit
+                                : 1000,
+                            max_depth: 1,
+                          }),
+                      }
+                    : undefined
+                }
                 exporting={
                   view.source
                     ? view.source.kind === "unavailable"
