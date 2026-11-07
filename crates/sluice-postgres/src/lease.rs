@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use deadpool_postgres::{Object, Pool};
-use serde::Serialize;
 use sluice_core::{DriverError, ErrorKind, ResetSupport};
 
 /// Release counters (T-040: "reopen rate is instrumented").
@@ -38,19 +37,8 @@ pub struct PoolStats {
     clean_returns: AtomicU64,
 }
 
-/// A point-in-time copy of [`PoolStats`].
-#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PoolStatsSnapshot {
-    /// Leases ended, by any path.
-    pub releases: u64,
-    /// Connections returned after the native reset primitive.
-    pub resets: u64,
-    /// Connections closed rather than returned — `reopen` capability, a failed
-    /// reset, or a lease dropped without release.
-    pub reopens: u64,
-    /// Connections returned as-is because nothing could have dirtied them.
-    pub clean_returns: u64,
-}
+/// A point-in-time copy of [`PoolStats`] — the engine-neutral counters (T-077).
+pub use sluice_core::PoolStatsSnapshot;
 
 impl PoolStats {
     pub fn snapshot(&self) -> PoolStatsSnapshot {
@@ -176,45 +164,34 @@ async fn rollback(client: &tokio_postgres::Client) -> Result<(), tokio_postgres:
     client.simple_query("ROLLBACK").await.map(|_| ())
 }
 
-/// T-051 / D-010: the handle that cancels one in-flight query.
-///
-/// A driver call made with a slot (`PgDriver::with_cancel`) records its leased
-/// connection's cancel token here when the lease is taken and clears it on
-/// release. `cancel` sends the protocol cancel request for whatever is running
-/// — or, if nothing has started yet, makes the next lease refuse to start.
-#[derive(Clone, Default)]
-pub struct CancelSlot {
-    inner: Arc<std::sync::Mutex<SlotState>>,
+/// T-051 / D-010: the engine-neutral cancel slot (T-077 moved it to core).
+pub use sluice_core::CancelSlot;
+
+/// Postgres's [`sluice_core::CancelHandle`]: the protocol cancel request, sent
+/// over a separate connection with the session's own TLS mode.
+pub struct PgCancel {
+    pub token: tokio_postgres::CancelToken,
+    pub tls: crate::tls::TlsMode,
 }
 
-#[derive(Default)]
-struct SlotState {
-    token: Option<tokio_postgres::CancelToken>,
-    cancelled: bool,
+impl PgCancel {
+    pub fn new(token: tokio_postgres::CancelToken, tls: crate::tls::TlsMode) -> Arc<Self> {
+        Arc::new(Self { token, tls })
+    }
 }
 
-impl CancelSlot {
-    pub(crate) fn arm(&self, token: tokio_postgres::CancelToken) -> bool {
-        let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if s.cancelled {
-            return false;
-        }
-        s.token = Some(token);
-        true
-    }
-
-    pub(crate) fn disarm(&self) {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).token = None;
-    }
-
-    /// Mark cancelled and take the token of the query running now, if any.
-    pub fn trip(&self) -> Option<tokio_postgres::CancelToken> {
-        let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        s.cancelled = true;
-        s.token.take()
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).cancelled
+#[async_trait::async_trait]
+impl sluice_core::CancelHandle for PgCancel {
+    async fn cancel(&self) -> bool {
+        use crate::tls::TlsMode;
+        let r = if self.tls == TlsMode::Disabled {
+            self.token.cancel_query(tokio_postgres::NoTls).await
+        } else {
+            match crate::tls::client_config(self.tls) {
+                Ok(cfg) => self.token.cancel_query(tokio_postgres_rustls::MakeRustlsConnect::new(cfg)).await,
+                Err(_) => return false,
+            }
+        };
+        r.is_ok()
     }
 }

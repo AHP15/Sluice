@@ -140,6 +140,36 @@ pub fn compile_with(
     keys: &KeyInfo,
     cmp: &Comparability,
 ) -> Result<CompiledBrowse, DriverError> {
+    compile_inner(relation, columns, req, ceiling, with_ctid, keys, cmp, true)
+}
+
+/// T-074 / D-024: the same browse — same projection, filter and order — with
+/// no LIMIT, OFFSET or cursor, for export. One statement over the whole
+/// relation, so the file is a single consistent snapshot rather than pages
+/// stitched together across which rows could shift.
+pub fn compile_unbounded(
+    relation: &NodeId,
+    columns: &[(String, Type)],
+    req: &BrowseRequest,
+    ceiling: i64,
+    keys: &KeyInfo,
+    cmp: &Comparability,
+) -> Result<CompiledBrowse, DriverError> {
+    let req = BrowseRequest { cursor: None, offset: None, ..req.clone() };
+    compile_inner(relation, columns, &req, ceiling, false, keys, cmp, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_inner(
+    relation: &NodeId,
+    columns: &[(String, Type)],
+    req: &BrowseRequest,
+    ceiling: i64,
+    with_ctid: bool,
+    keys: &KeyInfo,
+    cmp: &Comparability,
+    bounded: bool,
+) -> Result<CompiledBrowse, DriverError> {
     let rel = qualified(relation)?;
 
     let mut select: Vec<String> = Vec::new();
@@ -244,10 +274,12 @@ pub fn compile_with(
 
     // Bound in the SQL text rather than as a parameter: it is an integer the
     // compiler owns, never user text.
-    sql.push_str(&format!(" LIMIT {}", req.limit.clamp(1, 100_000)));
-    if let Paging::Offset { offset, .. } = &paging {
-        if *offset > 0 {
-            sql.push_str(&format!(" OFFSET {offset}"));
+    if bounded {
+        sql.push_str(&format!(" LIMIT {}", req.limit.clamp(1, 100_000)));
+        if let Paging::Offset { offset, .. } = &paging {
+            if *offset > 0 {
+                sql.push_str(&format!(" OFFSET {offset}"));
+            }
         }
     }
 
@@ -435,7 +467,10 @@ fn compile_predicate(
     // Anywhere else it is refused rather than silently ignored.
     let fold = p.case_insensitive;
     if fold {
-        let toggleable = matches!(p.op.as_str(), "eq" | "ne" | "in" | "contains" | "starts_with" | "ends_with");
+        let toggleable = matches!(
+            p.op.as_str(),
+            "eq" | "ne" | "in" | "not_in" | "contains" | "starts_with" | "ends_with" | "matches_regex"
+        );
         if !toggleable {
             return Err(invalid(format!("`{}` has no case-insensitive form", p.op)));
         }
@@ -488,11 +523,14 @@ fn compile_predicate(
 
     match p.op.as_str() {
         // D-005: a list, each element bound and cast like any single value.
-        "in" => {
-            let items = non_null_items(p, "in")?;
+        // T-014: `not_in` is the Postgres extension negating it.
+        "in" | "not_in" => {
+            let negated = p.op == "not_in";
+            let items = non_null_items(p, &p.op)?;
             if items.is_empty() {
-                // `col IN ()` is a syntax error; an empty list matches nothing.
-                return Ok("FALSE".to_string());
+                // `col IN ()` is a syntax error; an empty list matches nothing,
+                // and excluding nothing keeps every non-NULL row (as `<>` would).
+                return Ok(if negated { format!("{col} IS NOT NULL") } else { "FALSE".to_string() });
             }
             let mut binds = Vec::with_capacity(items.len());
             for v in items {
@@ -504,7 +542,8 @@ fn compile_predicate(
                 });
             }
             let lhs = if fold { format!("lower(({col})::text)") } else { col.clone() };
-            return Ok(format!("{lhs} IN ({})", binds.join(", ")));
+            let kw = if negated { "NOT IN" } else { "IN" };
+            return Ok(format!("{lhs} {kw} ({})", binds.join(", ")));
         }
         "between" => {
             let items = non_null_items(p, "between")?;
@@ -541,6 +580,16 @@ fn compile_predicate(
                 "({col})::text {like} ({})::text ESCAPE '\\'",
                 placeholder(params.len())
             ))
+        }
+        // T-014: POSIX regex, the pattern bound as a parameter — never text
+        // in the statement. `~*` is the case toggle's form.
+        "matches_regex" => {
+            if matches!(p.value, WireValue::Null | WireValue::Missing) {
+                return Err(invalid("`matches_regex` needs a pattern".into()));
+            }
+            params.push(wire_to_text(&p.value));
+            let op = if fold { "~*" } else { "~" };
+            Ok(format!("({col})::text {op} ({})::text", placeholder(params.len())))
         }
         other => Err(DriverError::new(
             ErrorKind::Unknown,

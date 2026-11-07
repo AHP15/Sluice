@@ -38,7 +38,7 @@ export function FilterBar({
   return (
     <form
       aria-label="Filter rows"
-      className="flex flex-col gap-1 border-b px-2 py-1 text-xs"
+      className="flex flex-col gap-1 border-b px-3 py-1.5 text-xs"
       onSubmit={(e) => {
         e.preventDefault();
         apply(rows);
@@ -47,12 +47,12 @@ export function FilterBar({
       {rows.map((row, i) => {
         const available = opsFor(columns[row.column], ops);
         const decl = available.find((o) => o.id === row.op);
-        const n = arity(row.op);
+        const n = arity(decl);
         return (
           <div key={i} className="flex items-center gap-1" data-testid="filter-row">
             <select
               aria-label="Column"
-              className="rounded border border-input bg-transparent px-1 py-0.5"
+              className="focus-glow h-6 rounded border border-input bg-background px-1.5 font-mono text-data transition-[border-color,box-shadow] duration-interact"
               value={row.column}
               onChange={(e) => {
                 const column = Number(e.target.value);
@@ -70,7 +70,7 @@ export function FilterBar({
             </select>
             <select
               aria-label="Operator"
-              className="rounded border border-input bg-transparent px-1 py-0.5"
+              className="focus-glow h-6 rounded border border-input bg-background px-1.5 font-mono text-data transition-[border-color,box-shadow] duration-interact"
               value={row.op}
               onChange={(e) => update(i, { op: e.target.value })}
             >
@@ -83,7 +83,7 @@ export function FilterBar({
             {n !== 0 && (
               <input
                 aria-label="Value"
-                className="w-40 rounded border border-input bg-transparent px-1 py-0.5"
+                className="w-40 focus-glow h-6 rounded border border-input bg-background px-1.5 font-mono text-data transition-[border-color,box-shadow] duration-interact"
                 placeholder={n === "list" ? "a, b, c" : n === 2 ? "from" : "value"}
                 value={row.value}
                 onChange={(e) => update(i, { value: e.target.value })}
@@ -92,7 +92,7 @@ export function FilterBar({
             {n === 2 && (
               <input
                 aria-label="Upper value"
-                className="w-40 rounded border border-input bg-transparent px-1 py-0.5"
+                className="w-40 focus-glow h-6 rounded border border-input bg-background px-1.5 font-mono text-data transition-[border-color,box-shadow] duration-interact"
                 placeholder="to"
                 value={row.value2}
                 onChange={(e) => update(i, { value2: e.target.value })}
@@ -112,7 +112,7 @@ export function FilterBar({
             <button
               type="button"
               aria-label="Remove filter"
-              className="rounded p-0.5 text-muted-foreground hover:text-destructive"
+              className="focus-glow rounded border border-transparent p-1 text-muted-foreground hover:text-destructive"
               onClick={() => {
                 const next = rows.filter((_, j) => j !== i);
                 setRows(next);
@@ -127,7 +127,7 @@ export function FilterBar({
       <div className="flex items-center gap-1">
         <button
           type="button"
-          className="flex items-center gap-1 rounded px-1 py-0.5 text-muted-foreground hover:text-foreground"
+          className="focus-glow flex h-6 items-center gap-1 rounded border border-transparent px-1.5 text-muted-foreground transition-colors duration-interact hover:bg-accent hover:text-foreground"
           onClick={() => setRows((rs) => [...rs, newRow(columns, ops)])}
         >
           {rows.length === 0 ? <ListFilter className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
@@ -140,7 +140,7 @@ export function FilterBar({
             </Button>
             <button
               type="button"
-              className="rounded px-1 py-0.5 text-muted-foreground hover:text-foreground"
+              className="focus-glow flex h-6 items-center gap-1 rounded border border-transparent px-1.5 text-muted-foreground transition-colors duration-interact hover:bg-accent hover:text-foreground"
               onClick={() => {
                 setRows([]);
                 apply([]);
@@ -151,7 +151,7 @@ export function FilterBar({
           </>
         )}
         {applied > 0 && (
-          <span className="text-muted-foreground" data-testid="filter-applied">
+          <span className="ml-auto font-mono text-2xs text-muted-foreground" data-testid="filter-applied">
             {applied} filter{applied === 1 ? "" : "s"} applied
           </span>
         )}

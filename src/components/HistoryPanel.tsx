@@ -36,13 +36,13 @@ export function HistoryPanel({
   const history = useQuery({ queryKey: HISTORY_KEY(scope, search), queryFn: () => listHistory(scope, search) });
 
   return (
-    <div className="absolute right-2 top-full z-20 mt-1 flex max-h-96 w-[32rem] flex-col rounded border bg-background shadow-lg">
+    <div className="absolute right-2 top-full z-20 mt-1 flex max-h-96 w-[32rem] flex-col rounded border border-border-strong bg-raised shadow-float">
       <div className="flex items-center gap-1 border-b p-1 text-xs">
         <Clock className="h-3.5 w-3.5 shrink-0" />
         <input
           autoFocus
           aria-label="Search history"
-          className="min-w-0 flex-1 rounded border border-input bg-transparent px-1 py-0.5"
+          className="min-w-0 flex-1 focus-glow h-6 rounded border border-input bg-background px-1.5"
           placeholder="Search history"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -100,19 +100,19 @@ function Entry({ entry: e, onLoad }: { entry: HistoryEntry; onLoad: (sql: string
         className={cn("block w-full px-2 py-1 text-left", replayable ? "hover:bg-accent" : "cursor-not-allowed")}
         onClick={() => replayable && onLoad(e.statement)}
       >
-        <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+        <div className="flex items-center gap-2 text-2xs text-muted-foreground">
           <span>{new Date(e.executed_at).toLocaleString()}</span>
           <span className={e.outcome === "ok" ? "" : "text-destructive"}>{e.outcome}</span>
           {e.rows != null && <span>{e.rows} rows</span>}
           {e.duration_ms != null && <span>{e.duration_ms} ms</span>}
           {!replayable && (
-            <span className="ml-auto flex items-center gap-1 rounded bg-muted px-1 text-foreground">
+            <span className="ml-auto flex items-center gap-1 rounded-sm border border-border-strong px-1 text-foreground">
               <ShieldOff className="h-3 w-3" />
               {e.redacted ? "redacted — not replayable" : "truncated — not replayable"}
             </span>
           )}
         </div>
-        <pre className="max-h-16 overflow-hidden whitespace-pre-wrap font-mono">{e.statement}</pre>
+        <pre className="max-h-16 overflow-hidden whitespace-pre-wrap font-mono text-data">{e.statement}</pre>
       </button>
     </li>
   );

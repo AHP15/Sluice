@@ -34,7 +34,8 @@ use sluice_config::evaluate::{
 };
 use sluice_config::launch::{parse_args, LaunchRequest};
 use sluice_config::{discover, interpreter};
-use sluice_postgres::tls::TlsMode;
+use sluice_core::TlsMode;
+use sluice_state::profile::Engine;
 use tauri::{Emitter, Manager};
 
 use crate::consent_dialog::{blast_radius_text, NativeConsentPrompt, NativeTargetConfirmation};
@@ -58,6 +59,8 @@ pub enum LaunchOrigin {
 /// The credential-free description of a launched connection.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct LaunchTarget {
+    /// T-075: the engine the URL's scheme names.
+    pub engine: Engine,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -264,33 +267,61 @@ fn discover_in(app: &tauri::AppHandle, launcher: &Launcher, dir: &Path) -> Launc
     }
 }
 
-/// libpq's defaults, applied in the core so the UI is told the real target.
-pub fn target_for(url: &ConnectionUrl) -> Result<LaunchTarget, String> {
-    if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
-        return Err(format!(
-            "`{}` connections are not supported yet; this build connects to Postgres.",
-            url.scheme
-        ));
+/// T-075: the user an engine's own clients assume when a URL names none.
+pub fn default_user(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "postgres",
+        Engine::Sqlserver => "sa",
+        // MongoDB connects unauthenticated when no user is given.
+        Engine::Mongodb => "",
     }
+}
+
+/// T-075: the database an engine's own clients open when a URL names none.
+pub fn default_database(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "postgres",
+        Engine::Sqlserver => "master",
+        Engine::Mongodb => "admin",
+    }
+}
+
+/// Each engine's client defaults, applied in the core so the UI is told the
+/// real target (libpq's for Postgres).
+///
+/// T-075: a scheme naming any engine Sluice has maps to that engine; whether
+/// this build can *connect* to it is the engine factory's call at connect
+/// time, which names the engine if it cannot. Only a scheme with no engine at
+/// all (`mysql`, `sqlite`) is refused here.
+pub fn target_for(url: &ConnectionUrl) -> Result<LaunchTarget, String> {
+    let engine = Engine::from_scheme(&url.scheme).ok_or_else(|| {
+        format!(
+            "`{}` connections are not supported; Sluice has engines for Postgres, SQL Server and MongoDB.",
+            url.scheme
+        )
+    })?;
     let user = url
         .user
         .clone()
         .or_else(|| url.params.get("user").cloned())
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "postgres".into());
+        .or_else(|| engine.is_postgres().then(|| std::env::var("USER").ok()).flatten())
+        .unwrap_or_else(|| default_user(engine).into());
+    let database = url
+        .database
+        .clone()
+        .or_else(|| url.params.get(if engine == Engine::Sqlserver { "database" } else { "dbname" }).cloned())
+        // libpq defaults the database to the user's name.
+        .unwrap_or_else(|| if engine.is_postgres() { user.clone() } else { default_database(engine).into() });
     Ok(LaunchTarget {
+        engine,
         scheme: url.scheme.clone(),
         host: url
             .host
             .clone()
             .or_else(|| url.params.get("host").cloned())
             .unwrap_or_else(|| "localhost".into()),
-        port: url.port.unwrap_or(5432),
-        database: url
-            .database
-            .clone()
-            .or_else(|| url.params.get("dbname").cloned())
-            .unwrap_or_else(|| user.clone()),
+        port: url.port.unwrap_or(engine.default_port()),
+        database,
         user,
         tls: tls_from_params(url),
     })
@@ -304,11 +335,37 @@ pub fn target_for(url: &ConnectionUrl) -> Result<LaunchTarget, String> {
 /// - `require` → `AcceptInvalidCerts`: libpq's `require` encrypts without
 ///   verifying, which is exactly this mode — and it carries its warning.
 /// - `disable` → `Disabled`, likewise with its warning.
+///
+/// T-075: the other engines' URL spellings map the same way — an explicit
+/// "no encryption" to `Disabled`, an explicit "trust any certificate" to
+/// `AcceptInvalidCerts`, and everything else (including absence) to `Verify`.
 pub fn tls_from_params(url: &ConnectionUrl) -> TlsMode {
-    match url.params.get("sslmode").map(String::as_str) {
-        Some("disable") => TlsMode::Disabled,
-        Some("require") => TlsMode::AcceptInvalidCerts,
-        _ => TlsMode::Verify,
+    let param = |k: &str| url.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.to_ascii_lowercase());
+    let is = |k: &str, v: &str| param(k).as_deref() == Some(v);
+    match Engine::from_scheme(&url.scheme) {
+        Some(Engine::Sqlserver) => {
+            if is("encrypt", "false") || is("encrypt", "no") {
+                TlsMode::Disabled
+            } else if is("trustservercertificate", "true") || is("trustservercertificate", "yes") {
+                TlsMode::AcceptInvalidCerts
+            } else {
+                TlsMode::Verify
+            }
+        }
+        Some(Engine::Mongodb) => {
+            if is("tls", "false") || is("ssl", "false") {
+                TlsMode::Disabled
+            } else if is("tlsallowinvalidcertificates", "true") || is("tlsinsecure", "true") {
+                TlsMode::AcceptInvalidCerts
+            } else {
+                TlsMode::Verify
+            }
+        }
+        _ => match param("sslmode").as_deref() {
+            Some("disable") => TlsMode::Disabled,
+            Some("require") => TlsMode::AcceptInvalidCerts,
+            _ => TlsMode::Verify,
+        },
     }
 }
 
@@ -350,10 +407,40 @@ mod tests {
         assert_eq!(mode("?sslmode=disable"), TlsMode::Disabled);
     }
 
+    /// T-075: every scheme with a Sluice engine maps to it, with that
+    /// engine's port and database defaults; one with no engine is refused by
+    /// name.
     #[test]
-    fn unsupported_engines_are_refused_by_name() {
-        let err = target_for(&parse("mongodb://h/db").unwrap()).unwrap_err();
-        assert!(err.contains("mongodb"), "{err}");
+    fn recognised_schemes_map_to_their_engine_and_others_are_refused_by_name() {
+        let t = target_for(&parse("postgres://h/db").unwrap()).unwrap();
+        assert_eq!(t.engine, Engine::Postgres);
+
+        let t = target_for(&parse("sqlserver://sa@sql.internal").unwrap()).unwrap();
+        assert_eq!((t.engine, t.port, t.database.as_str()), (Engine::Sqlserver, 1433, "master"));
+        let t = target_for(&parse("mssql://h:14333/app").unwrap()).unwrap();
+        assert_eq!((t.engine, t.port, t.database.as_str()), (Engine::Sqlserver, 14333, "app"));
+
+        let t = target_for(&parse("mongodb://h/db").unwrap()).unwrap();
+        assert_eq!((t.engine, t.port), (Engine::Mongodb, 27017));
+        let t = target_for(&parse("mongodb+srv://cluster.example.net/").unwrap()).unwrap();
+        assert_eq!((t.engine, t.database.as_str()), (Engine::Mongodb, "admin"));
+
+        let err = target_for(&parse("mysql://h/db").unwrap()).unwrap_err();
+        assert!(err.contains("mysql"), "{err}");
+    }
+
+    #[test]
+    fn other_engines_tls_params_never_weaken_the_verify_default() {
+        let mode = |u: &str| tls_from_params(&parse(u).unwrap());
+        assert_eq!(mode("sqlserver://h/db"), TlsMode::Verify);
+        assert_eq!(mode("sqlserver://h/db?encrypt=true"), TlsMode::Verify);
+        assert_eq!(mode("sqlserver://h/db?TrustServerCertificate=true"), TlsMode::AcceptInvalidCerts);
+        assert_eq!(mode("sqlserver://h/db?encrypt=false"), TlsMode::Disabled);
+        assert_eq!(mode("mongodb://h/db"), TlsMode::Verify);
+        assert_eq!(mode("mongodb://h/db?tlsAllowInvalidCertificates=true"), TlsMode::AcceptInvalidCerts);
+        assert_eq!(mode("mongodb://h/db?tls=false"), TlsMode::Disabled);
+        // A Postgres-only parameter on another engine's URL means nothing.
+        assert_eq!(mode("sqlserver://h/db?sslmode=disable"), TlsMode::Verify);
     }
 
     /// D-007: what the UI receives about a launch carries no credential.

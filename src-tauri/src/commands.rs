@@ -18,7 +18,7 @@ use sluice_core::{
     guard_driver_call, BrowseRequest, Capabilities, Driver, DriverError, EditPlan, EditRequest, ErrorKind,
     ExecutionResult, NavNode, NodeId, RawRequest, Secret, SessionId, WireValue,
 };
-use sluice_postgres::{tls::TlsMode, ConnectSpec, PgDriver};
+use sluice_core::TlsMode;
 use tokio::sync::Mutex;
 
 use crate::credentials::{Backend, CredentialStore};
@@ -27,7 +27,7 @@ use crate::guardrails::{Guardrails, Provenance};
 use crate::launcher::{LaunchOrigin, LaunchOutcome, Launcher};
 use crate::stream::{CreditGate, Stop, StreamEvent, Streams, BATCH_ROWS, MAX_IN_FLIGHT, STREAM_DEADLINE};
 use sluice_config::connection_url::ConnectionUrl;
-use sluice_state::profile::{CredentialProvider, Transport};
+use sluice_state::profile::{CredentialProvider, Engine, Transport};
 
 /// Non-secret connection metadata. This is the ONLY connection shape the
 /// webview ever sees or sends.
@@ -38,6 +38,10 @@ use sluice_state::profile::{CredentialProvider, Transport};
 pub struct ProfileMeta {
     pub id: String,
     pub label: String,
+    /// T-075 / D-022: which engine this profile connects to. Absent means
+    /// Postgres, the only engine older profiles could have meant.
+    #[serde(default)]
+    pub engine: Engine,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -91,7 +95,7 @@ pub struct SessionInfo {
 /// every connection it allows comes out of the server's `max_connections`,
 /// which every other client shares.
 pub fn budget_warning(budget: usize, max_connections: Option<i64>) -> Option<String> {
-    if budget <= sluice_postgres::DEFAULT_CONNECTION_BUDGET {
+    if budget <= sluice_core::DEFAULT_CONNECTION_BUDGET {
         return None;
     }
     let server = match max_connections {
@@ -101,7 +105,7 @@ pub fn budget_warning(budget: usize, max_connections: Option<i64>) -> Option<Str
     Some(format!(
         "This profile may hold up to {budget} connections (the default is {}), and each tab on it shares them; {server}. \
          Raise it only if this server has room to spare.",
-        sluice_postgres::DEFAULT_CONNECTION_BUDGET
+        sluice_core::DEFAULT_CONNECTION_BUDGET
     ))
 }
 
@@ -143,11 +147,11 @@ struct SessionRecord {
 
 #[derive(Default)]
 pub struct AppState {
-    drivers: Mutex<HashMap<String, Arc<PgDriver>>>,
+    drivers: Mutex<HashMap<String, Arc<dyn Driver>>>,
     /// T-042 / D-028: one driver — one pool, one connection budget — per
     /// profile, shared by every tab connected to it. Weak, so the driver goes
     /// when its last session does.
-    profiles: Mutex<HashMap<String, std::sync::Weak<PgDriver>>>,
+    profiles: Mutex<HashMap<String, std::sync::Weak<dyn Driver>>>,
     sessions: Mutex<HashMap<String, SessionRecord>>,
     creds: CredentialStore,
     queries: crate::execution::Queries,
@@ -193,7 +197,7 @@ impl AppState {
         self.sessions.lock().await.get(session_id).and_then(|r| r.statement_timeout)
     }
 
-    async fn driver(&self, session_id: &str) -> Result<Arc<PgDriver>, DriverError> {
+    async fn driver(&self, session_id: &str) -> Result<Arc<dyn Driver>, DriverError> {
         self.drivers
             .lock()
             .await
@@ -218,38 +222,6 @@ fn require_direct(t: &Transport) -> Result<(), DriverError> {
         Transport::Proxy { .. } => Err(DriverError::new(
             ErrorKind::ConnectionFailed,
             "proxy transports are not available yet — start the proxy yourself and point a direct profile at its local address",
-        )),
-    }
-}
-
-/// T-038 / D-008: resolve the profile's credential *provider* to a password.
-/// Returns the password (if any) and, for the keychain, why an existing item
-/// could not be read (T-071).
-///
-/// R-017: the environment is a credential parse boundary, so an `env` value
-/// is wrapped in `Secret` the moment it is read.
-fn resolve_auth(
-    creds: &CredentialStore,
-    profile_id: &str,
-    auth: &CredentialProvider,
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<(Option<Secret<String>>, Option<String>), DriverError> {
-    match auth {
-        CredentialProvider::Keychain {} => Ok(match creds.resolve(profile_id) {
-            Ok(p) => (Some(p), None),
-            Err(crate::credentials::CredentialError::Unreadable(why)) => (None, Some(why)),
-            Err(_) => (None, None),
-        }),
-        CredentialProvider::Env { var } => match env(var) {
-            Some(v) => Ok((Some(Secret::new(v)), None)),
-            None => Err(DriverError::new(
-                ErrorKind::AuthFailed,
-                format!("this profile reads its password from the environment variable `{var}`, which is not set"),
-            )),
-        },
-        other => Err(DriverError::new(
-            ErrorKind::AuthFailed,
-            format!("the `{}` credential provider is not available yet", other.label()),
         )),
     }
 }
@@ -312,19 +284,23 @@ pub async fn connect(
         // the UI to collect the password again, which re-stores it under this
         // build's identity.
         require_direct(&profile.transport)?;
-        let (password, unreadable) = resolve_auth(&state.creds, &profile.id, &profile.auth, |v| std::env::var(v).ok())?;
-
-        let spec = ConnectSpec {
+        // T-079: the engine decides how the credential is looked up and what
+        // connect spec is built; the factory owns both.
+        let (password, unreadable) =
+            crate::engines::lookup_credential(profile.engine, &state.creds, &profile.id, &profile.auth, |v| std::env::var(v).ok())?;
+        let budget = profile.connection_budget.map(|b| b.max(1) as usize).unwrap_or(sluice_core::DEFAULT_CONNECTION_BUDGET);
+        let target = crate::engines::Target {
+            engine: profile.engine,
             host: profile.host.clone(),
             port: profile.port,
             user: profile.user.clone(),
             password,
-            dbname: profile.dbname.clone(),
+            database: profile.dbname.clone(),
             tls: profile.tls,
-            application_name: "sluice".into(),
             statement_timeout: crate::execution::statement_timeout(profile.statement_timeout_secs),
+            budget,
         };
-        let timeout = spec.statement_timeout;
+        let timeout = target.statement_timeout;
 
         // T-042: a second tab on the same profile shares its driver, so the
         // profile's budget covers both. Keyed by id *and* settings, so an
@@ -334,12 +310,8 @@ pub async fn connect(
         let driver = match existing {
             Some(d) => d,
             None => {
-                let budget = profile
-                    .connection_budget
-                    .map(|b| b.max(1) as usize)
-                    .unwrap_or(sluice_postgres::DEFAULT_CONNECTION_BUDGET);
-                let redactor = sluice_core::Redactor::new(spec.password.clone());
-                let d = logged("connect", &profile.id, None, |_| None, PgDriver::connect_with_pool_size(spec, budget))
+                let redactor = sluice_core::Redactor::new(target.password.clone());
+                let d = logged("connect", &profile.id, None, |_| None, crate::engines::connect(target))
                     .await
                     .map_err(|e| credential_reentry(redactor.error(e), unreadable.as_deref()))?;
                 state.profiles.lock().await.insert(profile_key.clone(), Arc::downgrade(&d));
@@ -403,21 +375,24 @@ pub async fn connect_launch(
             .pending(&launch_id)
             .ok_or_else(|| DriverError::new(ErrorKind::NotFound, "no such launch"))?;
         let t = &pending.target;
-        let spec = ConnectSpec {
+        // T-079: the launch's engine, from its URL scheme (T-075), picks the
+        // driver; one not in this build is refused by name.
+        let target = crate::engines::Target {
+            engine: t.engine,
             host: t.host.clone(),
             port: t.port,
             user: t.user.clone(),
             password: pending.url.password.clone(),
-            dbname: t.database.clone(),
+            database: t.database.clone(),
             tls: t.tls,
-            application_name: "sluice".into(),
             // A launched connection has no profile yet: D-010's default.
             statement_timeout: crate::execution::statement_timeout(None),
+            budget: sluice_core::DEFAULT_CONNECTION_BUDGET,
         };
-        let timeout = spec.statement_timeout;
+        let timeout = target.statement_timeout;
 
-        let redactor = sluice_core::Redactor::new(spec.password.clone());
-        let driver = logged("connect", &launch_id, None, |_| None, PgDriver::connect(spec))
+        let redactor = sluice_core::Redactor::new(target.password.clone());
+        let driver = logged("connect", &launch_id, None, |_| None, crate::engines::connect(target))
             .await
             .map_err(|e| redactor.error(e))?;
         let capabilities = driver.capabilities();
@@ -441,6 +416,7 @@ pub async fn connect_launch(
                 ephemeral_url: Some(pending.url.clone()),
                 target: ProfileMeta {
                     id: launch_id.clone(),
+                    engine: t.engine,
                     label: format!("{}@{}", t.database, t.host),
                     host: t.host.clone(),
                     port: t.port,
@@ -508,14 +484,14 @@ pub async fn open_browse_stream(
             let stop: Arc<std::sync::Mutex<Option<Stop>>> = Arc::default();
             let emit = {
                 let (gate, on_event, seq, stop) = (gate.clone(), on_event.clone(), seq.clone(), stop.clone());
-                move |batch: sluice_postgres::BrowseBatch| {
+                sluice_core::sink(move |batch: sluice_core::BrowseBatch| {
                     let (gate, on_event, seq, stop) = (gate.clone(), on_event.clone(), seq.clone(), stop.clone());
                     async move {
                         match batch {
-                            sluice_postgres::BrowseBatch::Columns(columns, edit) => {
+                            sluice_core::BrowseBatch::Columns(columns, edit) => {
                                 on_event.send(StreamEvent::Columns { columns, edit }).is_ok()
                             }
-                            sluice_postgres::BrowseBatch::Rows(rows) => match gate.acquire(deadline).await {
+                            sluice_core::BrowseBatch::Rows(rows) => match gate.acquire(deadline).await {
                                 Ok(()) => {
                                     let n = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                                     on_event.send(StreamEvent::Rows { seq: n, rows }).is_ok()
@@ -527,7 +503,7 @@ pub async fn open_browse_stream(
                             },
                         }
                     }
-                }
+                })
             };
             let started = std::time::Instant::now();
             let result =
@@ -851,7 +827,7 @@ pub async fn apply_edits(
 #[derive(Serialize, Clone, Debug)]
 pub struct EditorOpened {
     pub editor_id: String,
-    pub status: sluice_postgres::pinned::SessionStatus,
+    pub status: sluice_core::SessionStatus,
 }
 
 /// T-041: pin a connection for one editor tab, for its lifetime.
@@ -898,7 +874,7 @@ pub async fn open_editor(
 #[derive(Serialize, Clone, Debug)]
 pub struct EditorRun {
     pub run: ScriptRun,
-    pub status: sluice_postgres::pinned::SessionStatus,
+    pub status: sluice_core::SessionStatus,
 }
 
 /// T-041: run a script on the editor's pinned session. Cancellable by
@@ -932,7 +908,7 @@ pub async fn run_in_editor(
         let p = pinned.clone();
         let call = crate::execution::run(&state.queries, query_id, d, limit, |d| async move {
             let mut s = p.lock().await;
-            d.run_pinned(&mut s, &script).await
+            d.run_pinned(&mut **s, script).await
         });
         let result = logged("editor_script", &session_id, Some(&text), rows_in, call).await;
         let status = pinned.lock().await.status();
@@ -954,7 +930,7 @@ pub async fn editor_transaction(
     editors: tauri::State<'_, Arc<crate::editor::Editors>>,
     editor_id: String,
     action: String,
-) -> Result<sluice_postgres::pinned::SessionStatus, DriverError> {
+) -> Result<sluice_core::SessionStatus, DriverError> {
     // T-042: a released editor is refused until it reconnects explicitly.
     if let Some(why) = editors.released(&editor_id).await {
         return Err(DriverError::new(ErrorKind::ConnectionFailed, why));
@@ -1102,7 +1078,7 @@ pub async fn fetch_value(
 ) -> Result<WireValue, DriverError> {
     let r = guard_driver_call(&sid(&session_id), async {
         let d = state.driver(&session_id).await?;
-        logged("fetch_value", &session_id, None, |_| Some(1), d.fetch_value(&handle)).await
+        logged("fetch_value", &session_id, None, |_| Some(1), d.fetch_value(handle)).await
     })
     .await;
     state.redacted(&session_id, r).await
@@ -1138,7 +1114,7 @@ pub async fn save_value_to_file(
         let name = if safe.is_empty() { "sluice-value".to_string() } else { safe };
         let dest = dir.join(format!("{name}-{}", short_token()));
 
-        let bytes = driver.stream_value_to_file(&handle, &dest).await?;
+        let bytes = driver.stream_value_to_file(handle, dest.clone()).await?;
         Ok(SavedFile { path: dest.to_string_lossy().to_string(), bytes })
     })
     .await
@@ -1148,6 +1124,135 @@ pub async fn save_value_to_file(
 pub struct SavedFile {
     pub path: String,
     pub bytes: u64,
+}
+
+/// What to export (T-074).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExportSource {
+    /// A browsed relation: its filter and sort apply; limit and paging do not.
+    Browse { request: BrowseRequest },
+    /// A raw statement, re-run read-only. Exactly one statement.
+    Query { script: String },
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ExportedFile {
+    pub path: String,
+    pub rows: u64,
+}
+
+/// T-074 / D-024: stream a full result to a file — the next action D-010's
+/// truncation notice offers.
+///
+/// Rows go from the server cursor straight into the file writer here in the
+/// core; none of them cross into the webview. The destination is derived the
+/// same way as `save_value_to_file`'s (downloads directory, sanitized name),
+/// for the same reasons. The file is written under a `.part` name and renamed
+/// only when complete, so a cancelled or failed export never leaves a file
+/// that looks whole. Cancellable by `query_id` and bounded by the profile's
+/// statement timeout (T-051).
+#[tauri::command]
+pub async fn export_result(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    source: ExportSource,
+    format: sluice_core::ExportFormat,
+    suggested_name: String,
+    query_id: Option<String>,
+) -> Result<ExportedFile, DriverError> {
+    use sluice_core::{ExportBatch, ExportWriter, SqlLiterals};
+    use std::io::BufWriter;
+
+    let r = guard_driver_call(&sid(&session_id), async {
+        let d = state.driver(&session_id).await?;
+        let limit = state.timeout(&session_id).await;
+
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .ok_or_else(|| DriverError::new(ErrorKind::Unknown, "no downloads directory"))?;
+        let safe: String = suggested_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .take(80)
+            .collect();
+        let name = if safe.is_empty() { "sluice-export".to_string() } else { safe };
+        let dest = dir.join(format!("{name}-{}.{}", short_token(), format.extension()));
+        let part = dest.with_extension(format!("{}.part", format.extension()));
+
+        // T-076: the engine spells its own INSERT literals.
+        let sql = match format {
+            sluice_core::ExportFormat::SqlInsert => Some(match &source {
+                ExportSource::Browse { request } => d.export_literals(Some(request.relation.clone()), String::new())?,
+                ExportSource::Query { .. } => d.export_literals(None, "query_result".into())?,
+            }),
+            _ => None,
+        };
+
+        type Sink = Option<ExportWriter<BufWriter<std::fs::File>>>;
+        let sink: Arc<std::sync::Mutex<(Sink, Option<Box<dyn SqlLiterals>>)>> =
+            Arc::new(std::sync::Mutex::new((None, sql)));
+        let failure: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let emit = {
+            let (sink, failure, part) = (sink.clone(), failure.clone(), part.clone());
+            sluice_core::sink(move |batch: ExportBatch| {
+                let mut guard = sink.lock().unwrap_or_else(|p| p.into_inner());
+                let result: Result<(), String> = (|| match batch {
+                    ExportBatch::Columns(columns) => {
+                        let file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+                        let sql = guard.1.take();
+                        guard.0 = Some(
+                            ExportWriter::new(BufWriter::new(file), format, columns, sql).map_err(|e| e.to_string())?,
+                        );
+                        Ok(())
+                    }
+                    ExportBatch::Rows(rows) => {
+                        let w = guard.0.as_mut().ok_or("rows before columns")?;
+                        rows.iter().try_for_each(|r| w.write_row(r)).map_err(|e| e.to_string())
+                    }
+                })();
+                let ok = match result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        false
+                    }
+                };
+                std::future::ready(ok)
+            })
+        };
+
+        let call = crate::execution::run(&state.queries, query_id, d, limit, move |d| async move {
+            match source {
+                ExportSource::Browse { request } => d.export_browse(request, BATCH_ROWS, emit).await,
+                ExportSource::Query { script } => d.export_query(script, BATCH_ROWS, emit).await,
+            }
+        });
+        let outcome = logged("export", &session_id, None, |e| Some(e.rows as usize), call).await;
+
+        let written = sink.lock().unwrap_or_else(|p| p.into_inner()).0.take().map(|w| w.finish());
+        let failure = failure.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let done = match (outcome, failure, written) {
+            (Ok(end), None, Some(Ok(_))) if !end.stopped => Ok(end.rows),
+            (Err(e), _, _) => Err(e),
+            (_, Some(msg), _) => Err(DriverError::new(ErrorKind::Unknown, msg)),
+            (_, _, Some(Err(e))) => Err(DriverError::new(ErrorKind::Unknown, e.to_string())),
+            _ => Err(DriverError::new(ErrorKind::Cancelled, "the export was stopped")),
+        };
+        match done {
+            Ok(rows) => {
+                std::fs::rename(&part, &dest)
+                    .map_err(|e| DriverError::new(ErrorKind::PermissionDenied, e.to_string()))?;
+                Ok(ExportedFile { path: dest.to_string_lossy().to_string(), rows })
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                Err(e)
+            }
+        }
+    })
+    .await;
+    state.redacted(&session_id, r).await
 }
 
 #[tauri::command]
@@ -1199,7 +1304,7 @@ mod boundary_tests {
     /// T-044: raising the budget is allowed and said plainly; the default is not.
     #[test]
     fn a_raised_budget_carries_the_max_connections_warning() {
-        assert_eq!(budget_warning(sluice_postgres::DEFAULT_CONNECTION_BUDGET, Some(100)), None);
+        assert_eq!(budget_warning(sluice_core::DEFAULT_CONNECTION_BUDGET, Some(100)), None);
         let w = budget_warning(20, Some(100)).unwrap();
         assert!(w.contains("20 connections") && w.contains("max_connections is 100"), "{w}");
         assert!(budget_warning(20, None).unwrap().contains("max_connections"));
@@ -1235,19 +1340,19 @@ mod boundary_tests {
         let creds = CredentialStore::with_fallback_dir(dir);
         let env = |v: &str| (v == "SET").then(|| "from-env".to_string());
 
-        let (pw, _) = resolve_auth(&creds, "p", &CredentialProvider::Env { var: "SET".into() }, env).unwrap();
+        let (pw, _) = crate::engines::resolve_auth(&creds, "p", &CredentialProvider::Env { var: "SET".into() }, env).unwrap();
         assert_eq!(pw.unwrap().expose(), "from-env");
 
-        let e = resolve_auth(&creds, "p", &CredentialProvider::Env { var: "UNSET".into() }, env).unwrap_err();
+        let e = crate::engines::resolve_auth(&creds, "p", &CredentialProvider::Env { var: "UNSET".into() }, env).unwrap_err();
         assert!(e.message.contains("UNSET"), "{}", e.message);
         assert!(!e.message.contains("from-env"));
 
         // No stored password is not an error: trust auth and .pgpass may apply.
-        let (pw, why) = resolve_auth(&creds, "p", &CredentialProvider::Keychain {}, env).unwrap();
+        let (pw, why) = crate::engines::resolve_auth(&creds, "p", &CredentialProvider::Keychain {}, env).unwrap();
         assert!(pw.is_none() && why.is_none());
 
         for p in [CredentialProvider::Static {}, CredentialProvider::IamToken {}] {
-            assert!(resolve_auth(&creds, "p", &p, env).is_err(), "{p:?}");
+            assert!(crate::engines::resolve_auth(&creds, "p", &p, env).is_err(), "{p:?}");
         }
     }
 
@@ -1330,6 +1435,7 @@ mod boundary_tests {
     fn no_ipc_type_can_carry_a_credential() {
         let p = ProfileMeta {
             id: "prod".into(),
+            engine: Engine::Postgres,
             label: "Production".into(),
             host: "db.internal".into(),
             port: 5432,
@@ -1356,6 +1462,7 @@ mod boundary_tests {
         let saved = SavedProfile {
             profile: ProfileMeta {
                 id: "profile-1".into(),
+                engine: Engine::Postgres,
                 label: "Ops".into(),
                 host: "db.prod.internal".into(),
                 port: 5432,

@@ -31,7 +31,7 @@ export function CellEditor({
     <button
       type="button"
       title="Set NULL"
-      className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-secondary"
+      className="focus-glow shrink-0 rounded border border-transparent px-1 text-2xs text-muted-foreground hover:bg-accent"
       // Fires before the input's blur would commit the typed text.
       onMouseDown={(e) => {
         e.preventDefault();
@@ -62,7 +62,7 @@ export function CellEditor({
     return (
       <select
         autoFocus
-        className="w-full rounded border border-input bg-background text-sm"
+        className="focus-glow h-6 w-full rounded border border-input bg-background text-sm"
         defaultValue={value.t === "bool" ? String(value.v) : "null"}
         onChange={(e) => {
           const v = e.target.value;
@@ -93,7 +93,7 @@ export function CellEditor({
           spellCheck={false}
           autoComplete="off"
           aria-invalid={error !== null}
-          className="w-full min-w-0 rounded border border-input bg-background px-1 font-mono text-sm outline-none focus:ring-1 focus:ring-ring aria-[invalid=true]:border-destructive"
+          className="focus-glow w-full min-w-0 rounded border border-primary/70 bg-background px-1.5 font-mono text-data outline-none aria-[invalid=true]:border-destructive"
           value={text}
           onChange={(e) => {
             setText(e.target.value);

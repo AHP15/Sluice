@@ -96,9 +96,14 @@ export interface NodeKind {
   is_relation: boolean;
 }
 
+/** T-014: how many values an operator takes, declared by the driver. */
+export type FilterArity = "none" | "one" | "two" | "list";
+
 export interface FilterOpDecl {
   id: string;
   label: string;
+  /** T-014: which value inputs to render — declared, never inferred from the id. */
+  arity: FilterArity;
   type_classes: TypeClass[];
   case_sensitive: boolean | null;
   /** T-015: the operator honours `Predicate.case_insensitive`. */
@@ -313,9 +318,24 @@ export type CredentialProvider =
   | { provider: "env"; var: string }
   | { provider: "iam-token" };
 
+/**
+ * T-075 / D-022: the database engine a profile connects to. Whether this build
+ * can connect to it is the core's call at connect time.
+ */
+export type Engine = "postgres" | "sqlserver" | "mongodb";
+
+/** The connect form's choices, with each engine's default port. */
+export const ENGINES: { id: Engine; label: string; port: number }[] = [
+  { id: "postgres", label: "Postgres", port: 5432 },
+  { id: "sqlserver", label: "SQL Server", port: 1433 },
+  { id: "mongodb", label: "MongoDB", port: 27017 },
+];
+
 export interface ProfileMeta {
   id: string;
   label: string;
+  /** T-075: absent means postgres, the only engine older profiles could mean. */
+  engine?: Engine;
   host: string;
   port: number;
   user: string;
@@ -349,6 +369,8 @@ export type LaunchOrigin =
 
 /** A launched connection, as the UI sees it — never with a credential (D-007). */
 export interface LaunchTarget {
+  /** T-075: the engine the URL's scheme names. */
+  engine: Engine;
   scheme: string;
   host: string;
   port: number;

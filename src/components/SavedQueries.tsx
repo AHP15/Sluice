@@ -35,10 +35,10 @@ export function SavedQueries({
   };
 
   return (
-    <div className="relative flex items-center gap-1 border-b px-2 py-0.5 text-xs">
+    <div className="relative flex h-9 shrink-0 items-center gap-1.5 border-b px-3 text-xs">
       <select
         aria-label="Saved queries"
-        className="max-w-48 rounded border border-input bg-transparent px-1 py-0.5"
+        className="max-w-48 focus-glow h-6 rounded border border-input bg-background px-1.5"
         value={selected}
         onChange={(e) => {
           setSelected(e.target.value);
@@ -57,7 +57,7 @@ export function SavedQueries({
         <button
           type="button"
           aria-label="Delete saved query"
-          className="rounded p-0.5 text-muted-foreground hover:text-destructive"
+          className="focus-glow rounded border border-transparent p-1 text-muted-foreground hover:text-destructive"
           onClick={() =>
             void run(async () => {
               const v = await deleteQuery(selected);
@@ -89,7 +89,7 @@ export function SavedQueries({
           <input
             autoFocus
             aria-label="Query name"
-            className="w-40 rounded border border-input bg-transparent px-1 py-0.5"
+            className="w-40 focus-glow h-6 rounded border border-input bg-background px-1.5"
             placeholder="Name this query"
             value={label}
             onChange={(e) => setLabel(e.target.value)}
@@ -99,7 +99,7 @@ export function SavedQueries({
       ) : (
         <button
           type="button"
-          className="flex items-center gap-1 rounded px-1 py-0.5 text-muted-foreground hover:text-foreground"
+          className="flex items-center gap-1 focus-glow h-6 rounded border border-transparent px-1.5 text-muted-foreground transition-colors duration-interact hover:bg-accent hover:text-foreground"
           onClick={() => setNaming(true)}
         >
           <Save className="h-3.5 w-3.5" />
@@ -109,7 +109,7 @@ export function SavedQueries({
       {err && <span className="truncate text-destructive">{err}</span>}
       <button
         type="button"
-        className="ml-auto flex items-center gap-1 rounded px-1 py-0.5 text-muted-foreground hover:text-foreground"
+        className="ml-auto flex items-center gap-1 focus-glow h-6 rounded border border-transparent px-1.5 text-muted-foreground transition-colors duration-interact hover:bg-accent hover:text-foreground"
         aria-expanded={showHistory}
         onClick={() => setShowHistory((v) => !v)}
       >

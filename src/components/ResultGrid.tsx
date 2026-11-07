@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   flexRender,
   getCoreRowModel,
@@ -12,7 +12,9 @@ import { formatBytes, isAbsent, renderValue } from "../lib/contract";
 import { fetchValue, saveValueToFile } from "../lib/ipc";
 import { cellReadOnlyReason, pendingCount, staged, type Pending } from "../lib/pendingEdits";
 import { cn } from "../lib/utils";
+import { useUiStore } from "../store/ui";
 import { CellEditor } from "./CellEditor";
+import { ExportActions, type GridExport } from "./ExportActions";
 
 type Row = WireValue[];
 
@@ -45,21 +47,31 @@ export interface GridEditing {
  *   selection and staged-edit state live in TanStack Table's model, not in
  *   hand-rolled arrays — the reason D-023 chose a headless table.
  */
+/** D-031 §3: numeric columns are right-aligned so digits line up. */
+function isNumeric(c: ColumnDesc | undefined): boolean {
+  return !!c && (c.type_class === "integer" || c.type_class === "exact_numeric" || c.type_class === "float");
+}
+
 export function ResultGrid({
   sessionId,
   columns,
   rows,
   truncated,
   editing,
+  exporting,
 }: {
   sessionId: string;
   columns: ColumnDesc[];
   rows: WireValue[][];
   truncated: boolean;
   editing?: GridEditing;
+  /** T-074: offered on the truncation notice, D-010's escape hatch. */
+  exporting?: GridExport;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const rowHeight = 28;
+  // D-031 §5: compact 28px or comfortable 34px, matching `--row-h`.
+  const density = useUiStore((st) => st.density);
+  const rowHeight = density === "comfortable" ? 34 : 28;
 
   // One definition per descriptor. Accessors index the row positionally — the
   // contract's rows are arrays aligned with `columns`, and column names are not
@@ -71,15 +83,20 @@ export function ResultGrid({
         accessorFn: (row: Row) => row[i],
         size: 180,
         minSize: 60,
+        // D-031 §3: carried on the definition so cells read it directly.
+        meta: { numeric: isNumeric(c) },
         header: () => (
           <>
-            <div className="truncate">{c.name}</div>
-            <div className="truncate text-[10px] font-normal text-muted-foreground">
-              {c.type_name}
-              {/* Schemaless engines: the column's type varied row to row,
-                  so the descriptor is wrong for some of them (T-073 F-2). */}
-              {c.mixed && <span className="text-destructive"> · mixed</span>}
-              {c.derived && <span> · inferred</span>}
+            <div className={cn("flex min-w-0 items-baseline gap-1.5", isNumeric(c) && "justify-end")}>
+              <span className="truncate text-foreground">{c.name}</span>
+              <span className="truncate text-2xs font-normal text-muted-foreground/80">
+                {c.type_name}
+                {/* Schemaless engines: the column's type varied row to row,
+                    so the descriptor is wrong for some of them (T-073 F-2).
+                    D-032: a caution, not a failure. */}
+                {c.mixed && <span className="text-caution"> · mixed</span>}
+                {c.derived && <span> · inferred</span>}
+              </span>
             </div>
           </>
         ),
@@ -124,23 +141,25 @@ export function ResultGrid({
     estimateSize: () => rowHeight,
     overscan: 12,
   });
+  // A density switch changes every row's height at once.
+  useEffect(() => virtualizer.measure(), [rowHeight, virtualizer]);
   const items = virtualizer.getVirtualItems();
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
         <table
-          className="border-collapse text-sm"
+          className="border-separate border-spacing-0 text-data"
           style={{ tableLayout: "fixed", width: table.getTotalSize() }}
         >
-          <thead className="sticky top-0 z-10 bg-secondary">
+          <thead className="sticky top-0 z-10 bg-panel">
             {table.getHeaderGroups().map((group) => (
               <tr key={group.id}>
                 {group.headers.map((h) => (
                   <th
                     key={h.id}
                     style={{ width: h.getSize() }}
-                    className="relative border-b border-r px-2 py-1 text-left align-top font-medium"
+                    className="relative h-row border-b border-r border-b-border-strong px-3 text-left align-middle font-mono text-xs font-medium"
                   >
                     {flexRender(h.column.columnDef.header, h.getContext())}
                     <div
@@ -150,7 +169,7 @@ export function ResultGrid({
                       onMouseDown={h.getResizeHandler()}
                       onTouchStart={h.getResizeHandler()}
                       className={cn(
-                        "absolute right-0 top-0 h-full w-1 cursor-col-resize select-none hover:bg-primary",
+                        "absolute right-0 top-0 h-full w-1 cursor-col-resize select-none transition-colors duration-interact hover:bg-primary",
                         h.column.getIsResizing() && "bg-primary",
                       )}
                     />
@@ -164,12 +183,16 @@ export function ResultGrid({
             {items.map((vi) => {
               const row = model[vi.index];
               return (
-                <tr key={row.id} style={{ height: rowHeight }} className="hover:bg-accent">
+                <tr key={row.id} style={{ height: rowHeight }} className="transition-colors duration-interact hover:bg-accent/50">
                   {row.getVisibleCells().map((cell) => (
                     <td
                       key={cell.id}
                       style={{ width: cell.column.getSize() }}
-                      className="overflow-hidden border-b border-r px-2 align-middle font-mono"
+                      className={cn(
+                        "overflow-hidden border-b border-r border-border/70 px-3 align-middle font-mono",
+                        // D-031 §3: numbers line up — right-aligned, tabular.
+                        (cell.column.columnDef.meta as { numeric?: boolean } | undefined)?.numeric && "text-right",
+                      )}
                     >
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}
                     </td>
@@ -189,7 +212,7 @@ export function ResultGrid({
           <div className="p-6 text-center text-sm text-muted-foreground">No rows</div>
         )}
       </div>
-      <div className="flex items-center gap-2 border-t px-2 py-1 text-xs text-muted-foreground">
+      <div className="flex min-h-8 flex-wrap items-center gap-x-3 gap-y-1 border-t bg-panel px-3 py-1 text-xs text-muted-foreground">
         {editing?.gate.state === "read_only" && (
           <span className="flex items-center gap-1" title={editing.gate.reason}>
             <Lock className="h-3 w-3" />
@@ -207,7 +230,7 @@ export function ResultGrid({
             <button
               type="button"
               disabled={editing.applying}
-              className="rounded bg-primary px-2 py-0.5 text-primary-foreground disabled:opacity-50"
+              className="focus-glow h-6 rounded bg-primary px-2.5 font-semibold text-primary-foreground transition-opacity duration-interact hover:opacity-90 disabled:opacity-50"
               onClick={editing.onApply}
             >
               {editing.applying ? "Working…" : "Review & apply…"}
@@ -215,7 +238,7 @@ export function ResultGrid({
             <button
               type="button"
               disabled={editing.applying}
-              className="rounded px-2 py-0.5 hover:bg-secondary disabled:opacity-50"
+              className="focus-glow h-6 rounded border border-border-strong bg-raised px-2.5 transition-colors duration-interact hover:border-muted-foreground/50 disabled:opacity-50"
               onClick={editing.onDiscard}
             >
               Discard
@@ -223,14 +246,16 @@ export function ResultGrid({
             <span className="text-muted-foreground">applied in one transaction · no undo after</span>
           </span>
         )}
-        <span>
+        <span className="font-mono text-2xs">
           {rows.length} rows · {items.length} rendered
         </span>
+        {/* D-032: truncation is a caution — there is more than is shown. */}
         {truncated && (
-          <span className="rounded bg-secondary px-1.5 py-0.5">
+          <span className="inline-flex h-5 items-center rounded-sm border border-caution/60 bg-caution/10 px-1.5 text-2xs text-caution">
             truncated — more rows available
           </span>
         )}
+        {truncated && exporting && <ExportActions exporting={exporting} />}
       </div>
     </div>
   );
@@ -266,7 +291,7 @@ function Cell({
             <button
               type="button"
               title="Load this value"
-              className="rounded px-1 hover:bg-secondary"
+              className="focus-glow rounded border border-transparent px-1 hover:bg-accent"
               onClick={async () => {
                 setBusy(true);
                 setNote(null);
@@ -284,7 +309,7 @@ function Cell({
             <button
               type="button"
               title="Save to file"
-              className="rounded px-1 hover:bg-secondary"
+              className="focus-glow rounded border border-transparent px-1 hover:bg-accent"
               onClick={async () => {
                 setBusy(true);
                 setNote(null);
@@ -302,7 +327,7 @@ function Cell({
             </button>
           </>
         )}
-        {note && <span className="truncate text-[10px]">{note}</span>}
+        {note && <span className="truncate text-2xs">{note}</span>}
       </span>
     );
   }
@@ -359,7 +384,11 @@ function EditableCell({
 
   return (
     <div
-      className={cn("flex items-center gap-1", pending !== undefined && "-mx-2 bg-primary/15 px-2")}
+      className={cn(
+        "flex items-center gap-1",
+        // D-032: a staged, unapplied change is a caution until applied.
+        pending !== undefined && "-mx-3 bg-caution/10 px-3 shadow-inset-caution",
+      )}
       title={reason ?? (pending !== undefined ? `was: ${renderValue(read)}` : "Double-click to edit")}
       onDoubleClick={() => {
         if (!reason && !disabled) setOpen(true);
@@ -369,7 +398,12 @@ function EditableCell({
         <Cell sessionId={sessionId} value={shown} column={column} />
       </div>
       {pending !== undefined && !disabled && (
-        <button type="button" title="Revert this cell" className="shrink-0 rounded hover:bg-secondary" onClick={onUnstage}>
+        <button
+          type="button"
+          title="Revert this cell"
+          className="focus-glow shrink-0 rounded border border-transparent p-0.5 text-muted-foreground hover:text-foreground"
+          onClick={onUnstage}
+        >
           <Undo2 className="h-3 w-3" />
         </button>
       )}

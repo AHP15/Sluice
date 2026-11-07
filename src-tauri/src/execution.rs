@@ -21,8 +21,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sluice_core::{DriverError, ErrorKind};
-use sluice_postgres::{CancelSlot, PgDriver};
+use sluice_core::{CancelSlot, Driver, DriverError, ErrorKind};
 use tokio::task::AbortHandle;
 
 /// How long a cancelled query gets to stop before its connection is dropped.
@@ -41,7 +40,7 @@ pub fn statement_timeout(secs: Option<u32>) -> Option<Duration> {
 }
 
 struct Running {
-    driver: Arc<PgDriver>,
+    driver: Arc<dyn Driver>,
     slot: CancelSlot,
     abort: AbortHandle,
 }
@@ -81,13 +80,13 @@ impl Queries {
 pub async fn run<T, F, Fut>(
     queries: &Queries,
     query_id: Option<String>,
-    driver: Arc<PgDriver>,
+    driver: Arc<dyn Driver>,
     limit: Option<Duration>,
     call: F,
 ) -> Result<T, DriverError>
 where
     T: Send + 'static,
-    F: FnOnce(Arc<PgDriver>) -> Fut,
+    F: FnOnce(Arc<dyn Driver>) -> Fut,
     Fut: Future<Output = Result<T, DriverError>> + Send + 'static,
 {
     let slot = CancelSlot::default();
@@ -130,26 +129,8 @@ where
 mod tests {
     use super::*;
 
-    async fn driver() -> Option<Arc<PgDriver>> {
-        use sluice_core::Secret;
-        use sluice_postgres::{tls::TlsMode, ConnectSpec};
-        let spec = ConnectSpec {
-            host: "localhost".into(),
-            port: 55432,
-            user: "postgres".into(),
-            password: Some(Secret::new("sluice_dev".into())),
-            dbname: "sluice_dev".into(),
-            tls: TlsMode::Disabled,
-            application_name: "sluice-exec-test".into(),
-            statement_timeout: None,
-        };
-        match PgDriver::connect(spec).await {
-            Ok(d) => Some(d),
-            Err(_) => {
-                eprintln!("SKIP: no Postgres reachable");
-                None
-            }
-        }
+    async fn driver() -> Option<Arc<dyn Driver>> {
+        crate::engines::test_postgres(sluice_core::DEFAULT_CONNECTION_BUDGET).await
     }
 
     /// D-010's fallback: a call the engine's cancel cannot stop is dropped

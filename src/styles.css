@@ -11,46 +11,108 @@
      - color-mix() / oklch()      (the reason Tailwind v3 is used, not v4)
      - :has()                     (support is uneven at the floor)
      - text-wrap: balance, anchor positioning
+     - backdrop-filter            (D-031: the expensive path on Linux)
 
    Layout uses flexbox and plain grid only; theming uses custom properties and
-   hsl(), which the floor has supported for years. */
+   hsl(), which the floor has supported for years.
+
+   T-092 / D-031: the instrument-panel tokens. DARK is the default and lives on
+   :root; `.light` overrides it. Every value is "H S% L%" so Tailwind's
+   `hsl(var(--x) / <alpha>)` opacity modifiers keep working. Components use
+   these through Tailwind classes only — never a raw colour (check:tokens). */
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222 47% 11%;
-    --border: 214 32% 91%;
-    --input: 214 32% 91%;
-    --ring: 187 65% 40%;
-    --primary: 187 65% 36%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 210 40% 96%;
-    --secondary-foreground: 222 47% 11%;
-    --muted: 210 40% 96%;
-    --muted-foreground: 215 16% 47%;
-    --accent: 210 40% 96%;
-    --accent-foreground: 222 47% 11%;
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 0 0% 100%;
-    --radius: 0.5rem;
+    /* Surfaces — depth by luminance, not shadow (D-031 §4). */
+    --background: 216 37% 7%;      /* base   #0B1018 */
+    --panel: 220 38% 11%;          /* panel  #111826 */
+    --raised: 220 37% 15%;         /* raised #172033 */
+    --foreground: 215 52% 94%;     /* #E6EDF7 */
+    --muted-foreground: 218 20% 62%; /* #8A99B3 */
+    /* Hairlines, pre-blended so `border-border/50` still composes. */
+    --border: 218 26% 18%;
+    --border-strong: 217 24% 26%;
+    --input: 218 26% 20%;
+
+    /* The one accent: interaction only (D-032). */
+    --primary: 188 86% 53%;        /* #22D3EE */
+    --primary-foreground: 216 37% 7%;
+    --ring: 188 86% 53%;
+
+    /* shadcn's names, mapped onto the surfaces. */
+    --secondary: 220 37% 15%;
+    --secondary-foreground: 215 52% 94%;
+    --muted: 220 38% 11%;
+    --accent: 219 34% 19%;          /* hover/active fill, not the accent hue */
+    --accent-foreground: 215 52% 94%;
+
+    /* D-032 reserved status hues — never decorative. */
+    --destructive: 1 85% 68%;      /* danger  #F26B68 */
+    --destructive-foreground: 216 37% 7%;
+    --caution: 40 90% 61%;         /* #F5B841 */
+    --caution-foreground: 216 37% 7%;
+    --verified: 151 65% 54%;       /* #3DD68C */
+    --verified-foreground: 216 37% 7%;
+    --info: 255 92% 76%;           /* #A78BFA */
+    --info-foreground: 216 37% 7%;
+
+    /* Syntax: desaturated, outside the accent and status hues (D-031 §2). */
+    --syn-keyword: 205 45% 74%;
+    --syn-string: 330 35% 76%;
+    --syn-number: 45 25% 72%;
+
+    /* Floating layers only (D-031 §4). */
+    --shadow-float: 216 60% 2%;
+    --overlay: 216 50% 3%;
+
+    --radius: 4px;
+    /* D-031 §5: compact by default; `.comfortable` raises it. */
+    --row-h: 28px;
+
+    color-scheme: dark;
   }
 
-  .dark {
-    --background: 200 30% 8%;
-    --foreground: 210 40% 96%;
-    --border: 200 20% 20%;
-    --input: 200 20% 20%;
-    --ring: 174 60% 45%;
-    --primary: 174 60% 45%;
-    --primary-foreground: 200 30% 8%;
-    --secondary: 200 24% 15%;
-    --secondary-foreground: 210 40% 96%;
-    --muted: 200 24% 15%;
-    --muted-foreground: 210 16% 65%;
-    --accent: 200 24% 15%;
-    --accent-foreground: 210 40% 96%;
-    --destructive: 0 62% 45%;
+  .light {
+    --background: 216 33% 97%;     /* #F6F8FB */
+    --panel: 0 0% 100%;
+    --raised: 214 32% 95%;         /* #EEF2F7 */
+    --foreground: 218 46% 10%;     /* #0E1726 */
+    --muted-foreground: 219 17% 41%; /* #55627A */
+    --border: 216 22% 87%;
+    --border-strong: 216 18% 78%;
+    --input: 216 22% 84%;
+
+    --primary: 192 82% 31%;        /* #0E7490 */
+    --primary-foreground: 0 0% 100%;
+    --ring: 192 82% 31%;
+
+    --secondary: 214 32% 95%;
+    --secondary-foreground: 218 46% 10%;
+    --muted: 0 0% 100%;
+    --accent: 214 30% 91%;
+    --accent-foreground: 218 46% 10%;
+
+    --destructive: 1 63% 43%;      /* #B42C29 */
     --destructive-foreground: 0 0% 100%;
+    --caution: 36 100% 27%;        /* #8A5300 */
+    --caution-foreground: 0 0% 100%;
+    --verified: 157 77% 26%;       /* #0F7550 */
+    --verified-foreground: 0 0% 100%;
+    --info: 254 52% 51%;           /* #5B3FC4 */
+    --info-foreground: 0 0% 100%;
+
+    --syn-keyword: 210 45% 34%;
+    --syn-string: 330 40% 38%;
+    --syn-number: 40 30% 32%;
+
+    --shadow-float: 216 40% 20%;
+    --overlay: 216 30% 20%;
+
+    color-scheme: light;
+  }
+
+  .comfortable {
+    --row-h: 34px;
   }
 
   * {
@@ -60,9 +122,82 @@
   body {
     background-color: hsl(var(--background));
     color: hsl(var(--foreground));
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    /* D-031 §3: bundled Inter (fontsource, local woff2 — the CSP forbids
+       remote fonts). Fallbacks only cover the instant before it loads. */
+    font-family: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 13px;
+    line-height: 1.4;
     margin: 0;
     /* The webview is a window chrome, not a document: never scroll the body. */
     overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* D-031 §3: tabular numerals wherever data is monospace. */
+  .font-mono {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.3);
+  }
+
+  /* D-031 §6: reduced motion means no motion at all. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      transition-duration: 0ms !important;
+      animation: none !important;
+    }
+  }
+}
+
+@layer components {
+  /* D-031 §4: the interaction glow — a 1px accent ring plus a soft halo.
+     Applied on focus, selection and the active tab only, never at rest. */
+  .glow {
+    box-shadow: 0 0 0 1px hsl(var(--ring) / 0.45), 0 0 12px hsl(var(--ring) / 0.25);
+  }
+  .focus-glow:focus-visible {
+    outline: none;
+    border-color: hsl(var(--ring));
+    box-shadow: 0 0 0 1px hsl(var(--ring) / 0.45), 0 0 12px hsl(var(--ring) / 0.25);
+  }
+
+  /* D-031 §6: the one looping motion — a thin scan line while a query runs.
+     Reduced motion hides it; the caller shows a static "Running…" instead. */
+  .scan-line {
+    height: 2px;
+    overflow: hidden;
+    background: hsl(var(--primary) / 0.15);
+  }
+  .scan-line > i {
+    display: block;
+    width: 30%;
+    height: 100%;
+    background: hsl(var(--primary));
+    animation: sluice-scan 1.4s ease-in-out infinite;
+  }
+  @keyframes sluice-scan {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .scan-line {
+      display: none;
+    }
+  }
+  .motion-reduce-label {
+    display: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .motion-reduce-label {
+      display: inline;
+    }
   }
 }

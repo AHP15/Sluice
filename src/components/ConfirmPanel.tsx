@@ -23,7 +23,7 @@ export function ConfirmPanel({
     <form
       role="alertdialog"
       aria-label="Confirm production statements"
-      className="space-y-1 border-b bg-destructive/10 px-3 py-2 text-xs"
+      className="space-y-1.5 border-b border-destructive/40 bg-destructive/10 px-3 py-2 text-xs"
       onSubmit={(e) => {
         e.preventDefault();
         if (ok) onConfirm(typed.trim());
@@ -48,7 +48,7 @@ export function ConfirmPanel({
             aria-label="Confirmation phrase"
             autoComplete="off"
             spellCheck={false}
-            className="w-48 rounded border border-input bg-background px-1 py-0.5 font-mono"
+            className="focus-glow h-6 w-48 rounded border border-destructive/50 bg-background px-1.5 font-mono"
             value={typed}
             onChange={(e) => setTyped(e.target.value)}
             onKeyDown={(e) => e.key === "Escape" && onCancel()}

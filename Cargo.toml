@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/sluice-core", "crates/sluice-config", "crates/sluice-postgres", "crates/sluice-state"]
+members = ["src-tauri", "crates/sluice-core", "crates/sluice-config", "crates/sluice-postgres", "crates/sluice-sqlserver", "crates/sluice-state"]
 
 # The spikes are throwaway probes (T-072, T-073, T-046) with their own
 # lockfiles. They must not contribute dependencies to the shipped app.

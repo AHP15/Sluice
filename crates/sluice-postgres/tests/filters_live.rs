@@ -134,3 +134,57 @@ async fn every_core_operator_returns_the_right_rows() {
     assert!(eq.case_insensitive_toggle);
     eprintln!("server collation: {:?}", caps.string_collation);
 }
+
+/// T-014 / D-005: the driver's extension operators are declared with their
+/// arity and type classes, outside the core set, and return the right rows.
+#[tokio::test]
+async fn declared_extension_operators_return_the_right_rows() {
+    use sluice_core::{is_extension_op, FilterArity, TypeClass};
+    let Some(d) = driver().await else { return };
+    let setup = r#"
+        drop table if exists filter_x;
+        create table filter_x(id int primary key, name text, n int8);
+        insert into filter_x values (1, 'alice', 10), (2, 'Alicia', 20), (3, 'bob', 30), (4, null, null);
+    "#;
+    d.raw(RawRequest::Script(setup.into())).await.unwrap();
+
+    let caps = d.capabilities();
+    let ext: Vec<_> = caps.filter_ops.iter().filter(|o| is_extension_op(&o.id)).collect();
+    let regex = ext.iter().find(|o| o.id == "matches_regex").expect("declared");
+    assert_eq!((regex.arity, regex.type_classes.as_slice()), (FilterArity::One, &[TypeClass::Text][..]));
+    let not_in = ext.iter().find(|o| o.id == "not_in").expect("declared");
+    assert_eq!(not_in.arity, FilterArity::List);
+    // Every core op carries its arity too.
+    let between = caps.filter_ops.iter().find(|o| o.id == "between").unwrap();
+    assert_eq!(between.arity, FilterArity::Two);
+
+    let ids_x = |f: FilterTree| {
+        let d = d.clone();
+        async move {
+            let r = d
+                .browse(BrowseRequest {
+                    relation: NodeId { kind: "table".into(), path: vec!["public".into(), "filter_x".into()] },
+                    filter: Some(f),
+                    sort: vec![SortKey { column: "id".into(), descending: false }],
+                    limit: 100,
+                    cursor: None,
+                    offset: None,
+                })
+                .await
+                .expect("browse");
+            r.first_rows().unwrap().1.iter().map(|r| r[0].clone()).collect::<Vec<_>>()
+        }
+    };
+    let i = |n: i64| WireValue::Int(n);
+
+    assert_eq!(ids_x(pred("name", "matches_regex", t("^ali"))).await, vec![i(1)]);
+    let mut folded = Predicate { case_insensitive: true, column: "name".into(), op: "matches_regex".into(), value: t("^ali") };
+    assert_eq!(ids_x(FilterTree::Pred(folded.clone())).await, vec![i(1), i(2)]);
+    // A pattern is a bound value: a quote in it is just a character.
+    folded.value = t("o'; drop table filter_x; --");
+    assert_eq!(ids_x(FilterTree::Pred(folded)).await, Vec::<WireValue>::new());
+
+    let list = WireValue::Array(vec![WireValue::Numeric("10".into()), WireValue::Numeric("30".into())]);
+    // Like `ne`, a NULL cell never matches.
+    assert_eq!(ids_x(pred("n", "not_in", list)).await, vec![i(2)]);
+}

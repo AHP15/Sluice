@@ -84,3 +84,52 @@ async fn the_budget_is_per_execution_in_order_and_never_stops_execution() {
     assert_eq!(r.budget.unwrap().exhausted_by, None);
     assert!(!r.summary().contains("display limit"));
 }
+
+/// R-042 (T-052 disposition): a script's results are drained at server speed,
+/// independent of anyone consuming them. A large first result past the budget
+/// does not hold the script between statements: the statements after it run,
+/// the implicit transaction ends with the call, and the connection is left
+/// with no transaction open — there is no credit to wait on in this path.
+#[tokio::test]
+async fn a_script_drains_past_a_large_result_and_leaves_no_transaction_open() {
+    let Some(d) = driver().await else { return };
+    let d = d.with_budget(ExecBudget { max_rows: 100, max_bytes: 1 << 20 });
+    d.raw(RawRequest::Script("DROP TABLE IF EXISTS t052_after; CREATE TABLE t052_after (n int);".into()))
+        .await
+        .unwrap();
+
+    let r = d
+        .raw(RawRequest::Script(
+            "SELECT g, repeat('x', 200) FROM generate_series(1, 200000) g;
+             INSERT INTO t052_after VALUES (1);
+             SELECT 'last' AS marker;"
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = r
+        .outcomes
+        .iter()
+        .map(|o| match &o.body {
+            OutcomeBody::Rows { truncated: true, .. } => "rows-truncated",
+            OutcomeBody::Rows { .. } => "rows",
+            OutcomeBody::Affected { .. } => "affected",
+            _ => "other",
+        })
+        .collect();
+    // The last result is truncated too: T-050's budget is per execution and
+    // was spent by the first. What matters here is that it *ran*.
+    assert_eq!(kinds, ["rows-truncated", "affected", "rows-truncated"]);
+
+    let after = d.raw(RawRequest::Script("SELECT count(*) FROM t052_after".into())).await.unwrap();
+    assert_eq!(after.first_rows().unwrap().1[0][0], sluice_core::WireValue::Text("1".into()));
+
+    let open = d
+        .raw(RawRequest::Script(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'sluice-budget' AND state LIKE 'idle in transaction%'"
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(open.first_rows().unwrap().1[0][0], sluice_core::WireValue::Text("0".into()));
+}

@@ -270,6 +270,31 @@ export function saveValueToFile(
   return invoke<SavedFile>("save_value_to_file", { sessionId, handle, suggestedName });
 }
 
+/** T-074 / D-024: what to export. A browse keeps its filter and sort and
+ * drops its limit; a query is re-run read-only and must be one statement. */
+export type ExportSource =
+  | { kind: "browse"; request: BrowseRequest }
+  | { kind: "query"; script: string };
+
+export type ExportFormat = "csv" | "jsonl" | "sql_insert";
+
+export interface ExportedFile {
+  path: string;
+  rows: number;
+}
+
+/** T-074: stream the full result to a file in the downloads directory. The
+ * rows never come back here — only the path and the count. */
+export function exportResult(
+  sessionId: string,
+  source: ExportSource,
+  format: ExportFormat,
+  suggestedName: string,
+  queryId: string | null = null,
+): Promise<ExportedFile> {
+  return invoke<ExportedFile>("export_result", { sessionId, source, format, suggestedName, queryId });
+}
+
 /** T-049: what a browse stream delivers, in order. */
 export type StreamEvent =
   | { kind: "columns"; columns: ColumnDesc[]; edit: EditGate }
