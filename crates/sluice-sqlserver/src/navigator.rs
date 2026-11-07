@@ -21,6 +21,11 @@ use crate::pool::Conn;
 
 const RELATION_KINDS: &[&str] = &["table", "view"];
 
+/// Whether a node of this kind can be browsed (T-082).
+pub fn is_relation_kind(kind: &str) -> bool {
+    RELATION_KINDS.contains(&kind)
+}
+
 pub fn node_kinds() -> Vec<NodeKind> {
     let kind = |id: &str, label: &str, has_children: bool, is_relation: bool| NodeKind {
         id: id.into(),
