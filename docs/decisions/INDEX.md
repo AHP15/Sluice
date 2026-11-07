@@ -30,3 +30,14 @@ D-029 | accepted | Three-part contract with a statement-outcome sequence result 
 D-030 | accepted | SQL Server cancellation: close-and-declare baseline, KILL only when verified
 D-031 | accepted | Instrument-panel visual direction for the UI overhaul
 D-032 | accepted | Status colours are reserved, never carried by the accent or by colour alone
+D-033 | superseded | Typed, closed per-engine connection options (→ D-042)
+D-034 | superseded | Engine-neutral connection address: host, seed list, or SRV (→ D-040)
+D-035 | accepted | Driver monitoring connections are declared overhead outside the budget
+D-036 | accepted | Mongo authSource is an option; the auth mechanism follows the credential provider
+D-037 | superseded | Connection URL parameters are mapped, ignore-listed, or refused (→ D-041)
+D-038 | accepted | Profile file format version 2, written only when needed
+D-039 | accepted | SRV TXT options: accept replicaSet and authSource, refuse loadBalanced
+D-040 | accepted | Engine-neutral connection address, with discovery confined to seed lists and SRV
+D-041 | accepted | Connection URL parameters are mapped, honoured as behaviour, ignore-listed, or refused
+D-042 | superseded | Typed, closed per-engine connection options, with TLS trust anchors and client identity (→ D-043)
+D-043 | accepted | Typed, closed per-engine connection options, with a pinned TLS trust anchor and client identity

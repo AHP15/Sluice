@@ -94,3 +94,21 @@ T-093 | done | M | D-011,D-014 | Persistent sidebar listing saved connections | 
 T-094 | done | S | D-011 | Name and rename connections | 2026-11-06
 T-095 | done | L | D-023,D-031,D-032 | Restyle the app shell, navigator, and editor to the new design | 2026-11-06
 T-096 | done | M | D-023,D-031,D-032 | Restyle the result grid, filter bar, and edit and confirm panels | 2026-11-06
+T-097 | todo | M | D-040 | Engine-neutral Address on Target and in the profile file |
+T-098 | todo | M | D-043 | Closed per-engine connection options |
+T-099 | todo | M | D-043 | TLS trust anchor and client identity across engines |
+T-100 | todo | S | R-060 | Portable certificate and key paths |
+T-101 | todo | M | D-038,R-053 | Profile file version 2 written only when needed |
+T-102 | todo | L | D-041 | Classify connection URL parameters per engine |
+T-103 | todo | S | D-036 | Refuse Mongo auth mechanisms without a credential provider |
+T-104 | todo | S | R-055 | Single host plus replicaSet maps to a one-element seed list |
+T-105 | todo | M | D-041,R-058 | Postgres behaviour under pgbouncer=true transaction pooling |
+T-106 | todo | M | D-040,R-047 | Mongo connection URI built only from validated typed values |
+T-107 | todo | M | D-040,R-056 | Mongo topology: direct for Host, discovery for seeds and SRV, tunnel refusal |
+T-108 | todo | M | R-057 | Confirm discovered members outside the configured seeds |
+T-109 | todo | M | D-040 | Guardrails over every configured and discovered member |
+T-110 | todo | M | D-036,R-048 | Mongo auth source default, visible field, and failure hint |
+T-111 | todo | M | D-039 | SRV TXT options, loadBalanced refusal, and DNS provenance |
+T-112 | todo | S | R-054 | Explain SRV resolution failures and verify over a VPN |
+T-113 | todo | M | D-035 | Declare Mongo monitoring sockets as budget overhead |
+T-114 | todo | M | R-046 | Split the budget across mongos routers |
