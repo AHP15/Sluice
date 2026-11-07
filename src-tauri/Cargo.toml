@@ -28,6 +28,8 @@ dirs = "5"
 sluice-postgres = { version = "0.1.0", path = "../crates/sluice-postgres" }
 # T-080: SQL Server, reached only through the engine factory (engines.rs).
 sluice-sqlserver = { version = "0.1.0", path = "../crates/sluice-sqlserver" }
+# T-087: MongoDB, reached only through the engine factory (engines.rs).
+sluice-mongo = { version = "0.1.0", path = "../crates/sluice-mongo" }
 sluice-config = { path = "../crates/sluice-config" }
 
 # T-029/D-026: the consent dialog is NATIVE, not a webview modal — it must be
