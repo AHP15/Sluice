@@ -23,47 +23,49 @@
 
 @layer base {
   :root {
-    /* Surfaces — depth by luminance, not shadow (D-031 §4). */
-    --background: 216 37% 7%;      /* base   #0B1018 */
-    --panel: 220 38% 11%;          /* panel  #111826 */
-    --raised: 220 37% 15%;         /* raised #172033 */
-    --foreground: 215 52% 94%;     /* #E6EDF7 */
-    --muted-foreground: 218 20% 62%; /* #8A99B3 */
+    /* Surfaces — VS Code "Dark Modern": neutral greys, no blue cast. Depth by
+       luminance, not shadow (D-031 §4): chrome is darkest, data sits on the
+       editor grey, controls are raised above both. */
+    --background: 0 0% 12%;        /* editor   #1F1F1F */
+    --panel: 0 0% 9%;              /* sidebar  #181818 */
+    --raised: 0 0% 19%;            /* control  #313131 */
+    --foreground: 0 0% 80%;        /* #CCCCCC */
+    --muted-foreground: 0 0% 62%;  /* #9D9D9D */
     /* Hairlines, pre-blended so `border-border/50` still composes. */
-    --border: 218 26% 18%;
-    --border-strong: 217 24% 26%;
-    --input: 218 26% 20%;
+    --border: 0 0% 17%;            /* #2B2B2B */
+    --border-strong: 0 0% 24%;     /* #3C3C3C */
+    --input: 0 0% 24%;             /* #3C3C3C */
 
-    /* The one accent: interaction only (D-032). */
-    --primary: 188 86% 53%;        /* #22D3EE */
-    --primary-foreground: 216 37% 7%;
-    --ring: 188 86% 53%;
+    /* The one accent: interaction only (D-032). Dark Modern's focus blue. */
+    --primary: 207 100% 42%;       /* #0078D4 */
+    --primary-foreground: 0 0% 100%;
+    --ring: 207 100% 42%;
 
     /* shadcn's names, mapped onto the surfaces. */
-    --secondary: 220 37% 15%;
-    --secondary-foreground: 215 52% 94%;
-    --muted: 220 38% 11%;
-    --accent: 219 34% 19%;          /* hover/active fill, not the accent hue */
-    --accent-foreground: 215 52% 94%;
+    --secondary: 0 0% 19%;
+    --secondary-foreground: 0 0% 80%;
+    --muted: 0 0% 9%;
+    --accent: 180 2% 17%;           /* list hover #2A2D2E, not the accent hue */
+    --accent-foreground: 0 0% 80%;
 
     /* D-032 reserved status hues — never decorative. */
     --destructive: 1 85% 68%;      /* danger  #F26B68 */
-    --destructive-foreground: 216 37% 7%;
+    --destructive-foreground: 0 0% 9%;
     --caution: 40 90% 61%;         /* #F5B841 */
-    --caution-foreground: 216 37% 7%;
+    --caution-foreground: 0 0% 9%;
     --verified: 151 65% 54%;       /* #3DD68C */
-    --verified-foreground: 216 37% 7%;
+    --verified-foreground: 0 0% 9%;
     --info: 255 92% 76%;           /* #A78BFA */
-    --info-foreground: 216 37% 7%;
+    --info-foreground: 0 0% 9%;
 
-    /* Syntax: desaturated, outside the accent and status hues (D-031 §2). */
-    --syn-keyword: 205 45% 74%;
-    --syn-string: 330 35% 76%;
-    --syn-number: 45 25% 72%;
+    /* Syntax: Dark Modern's own SQL colours. */
+    --syn-keyword: 207 61% 59%;    /* #569CD6 */
+    --syn-string: 17 47% 64%;      /* #CE9178 */
+    --syn-number: 99 28% 73%;      /* #B5CEA8 */
 
     /* Floating layers only (D-031 §4). */
-    --shadow-float: 216 60% 2%;
-    --overlay: 216 50% 3%;
+    --shadow-float: 0 0% 0%;
+    --overlay: 0 0% 0%;
 
     --radius: 4px;
     /* D-031 §5: compact by default; `.comfortable` raises it. */
