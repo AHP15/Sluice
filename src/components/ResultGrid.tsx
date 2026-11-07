@@ -6,8 +6,24 @@ import {
   type ColumnDef,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Download, Eye, Loader2, Lock, Undo2 } from "lucide-react";
-import type { ColumnDesc, EditGate, WireValue } from "../lib/contract";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Eye,
+  EyeOff,
+  Loader2,
+  Lock,
+  Pin,
+  PinOff,
+  Plus,
+  RefreshCw,
+  Undo2,
+  X,
+} from "lucide-react";
+import type { ColumnDesc, ColumnInference, EditGate, WireValue } from "../lib/contract";
+import * as columnLayout from "../lib/columnLayout";
+import type { CachedLayout, ColumnLayout, LayoutColumn } from "../lib/columnLayout";
 import { formatBytes, isAbsent, renderValue } from "../lib/contract";
 import { fetchValue, saveValueToFile } from "../lib/ipc";
 import { cellReadOnlyReason, pendingCount, staged, type Pending } from "../lib/pendingEdits";
@@ -30,6 +46,27 @@ export interface GridEditing {
   onApply: () => void;
   onDiscard: () => void;
   applying: boolean;
+}
+
+/**
+ * T-063 / D-018: a schemaless relation's columns are derived, so the grid
+ * offers the user control over them. `key` names the collection the layout
+ * and inference are cached under; `infer` re-runs inference, and is called
+ * only when nothing is cached for `key` or on the user's explicit refresh.
+ */
+export interface GridColumnLayout {
+  key: string;
+  infer: () => Promise<ColumnInference>;
+}
+
+/** One rendered column: where its value comes from and whether it edits positionally. */
+interface ColumnSpec {
+  id: string;
+  desc: ColumnDesc;
+  get: (row: Row) => WireValue;
+  /** The page column index an edit stages against; null renders read-only. */
+  edit: number | null;
+  layout?: LayoutColumn;
 }
 
 /**
@@ -59,6 +96,7 @@ export function ResultGrid({
   truncated,
   editing,
   exporting,
+  layout,
 }: {
   sessionId: string;
   columns: ColumnDesc[];
@@ -67,20 +105,103 @@ export function ResultGrid({
   editing?: GridEditing;
   /** T-074: offered on the truncation notice, D-010's escape hatch. */
   exporting?: GridExport;
+  /** T-063: set for a relation whose columns are derived (D-018). */
+  layout?: GridColumnLayout;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // D-031 §5: compact 28px or comfortable 34px, matching `--row-h`.
   const density = useUiStore((st) => st.density);
   const rowHeight = density === "comfortable" ? 34 : 28;
 
-  // One definition per descriptor. Accessors index the row positionally — the
+  // T-063: the cached layout for this collection, and an inference in flight.
+  const layoutKey = layout?.key;
+  const [entry, setEntry] = useState<CachedLayout | null>(null);
+  const [inferring, setInferring] = useState(false);
+  const [inferError, setInferError] = useState<string | null>(null);
+  const inferRef = useRef(layout?.infer);
+  inferRef.current = layout?.infer;
+  const layoutKeyRef = useRef(layoutKey);
+  layoutKeyRef.current = layoutKey;
+
+  const runInference = async (key: string) => {
+    const infer = inferRef.current;
+    if (!infer) return;
+    setInferring(true);
+    setInferError(null);
+    try {
+      const inference = await infer();
+      const cur = columnLayout.layoutCache.get(key) ?? { inference: null, layout: columnLayout.EMPTY_LAYOUT };
+      const next = { ...cur, inference };
+      columnLayout.layoutCache.set(key, next);
+      // A result for a collection no longer on screen is cached, not shown.
+      if (layoutKeyRef.current === key) setEntry(next);
+    } catch (e) {
+      if (layoutKeyRef.current === key) setInferError(String((e as { message?: string })?.message ?? e));
+    } finally {
+      setInferring(false);
+    }
+  };
+
+  useEffect(() => {
+    setInferError(null);
+    if (!layoutKey) {
+      setEntry(null);
+      return;
+    }
+    const cached = columnLayout.layoutCache.get(layoutKey);
+    if (cached) {
+      setEntry(cached);
+      return;
+    }
+    const fresh = { inference: null, layout: columnLayout.EMPTY_LAYOUT };
+    columnLayout.layoutCache.set(layoutKey, fresh);
+    setEntry(fresh);
+    void runInference(layoutKey);
+    // runInference reads the latest `infer` through a ref; only the
+    // collection changing should trigger it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutKey]);
+
+  const setLayout = (f: (l: ColumnLayout) => ColumnLayout) => {
+    if (!layoutKey) return;
+    const cur = columnLayout.layoutCache.get(layoutKey) ?? { inference: null, layout: columnLayout.EMPTY_LAYOUT };
+    const next = { ...cur, layout: f(cur.layout) };
+    columnLayout.layoutCache.set(layoutKey, next);
+    setEntry(next);
+  };
+
+  const resolved = useMemo(
+    () => (entry ? columnLayout.resolveColumns(entry.inference, entry.layout, columns) : null),
+    [entry, columns],
+  );
+
+  // Without a layout: one spec per descriptor, indexed positionally — the
   // contract's rows are arrays aligned with `columns`, and column names are not
   // guaranteed unique (a script can select `a, a`), so ids are positional too.
+  // With one (T-063): one spec per visible path, looked up, never converted.
+  const specs = useMemo<ColumnSpec[]>(
+    () =>
+      resolved
+        ? resolved.visible.map((lc) => ({
+            id: `p${lc.key}`,
+            desc: columnLayout.layoutDesc(lc, columns),
+            get: (row: Row) => columnLayout.pathValue(columns, row, lc.path),
+            edit: lc.pageIndex,
+            layout: lc,
+          }))
+        : columns.map((c, i) => ({ id: `c${i}`, desc: c, get: (row: Row) => row[i], edit: i })),
+    [resolved, columns],
+  );
+  const visibleKeys = resolved ? resolved.visible.map((c) => c.key) : [];
+  const controlsRef = useRef({ setLayout, visibleKeys });
+  controlsRef.current = { setLayout, visibleKeys };
+  const sampled = entry?.inference?.sampled ?? 0;
+
   const columnDefs = useMemo<ColumnDef<Row, WireValue>[]>(
     () =>
-      columns.map((c, i) => ({
-        id: `c${i}`,
-        accessorFn: (row: Row) => row[i],
+      specs.map(({ id, desc: c, get, edit: i, layout: lc }) => ({
+        id,
+        accessorFn: get,
         size: 180,
         minSize: 60,
         // D-031 §3: carried on the definition so cells read it directly.
@@ -88,6 +209,7 @@ export function ResultGrid({
         header: () => (
           <>
             <div className={cn("flex min-w-0 items-baseline gap-1.5", isNumeric(c) && "justify-end")}>
+              {lc?.pinned && <Pin aria-label="pinned" className="h-3 w-3 shrink-0 self-center text-primary" />}
               <span className="truncate text-foreground">{c.name}</span>
               <span className="truncate text-2xs font-normal text-muted-foreground/80">
                 {c.type_name}
@@ -96,7 +218,20 @@ export function ResultGrid({
                     D-032: a caution, not a failure. */}
                 {c.mixed && <span className="text-caution"> · mixed</span>}
                 {c.derived && <span> · inferred</span>}
+                {lc?.inferred && sampled > 0 && (
+                  <span title="share of sampled documents carrying this path">
+                    {" · "}
+                    {columnLayout.frequencyLabel(lc.inferred, sampled)}
+                  </span>
+                )}
               </span>
+              {lc && (
+                <HeaderControls
+                  column={lc}
+                  onLayout={(f) => controlsRef.current.setLayout(f)}
+                  order={() => controlsRef.current.visibleKeys}
+                />
+              )}
             </div>
           </>
         ),
@@ -105,6 +240,10 @@ export function ResultGrid({
           const ed = (ctx.table.options.meta as { editing?: GridEditing } | undefined)?.editing;
           const read = ctx.getValue();
           const row = ctx.row.index;
+          // T-063: a nested or hand-added path is not a page column, so it has
+          // no positional edit identity; it renders read-only (T-062 decides
+          // which paths become editable).
+          if (i === null) return <Cell sessionId={sessionId} value={read} column={c} />;
           const pending = ed ? staged(ed.pending, row, i) : undefined;
           if (!ed || ed.gate.state !== "editable") {
             return <Cell sessionId={sessionId} value={read} column={c} />;
@@ -122,7 +261,7 @@ export function ResultGrid({
           );
         },
       })),
-    [columns, sessionId],
+    [specs, sessionId, sampled],
   );
 
   const table = useReactTable({
@@ -147,6 +286,16 @@ export function ResultGrid({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {layoutKey && resolved && (
+        <LayoutBar
+          inference={entry?.inference ?? null}
+          hidden={resolved.hidden}
+          inferring={inferring}
+          error={inferError}
+          onRefresh={() => void runInference(layoutKey)}
+          onLayout={setLayout}
+        />
+      )}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
         <table
           className="border-separate border-spacing-0 text-data"
@@ -407,6 +556,159 @@ function EditableCell({
           <Undo2 className="h-3 w-3" />
         </button>
       )}
+    </div>
+  );
+}
+
+/**
+ * T-063: per-column layout controls — pin, move, hide, and remove for a path
+ * added by hand. `order` is read at click time so the header definitions need
+ * not rebuild on every layout change.
+ */
+function HeaderControls({
+  column,
+  onLayout,
+  order,
+}: {
+  column: LayoutColumn;
+  onLayout: (f: (l: ColumnLayout) => ColumnLayout) => void;
+  order: () => string[];
+}) {
+  const btn =
+    "focus-glow shrink-0 rounded border border-transparent p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground";
+  const k = column.key;
+  return (
+    <span className="ml-auto flex shrink-0 items-center gap-0.5 self-center">
+      <button
+        type="button"
+        className={btn}
+        title={column.pinned ? `Unpin ${column.label}` : `Pin ${column.label}`}
+        onClick={() => onLayout((l) => columnLayout.togglePin(l, k))}
+      >
+        {column.pinned ? <PinOff className="h-3 w-3" /> : <Pin className="h-3 w-3" />}
+      </button>
+      <button
+        type="button"
+        className={btn}
+        title={`Move ${column.label} left`}
+        onClick={() => onLayout((l) => columnLayout.move(l, order(), k, -1))}
+      >
+        <ChevronLeft className="h-3 w-3" />
+      </button>
+      <button
+        type="button"
+        className={btn}
+        title={`Move ${column.label} right`}
+        onClick={() => onLayout((l) => columnLayout.move(l, order(), k, 1))}
+      >
+        <ChevronRight className="h-3 w-3" />
+      </button>
+      {column.added ? (
+        <button
+          type="button"
+          className={btn}
+          title={`Remove ${column.label}`}
+          onClick={() => onLayout((l) => columnLayout.removeAdded(l, k))}
+        >
+          <X className="h-3 w-3" />
+        </button>
+      ) : (
+        <button
+          type="button"
+          className={btn}
+          title={`Hide ${column.label}`}
+          onClick={() => onLayout((l) => columnLayout.hide(l, k))}
+        >
+          <EyeOff className="h-3 w-3" />
+        </button>
+      )}
+    </span>
+  );
+}
+
+/**
+ * T-063 / D-018: what the columns were derived from, the explicit refresh, a
+ * path added by hand, and every hidden column offered back — hiding is the
+ * user's choice and is never silent.
+ */
+function LayoutBar({
+  inference,
+  hidden,
+  inferring,
+  error,
+  onRefresh,
+  onLayout,
+}: {
+  inference: ColumnInference | null;
+  hidden: LayoutColumn[];
+  inferring: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onLayout: (f: (l: ColumnLayout) => ColumnLayout) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const parsed = columnLayout.parsePath(draft);
+  const source = !inference
+    ? "columns not inferred yet"
+    : inference.from_validator
+      ? `columns from the validator · ${inference.sampled} documents sampled`
+      : `columns inferred from ${inference.sampled} documents${inference.sample_truncated ? ` (first ${inference.sample_limit})` : ""}`;
+  return (
+    <div className="flex min-h-8 flex-wrap items-center gap-x-3 gap-y-1 border-b bg-panel px-3 py-1 text-xs text-muted-foreground">
+      <span className="font-mono text-2xs">{source}</span>
+      <button
+        type="button"
+        disabled={inferring}
+        title="Re-run column inference"
+        className="focus-glow inline-flex h-6 items-center gap-1 rounded border border-border-strong bg-raised px-2 text-foreground transition-colors duration-interact hover:border-muted-foreground/50 disabled:opacity-50"
+        onClick={onRefresh}
+      >
+        {inferring ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+        Refresh columns
+      </button>
+      <form
+        className="flex items-center gap-1"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!parsed) return;
+          onLayout((l) => columnLayout.addPath(l, parsed));
+          setDraft("");
+        }}
+      >
+        <input
+          aria-label="Add a column by path"
+          placeholder="add path, e.g. address.city"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="focus-glow h-6 w-48 rounded border border-input bg-transparent px-2 font-mono text-xs text-foreground"
+        />
+        <button
+          type="submit"
+          disabled={!parsed}
+          title="Add column"
+          className="focus-glow inline-flex h-6 items-center rounded border border-border-strong bg-raised px-1.5 text-foreground disabled:opacity-50"
+        >
+          <Plus className="h-3 w-3" />
+        </button>
+      </form>
+      {hidden.length > 0 && (
+        <span className="flex flex-wrap items-center gap-1">
+          <span>hidden:</span>
+          {hidden.map((h) => (
+            <button
+              key={h.key}
+              type="button"
+              title={`Show ${h.label}`}
+              className="focus-glow inline-flex h-5 items-center gap-1 rounded-sm border border-border px-1.5 font-mono text-2xs hover:bg-accent hover:text-foreground"
+              onClick={() => onLayout((l) => columnLayout.show(l, h.key))}
+            >
+              <Eye className="h-3 w-3" />
+              {h.label}
+            </button>
+          ))}
+        </span>
+      )}
+      {error && <span className="text-destructive">inference failed: {error}</span>}
     </div>
   );
 }

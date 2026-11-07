@@ -27,6 +27,7 @@ pub mod export;
 pub mod outcome;
 pub mod panic_guard;
 pub mod request;
+pub mod schema_infer;
 pub mod script;
 pub mod redact;
 pub mod secret;
@@ -37,7 +38,7 @@ pub mod value;
 
 pub use capability::{is_extension_op, missing_core_ops, CORE_FILTER_OPS, FilterArity,
     CancelSupport, Capabilities, FilterOpDecl, NodeKind, RawPayloadKind, ResetSupport,
-    CatalogFeature, CatalogSupport, ReadOnlyGuarantee, SessionAffinity, TransactionSupport,
+    CatalogFeature, CatalogSupport, ColumnDerivation, ReadOnlyGuarantee, SessionAffinity, TransactionSupport,
 };
 pub use driver::Driver;
 pub use export::{ExportError, ExportFormat, ExportWriter, SqlLiterals};
@@ -45,6 +46,7 @@ pub use error::{ConfirmationRequest, DriverError, EnginePayload, ErrorHints, Err
 pub use outcome::{row_cost, BudgetLimit, BudgetMeter, BudgetReport, ExecBudget, PageInfo, 
     Attribution, ExecutionResult, Outcome, OutcomeBody, TxContext, TxDisposition, TxMode,
 };
+pub use schema_infer::{infer_columns, ColumnInference, ColumnSource, InferOptions, InferredColumn};
 pub use script::{ScriptDialect, SplitResult, StatementSpan};
 pub use panic_guard::{
     guard_driver_call, guard_driver_call_blocking, ConnectionHome, ConnectionLease, DiscardReason,
@@ -157,6 +159,7 @@ mod contract_tests {
             string_collation: Some("en_US.utf8".into()),
             read_only: ReadOnlyGuarantee::Enforced { basis: "standby".into() },
             catalog: CatalogSupport::default(),
+            column_inference: ColumnDerivation::Inferred { validator: true, sample_limit: 1000, deep_sample: true },
         };
 
         let json = serde_json::to_string(&caps).expect("serialize");

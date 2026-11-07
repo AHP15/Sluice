@@ -129,6 +129,36 @@ export interface Capabilities {
   read_only?: ReadOnlyGuarantee;
   /** T-055 / R-028: which catalog areas probed successfully at connect. */
   catalog?: CatalogSupport;
+  /** T-063 / D-018: where grid columns come from. Absent means `catalog`. */
+  column_inference?: ColumnDerivation;
+}
+
+/** T-063 / D-018: declared column derivation (`capability::ColumnDerivation`). */
+export type ColumnDerivation =
+  | { mode: "catalog" }
+  | { mode: "inferred"; validator: boolean; sample_limit: number; deep_sample: boolean };
+
+/** T-063: one derived column (`schema_infer::InferredColumn`). */
+export interface InferredColumn {
+  /** Field names from the root — a path, since a field name may contain dots. */
+  path: string[];
+  source: "validator" | "sample";
+  /** Sampled documents holding a value here (null included, absent not). */
+  present: number;
+  nulls: number;
+  observed: string[];
+  declared: string[];
+  /** D-018's marker: the type held here varies between documents. */
+  type_varies: boolean;
+}
+
+/** T-063: one inference run (`schema_infer::ColumnInference`). */
+export interface ColumnInference {
+  columns: InferredColumn[];
+  sampled: number;
+  sample_limit: number;
+  sample_truncated: boolean;
+  from_validator: boolean;
 }
 
 export interface CatalogSupport {

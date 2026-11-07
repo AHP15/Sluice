@@ -1003,6 +1003,8 @@ impl Driver for PgDriver {
             string_collation: self.collation.as_ref().map(|(name, _)| name.clone()),
             read_only: self.read_only.clone(),
             catalog: self.catalog.clone(),
+            // D-018: the catalog declares every column.
+            column_inference: sluice_core::ColumnDerivation::Catalog,
         }
     }
 
