@@ -13,7 +13,7 @@
  * Usage: bun run check:tokens
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 const ROOT = "src";
 const ALLOWED = new Set(["src/styles.css"]); // the one place tokens are defined
@@ -32,7 +32,8 @@ function* walk(dir) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name);
     if (statSync(p).isDirectory()) yield* walk(p);
-    else if (/\.(tsx?|css)$/.test(name)) yield p;
+    // POSIX separators so ALLOWED matches on Windows, where join() emits `\`.
+    else if (/\.(tsx?|css)$/.test(name)) yield p.split(sep).join("/");
   }
 }
 
