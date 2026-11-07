@@ -60,7 +60,7 @@ T-059 | done | M | D-027,R-034 | Bind concurrency originals with an explicit per
 T-060 | done | M | D-027,R-035 | Determine concurrency comparability by probing the catalog | 2026-11-06
 T-061 | done | M | D-027 | Database-enforced safety mode and production confirmation | 2026-11-06
 T-062 | todo | M | D-027,D-018,R-026 | Classify Mongo document paths as editable or read-only |
-T-063 | todo | L | D-018 | Column derivation for schemaless collections |
+T-063 | in_progress | L | D-018 | Column derivation for schemaless collections |
 T-064 | todo | M | D-018,R-015 | Sample both ends of a collection and show inference coverage |
 T-065 | todo | M | D-018,D-029,R-025 | Declare sortability per relation and per path |
 T-066 | done | L | D-017 | Layered error model with normalized kind, hints, and verbatim payload | 2026-08-03
@@ -79,12 +79,12 @@ T-078 | done | M | D-003,D-022 | Hold and dispatch sessions as engine-neutral dr
 T-079 | done | M | D-003,D-022 | Build each session's driver from its engine at connect time | 2026-11-06
 T-080 | done | L | D-002,D-022,D-028 | SQL Server driver crate: connect, TLS, auth, and pooled reset over tiberius | 2026-11-06
 T-081 | done | M | D-016,D-029 | SQL Server navigator and lazy catalog introspection | 2026-11-06
-T-082 | todo | L | D-005,D-006,D-010,D-029 | SQL Server browse compilation, lossless type encoding, and core filters |
+T-082 | in_progress | L | D-005,D-006,D-010,D-029 | SQL Server browse compilation, lossless type encoding, and core filters |
 T-083 | todo | M | D-029,D-010 | SQL Server raw scripts as a budgeted statement-outcome sequence |
 T-084 | todo | M | D-030,D-010 | SQL Server cancellation: close-and-declare baseline with verified KILL |
 T-085 | todo | M | D-027 | Staged edits on SQL Server behind the unique-key gate |
 T-086 | todo | M | D-021,D-006 | SQL Server type-fidelity corpus in CI against a service container |
-T-087 | todo | L | D-002,D-022,D-028 | MongoDB driver crate: connect, capability descriptor, and navigator |
+T-087 | in_progress | L | D-002,D-022,D-028 | MongoDB driver crate: connect, capability descriptor, and navigator |
 T-088 | todo | L | D-005,D-006,D-010,D-029 | MongoDB browse with BSON-faithful encoding and operator-safe filters |
 T-089 | todo | M | D-029,D-010 | MongoDB raw command documents as an outcome sequence |
 T-090 | todo | M | D-021,D-006 | MongoDB fidelity corpus in CI against a mongod service container |
