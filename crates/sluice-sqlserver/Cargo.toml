@@ -19,6 +19,9 @@ tokio = { workspace = true, features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
 serde = { workspace = true }
+# T-082: binary crosses as base64 (D-006); rows stream with backpressure.
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
