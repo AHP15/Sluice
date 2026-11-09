@@ -13,7 +13,49 @@ spikes/               throwaway engine probes, independent crates
 docs/                 decisions, risks, tasks (Treenail records)
 ```
 
-## Prerequisites
+## Install
+
+No Rust, Bun or Node needed — these download a prebuilt release.
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AHP15/Sluice/main/install.sh | sh
+```
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/AHP15/Sluice/main/install.ps1 | iex
+```
+
+Or download a `.dmg`, `.AppImage` or `-setup.exe` from
+[Releases](https://github.com/AHP15/Sluice/releases/latest).
+
+- Pin a version: `SLUICE_VERSION=v0.2.0` (both installers).
+- macOS installs to `/Applications` (or `~/Applications`); Linux to
+  `~/.local/opt/sluice` with a `sluice` launcher in `~/.local/bin` and a menu
+  entry — uninstall with `sh install.sh --uninstall`. Windows installs
+  per-user; uninstall from Settings → Apps.
+- Builds are not yet Developer ID / Authenticode signed (D-019). The
+  installers handle this (ad-hoc seal, quarantine / Mark-of-the-Web cleared);
+  a manually downloaded `.dmg` needs right-click → Open the first time.
+- Linux needs no FUSE: the launcher falls back to extract-and-run. WebKitGTK
+  is bundled in the AppImage. Windows fetches WebView2 if it is missing.
+
+## Release
+
+```sh
+scripts/release.sh 0.2.0        # bump all manifests, commit, tag v0.2.0, push
+```
+
+The tag runs `.github/workflows/release.yml`: it checks that the tag matches
+every manifest version, builds macOS (arm64, x86_64), Linux x86_64 and
+Windows x86_64, uploads the assets under stable names plus `SHA256SUMS`, and
+publishes the release. A prerelease tag (`0.2.0-rc.1`) never becomes
+"latest", so the one-line installers ignore it.
+
+## Development prerequisites
 
 - Rust stable (`rustup`)
 - [Bun](https://bun.sh) — package manager and Vite driver only; **not** shipped

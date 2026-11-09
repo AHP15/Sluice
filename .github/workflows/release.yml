@@ -1,0 +1,200 @@
+name: release
+
+# Builds the four-platform matrix from build.yml and publishes the bundles as a
+# GitHub Release. Triggered by pushing a `vX.Y.Z` tag (scripts/release.sh does
+# the version bump, tag and push in one step).
+#
+# Assets are uploaded under STABLE names (no version in the filename) so the
+# installers can fetch `releases/latest/download/<name>` without querying the
+# API or parsing JSON:
+#
+#   sluice-macos-arm64.app.tar.gz      install.sh (macOS, Apple Silicon)
+#   sluice-macos-x86_64.app.tar.gz     install.sh (macOS, Intel)
+#   sluice-macos-arm64.dmg             manual download
+#   sluice-macos-x86_64.dmg            manual download
+#   sluice-linux-x86_64.AppImage       install.sh (Linux)
+#   sluice-windows-x86_64-setup.exe    install.ps1 / manual download
+#   SHA256SUMS                         verified by both installers
+#
+# Builds are still UNSIGNED (D-019 / T-071): macOS bundles are ad-hoc signed
+# only, so the keychain identity changes per release (see docs/SIGNING.md §2 —
+# an unreadable item is re-prompted, never fatal).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and release, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # A tag whose version disagrees with the manifests would publish bundles
+  # whose filenames and About box name a different version. Fail before
+  # spending four platform builds on it.
+  prepare:
+    name: verify version and create draft
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Tag matches manifest versions
+        run: |
+          want="${TAG#v}"
+          pkg=$(jq -r .version package.json)
+          tauri=$(jq -r .version src-tauri/tauri.conf.json)
+          cargo=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)
+          echo "tag=$want package.json=$pkg tauri.conf.json=$tauri Cargo.toml=$cargo"
+          for v in "$pkg" "$tauri" "$cargo"; do
+            if [ "$v" != "$want" ]; then
+              echo "::error::version mismatch — run scripts/release.sh $want to bump all manifests"
+              exit 1
+            fi
+          done
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; assets will be replaced"
+          else
+            prerelease=""
+            case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+            gh release create "$TAG" --draft --verify-tag $prerelease \
+              --title "Sluice ${TAG#v}" --generate-notes
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: macos-arm64
+            platform: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - name: macos-x86_64
+            platform: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - name: linux-x86_64
+            # 22.04 = the WebKitGTK 4.1 floor (D-019); building AppImage on the
+            # oldest supported base keeps it portable across distros.
+            platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage
+          - name: windows-x86_64
+            platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            build-essential \
+            file \
+            wget
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: release-${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        env:
+          # Skips the Finder/AppleScript DMG layout step (see build.yml).
+          CI: true
+        run: bun run tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Stage assets under stable names
+        shell: bash
+        run: |
+          set -euo pipefail
+          b="target/${{ matrix.target }}/release/bundle"
+          mkdir -p out
+          case "${{ matrix.name }}" in
+            macos-*)
+              app=$(ls -d "$b"/macos/*.app | head -n1)
+              # Re-seal the bundle with one ad-hoc signature after bundling, so
+              # the installer's `codesign --verify` passes and arm64 launches.
+              codesign --force --deep --sign - "$app"
+              tar -czf "out/sluice-${{ matrix.name }}.app.tar.gz" -C "$(dirname "$app")" "$(basename "$app")"
+              cp "$(ls "$b"/dmg/*.dmg | head -n1)" "out/sluice-${{ matrix.name }}.dmg"
+              ;;
+            linux-*)
+              cp "$(ls "$b"/appimage/*.AppImage | head -n1)" "out/sluice-${{ matrix.name }}.AppImage"
+              ;;
+            windows-*)
+              cp "$(ls "$b"/nsis/*-setup.exe | head -n1)" "out/sluice-${{ matrix.name }}-setup.exe"
+              ;;
+          esac
+          ls -l out
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" out/* --clobber
+
+  publish:
+    name: checksums and publish
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download assets, write SHA256SUMS, publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir assets && cd assets
+          gh release download "$TAG" --pattern 'sluice-*'
+          sha256sum sluice-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
+          # Publishing (leaving draft) is what makes it `releases/latest`,
+          # which is the URL the installers resolve. Prereleases never become
+          # latest, so a `-rc` tag cannot reach users of the one-liner.
+          gh release edit "$TAG" --draft=false
